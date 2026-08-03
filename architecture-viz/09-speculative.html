@@ -930,7 +930,7 @@ document.addEventListener("DOMContentLoaded", () => {
   const DLLM_IDS = ["#dm-1","#dm-2","#dm-3","#dm-4","#dm-5","#dm-6","#dm-7","#dm-8"];
   new Stepper("#st-dllm", {
     title: "dLLM block denoising with LowConfidence (threshold 0.95)",
-    intro: "8 masked positions shown for readability — real blocks are 32 (LLaDA2MoeModelLM) or 4 (SDAR). Target output: \"Bon jour , tout le monde ! </s>\".",
+    intro: "8 masked positions shown for readability — real blocks are 32 (LLaDA2MoeModelLM) or 4 (SDAR). Target output: \"Bon jour , tout le monde ! &lt;/s&gt;\".",
     autoMs: 3400,
     reset(sc) {
       clearState(sc, ".sc-box,.tok");
