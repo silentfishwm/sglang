@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SGLang Internals — Animated Architecture Guide</title>
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/mermaid.min.js"></script>
+<script src="assets/viz.js"></script>
+</head>
+<body>
+<div class="layout">
+<main>
+  <div class="page-hero"><div class="content">
+    <span class="phase-badge">Phase I · Foundations</span>
+    <h1>SGLang Internals<br>An Animated Guide to the Architecture</h1>
+    <p class="lede">
+      A guided, animated tour through the design and implementation of
+      <b>SGLang</b> — the high-performance LLM serving engine. Every diagram, code snippet
+      and claim in this guide was derived from and verified against the source code in this
+      repository. Work through the chapters in order, or jump straight to the subsystem
+      you care about — each page stands alone.
+    </p>
+  </div></div>
+
+  <div class="content">
+
+  <h2><span class="sec-num">0.1</span>What is SGLang?</h2>
+  <p>
+    SGLang is an open-source serving engine for large language models and vision-language
+    models, built for production throughput. It began as a research project — the NeurIPS 2024
+    paper <i>"SGLang: Efficient Execution of Structured Language Model Programs"</i> introduced
+    <b>RadixAttention</b> (automatic KV-cache prefix reuse via a radix tree) and a Python DSL for
+    programming LLM interactions — and has grown into a full serving stack used at massive scale
+    (xAI publicly serves Grok on SGLang; the project README reports deployments spanning hundreds
+    of thousands of GPUs).
+  </p>
+  <p>Four ideas define its character; everything else in this guide elaborates on them:</p>
+  <div class="card">
+    <ul>
+      <li><b>Continuous batching with a zero-overhead scheduler</b> — requests join and leave
+        GPU batches every iteration, and CPU scheduling work is overlapped with GPU execution
+        so the GPU never waits (chapters 01–02).</li>
+      <li><b>RadixAttention</b> — all KV cache lives in one radix tree keyed by token IDs, so any
+        shared prefix (system prompts, few-shot examples, multi-turn history) is computed once
+        and reused automatically (chapter 03).</li>
+      <li><b>A pluggable compute stack</b> — 20+ attention backends, ~29 quantization methods,
+        AOT/JIT/Triton kernel tiers, and platform abstraction spanning NVIDIA, AMD, Intel,
+        Ascend, and more (chapters 04–06).</li>
+      <li><b>Scale-out by composition</b> — TP/PP/DP/EP parallelism, DP attention for MLA models,
+        prefill-decode disaggregation with RDMA KV transfer, hierarchical KV cache, and a Rust
+        model gateway (chapters 07–08).</li>
+    </ul>
+  </div>
+
+  <div class="callout note"><span class="co-title">Scope &amp; provenance</span>
+    This guide documents the code in <b>this repository</b> at the commit it was written against
+    (<code>45c00da</code>, 2026-08). SGLang moves fast: several subsystems here are newer than, or
+    renamed from, what upstream blog posts describe (e.g. the kernel tree now lives under
+    <code>python/sglang/kernels/</code>, the router is now the "Model Gateway"). Where the repo and
+    older public docs disagree, the pages follow the repo and call out the drift.
+  </div>
+
+  <h2><span class="sec-num">0.2</span>Sixty seconds of LLM-inference background</h2>
+  <p>
+    Every chapter assumes you know this much: serving an autoregressive LLM has two very
+    different phases, and nearly every architectural decision in SGLang exists to exploit
+    that difference.
+  </p>
+
+  <div class="stepper" id="st-101">
+    <div class="st-scene">
+      <div class="sc-row">
+        <div class="sc-box" id="b101-p">Prompt<small>"What is the capital of France?"</small></div>
+        <div class="sc-box" id="b101-kv">KV cache<small>one entry per token per layer</small></div>
+      </div>
+      <div class="sc-row" style="margin-top:14px">
+        <span class="tok" id="t101-1">What</span><span class="tok" id="t101-2">is</span>
+        <span class="tok" id="t101-3">the</span><span class="tok" id="t101-4">capital</span>
+        <span class="tok" id="t101-5">of</span><span class="tok" id="t101-6">France</span>
+        <span class="tok" id="t101-7">?</span>
+        <span class="tok appear" id="t101-8">The</span>
+        <span class="tok appear" id="t101-9">capital</span>
+        <span class="tok appear" id="t101-10">is</span>
+        <span class="tok appear" id="t101-11">Paris</span>
+      </div>
+      <div class="sc-row" style="margin-top:14px">
+        <div class="sc-box ghost" id="b101-pf">PREFILL — compute-bound<small>all prompt tokens in parallel, one pass</small></div>
+        <div class="sc-box ghost" id="b101-dc">DECODE — memory-bandwidth-bound<small>one token per pass, reads the whole KV cache</small></div>
+      </div>
+    </div>
+  </div>
+
+  <p>
+    Prefill saturates the GPU's compute units; decode barely uses them but hammers memory
+    bandwidth. That asymmetry is why SGLang batches many requests' decode steps together
+    (chapter 02), caches and shares prefill work (chapter 03), replays decode through CUDA
+    graphs (chapter 04), speculates several tokens per pass (chapter 09), and can even run
+    prefill and decode on separate GPU fleets (chapter 08).
+  </p>
+
+  <h2><span class="sec-num">0.3</span>The whole system on one diagram</h2>
+
+  <div class="diagram">
+    <div class="dg-title">SGLang full-stack architecture — each region maps to a chapter</div>
+    <pre class="mermaid">
+flowchart TB
+  client([Clients])
+  gw["Model Gateway (Rust)<br/>cache-aware routing · PD pairing — ch 08"]
+  subgraph node ["One SGLang server (ch 01)"]
+    direction TB
+    http["FastAPI + OpenAI/Anthropic APIs — ch 10·11<br/>TokenizerManager"]
+    subgraph sched ["Scheduler process, one per GPU"]
+      sc["Scheduler — ch 02<br/>continuous batching · policies · retraction"]
+      mem["RadixCache + KV pools — ch 03"]
+      spec["Speculative EAGLE — ch 09"]
+      gram["Grammar masks — ch 10"]
+      mr["ModelRunner — ch 04<br/>ForwardBatch · CUDA graphs"]
+      att["Attention backends — ch 04"]
+      lay["Layers: TP linear · MoE · quant · LoRA — ch 05"]
+      ker["Kernels: AOT · JIT · Triton · torch.compile — ch 06"]
+      sc --> mr
+      mem --- sc
+      spec --- sc
+      gram --- sc
+      mr --> att --> lay --> ker
+    end
+    detok["DetokenizerManager"]
+    http --> sc
+    sc --> detok --> http
+  end
+  dist["TP · PP · DP · EP across GPUs/nodes — ch 07"]
+  hic["HiCache: host memory + storage tiers — ch 08"]
+  obs["Metrics · tracing · watchdogs · config — ch 12"]
+  dsl["Frontend DSL · benchmarks · tests — ch 11"]
+  client --> gw --> http
+  sched --- dist
+  mem --- hic
+  node --- obs
+  dsl --- client
+  style node fill:#f6f7fb,stroke:#4f46e5
+  style sched fill:#e7f7ec,stroke:#16a34a
+  style gw fill:#fdf3e3,stroke:#d97706
+    </pre>
+    <div class="dg-caption">
+      One box = one chapter. The scheduler process is where almost everything interesting
+      happens: scheduling, caching, speculation, grammar, and the model forward all live in the
+      same OS process per GPU (see chapter 01 for why).
+    </div>
+  </div>
+
+  <h2><span class="sec-num">0.4</span>The repository, mapped</h2>
+
+  <div class="filetree">sglang/
+├── python/sglang/
+│   ├── <b>srt/</b>                  <i>“SGLang RunTime” — the serving engine (chapters 01–10, 12)</i>
+│   │   ├── entrypoints/         <i>HTTP server, Engine, OpenAI/Anthropic APIs → ch 01, 10</i>
+│   │   ├── managers/            <i>TokenizerManager, Scheduler, Detokenizer → ch 01, 02</i>
+│   │   ├── mem_cache/           <i>RadixCache, KV pools, HiCache → ch 03, 08</i>
+│   │   ├── model_executor/      <i>ModelRunner, ForwardBatch, CUDA graphs → ch 04</i>
+│   │   ├── layers/              <i>attention backends, MoE, quantization, sampler → ch 04, 05</i>
+│   │   ├── models/              <i>212 model implementations → ch 04, 05</i>
+│   │   ├── distributed/         <i>process groups, custom collectives → ch 07</i>
+│   │   ├── disaggregation/      <i>PD split, Mooncake/NIXL KV transfer → ch 08</i>
+│   │   ├── speculative/         <i>EAGLE/MTP/NGRAM workers → ch 09</i>
+│   │   ├── constrained/         <i>xgrammar/outlines/llguidance → ch 10</i>
+│   │   ├── lora/ · multimodal/  <i>adapter serving · VLM processors → ch 05</i>
+│   │   ├── observability/       <i>Prometheus, OTel tracing → ch 12</i>
+│   │   └── … 30+ more subsystems <i>→ complete map in ch 12</i>
+│   ├── <b>lang/</b>                 <i>the original SGLang DSL frontend → ch 11</i>
+│   ├── <b>kernels/</b>              <i>AOT (sgl_kernel) + JIT + registry → ch 06</i>
+│   ├── benchmark/ · eval/       <i>bench_serving, gsm8k eval → ch 11</i>
+│   └── multimodal_gen/          <i>“SGLang Diffusion” image/video gen → ch 12</i>
+├── <b>sgl-model-gateway/</b>        <i>Rust router/gateway (formerly sgl-router) → ch 08</i>
+├── rust/                        <i>in-process Rust server + gRPC crates (PyO3) → ch 08, 10</i>
+├── proto/                       <i>gRPC service definition → ch 10</i>
+├── test/ · benchmark/           <i>CI suites, perf benchmarks → ch 11</i>
+├── docs_new/                    <i>Mintlify docs + model cookbook → ch 11</i>
+├── docker/ · scripts/ · 3rdparty/ <i>images for 8 hardware vendors, tooling → ch 06, 12</i>
+└── examples/ · experimental/    <i>runnable examples → ch 11</i></div>
+
+  <div class="card">
+    <p style="margin:4px 0"><b>Scale of the codebase this guide covers</b> (counted at the pinned commit):</p>
+    <ul style="margin:6px 0">
+      <li><b>212</b> model implementation files (193 registered architectures) in <code>srt/models/</code></li>
+      <li><b>24</b> selectable <code>--attention-backend</code> choices across ~30 backend files</li>
+      <li><b>~29</b> quantization method families in <code>srt/layers/quantization/</code></li>
+      <li><b>43</b> subsystem directories under <code>srt/</code> — all of them mapped in chapter 12</li>
+      <li><b>~9,400</b> lines of <code>ServerArgs</code> alone; ~120 Prometheus metrics; ~60 HTTP endpoints</li>
+    </ul>
+  </div>
+
+  <h2><span class="sec-num">0.5</span>Your learning path</h2>
+  <p>
+    The chapters are phased so each builds only on what came before. Phase I–II are the
+    core every user should know; III–IV go down and out; V–VI complete the picture.
+  </p>
+
+  <div class="chapter-grid">
+    <a class="chapter-card" href="01-request-lifecycle.html"><span class="cc-num">01 · Phase I</span>
+      <h3>Processes &amp; Request Lifecycle</h3>
+      <p>The process constellation, ZMQ wiring, and an animated walk through one chat request from HTTP to SSE.</p></a>
+    <a class="chapter-card" href="02-scheduler.html"><span class="cc-num">02 · Phase II</span>
+      <h3>Scheduler &amp; Continuous Batching</h3>
+      <p>The event loop, batch construction budgets, policies, chunked prefill, retraction, and overlap scheduling.</p></a>
+    <a class="chapter-card" href="03-memory.html"><span class="cc-num">03 · Phase II</span>
+      <h3>KV Cache &amp; RadixAttention</h3>
+      <p>Two-level KV indirection, the radix tree, prefix sharing animated node-by-node, eviction, allocators.</p></a>
+    <a class="chapter-card" href="04-model-execution.html"><span class="cc-num">04 · Phase II</span>
+      <h3>ModelRunner, Attention &amp; CUDA Graphs</h3>
+      <p>ForwardBatch anatomy, the attention-backend zoo, CUDA graph capture/replay, logits→token pipeline.</p></a>
+    <a class="chapter-card" href="05-layers.html"><span class="cc-num">05 · Phase III</span>
+      <h3>Layers: TP, MoE, Quantization, LoRA, VLM</h3>
+      <p>Parallel linear layers, the FusedMoE pipeline, the quantization plug-in pattern, LoRA and multimodal serving.</p></a>
+    <a class="chapter-card" href="06-kernels.html"><span class="cc-num">06 · Phase III</span>
+      <h3>Kernels, torch.compile &amp; Hardware</h3>
+      <p>AOT/JIT/Triton kernel tiers, piecewise CUDA graphs, deterministic inference, platform abstraction.</p></a>
+    <a class="chapter-card" href="07-distributed.html"><span class="cc-num">07 · Phase IV</span>
+      <h3>Parallelism: TP · PP · DP · EP</h3>
+      <p>Process groups and rank math, DP attention for MLA, pipeline microbatches, EPLB expert rebalancing, RL weight sync.</p></a>
+    <a class="chapter-card" href="08-disaggregation.html"><span class="cc-num">08 · Phase IV</span>
+      <h3>PD Disaggregation, HiCache &amp; Router</h3>
+      <p>Prefill/decode fleets, RDMA KV transfer, hierarchical cache tiers, and the Rust model gateway.</p></a>
+    <a class="chapter-card" href="09-speculative.html"><span class="cc-num">09 · Phase V</span>
+      <h3>Speculative Decoding (EAGLE) &amp; Overlap</h3>
+      <p>Draft trees, tree-attention verification, acceptance math, diffusion LMs, and two-batch overlap.</p></a>
+    <a class="chapter-card" href="10-structured-output.html"><span class="cc-num">10 · Phase V</span>
+      <h3>Sampling, Grammar &amp; Function Calling</h3>
+      <p>The sampling pipeline, grammar-constrained decoding with vocab masks, tool-call parsing, the OpenAI layer.</p></a>
+    <a class="chapter-card" href="11-frontend-tooling.html"><span class="cc-num">11 · Phase VI</span>
+      <h3>APIs, Frontend DSL &amp; Benchmarks</h3>
+      <p>The original SGLang language, fork/join/select, CLI, bench_serving metrics, tests and CI.</p></a>
+    <a class="chapter-card" href="12-observability.html"><span class="cc-num">12 · Phase VI</span>
+      <h3>Observability, Config &amp; Everything Else</h3>
+      <p>Metrics, tracing, watchdogs, the configuration architecture — and the complete map of all 43 subsystems.</p></a>
+  </div>
+
+  <h2><span class="sec-num">0.6</span>How to read these pages</h2>
+  <div class="card">
+    <ul>
+      <li><b>Animated steppers</b> — every chapter has guided animations. Press <i>▶ Play</i> or
+        step manually; each step's caption names the exact functions involved. They are the
+        fastest way to build intuition.</li>
+      <li><b>Diagrams</b> — rendered with Mermaid (vendored locally; pages work offline).
+        Wide diagrams scroll horizontally.</li>
+      <li><b>Code snippets</b> — verbatim from this repo, headed by
+        <code>path/to/file.py:line</code>. Line numbers refer to the pinned commit and may drift
+        as the code evolves; names and logic were individually verified.</li>
+      <li><b>Callouts</b> — green <i>fact-check</i> boxes mark claims that were explicitly
+        re-verified in source; amber boxes warn where this repo differs from upstream docs.</li>
+    </ul>
+  </div>
+
+  <div id="pager"></div>
+  </div>
+</main>
+</div>
+
+<script>
+document.addEventListener("DOMContentLoaded", () => {
+  new Stepper("#st-101", {
+    title: "Prefill vs decode — the asymmetry everything exploits",
+    intro: "The two phases of autoregressive inference.",
+    autoMs: 3400,
+    reset(sc) {
+      clearState(sc, ".sc-box,.tok");
+      rmCls(sc, ".appear", "in");
+    },
+    steps: [
+      { cap: "The prompt arrives and is tokenized into 7 tokens.",
+        run(sc) { setCls(sc, "#b101-p", "hl"); setCls(sc, "#t101-1,#t101-2,#t101-3,#t101-4,#t101-5,#t101-6,#t101-7", "hl"); } },
+      { cap: "<b>Prefill</b>: one forward pass processes all 7 prompt tokens in parallel — thousands of tokens can be crunched per pass. This phase is <b>compute-bound</b>.",
+        run(sc) { rmCls(sc, "#b101-p", "hl"); setCls(sc, "#b101-pf", "ok"); setCls(sc, "#t101-1,#t101-2,#t101-3,#t101-4,#t101-5,#t101-6,#t101-7", "ok"); } },
+      { cap: "Each token's attention keys and values are written to the <b>KV cache</b> — the reusable byproduct of prefill. For a 70B model this is hundreds of KB per token.",
+        run(sc) { setCls(sc, "#b101-kv", "cache", "pulse"); rmCls(sc, "#t101-1,#t101-2,#t101-3,#t101-4,#t101-5,#t101-6,#t101-7", "hl"); } },
+      { cap: "<b>Decode</b> step 1: one forward pass, <i>one</i> new token — but it must read the entire KV cache. The GPU's compute sits mostly idle; memory bandwidth is the bottleneck.",
+        run(sc) { rmCls(sc, "#b101-kv", "pulse"); setCls(sc, "#b101-dc", "warn"); setCls(sc, "#t101-8", "in", "hl"); } },
+      { cap: "Decode step 2 — another full pass for one more token…",
+        run(sc) { rmCls(sc, "#t101-8", "hl"); setCls(sc, "#t101-9", "in", "hl"); } },
+      { cap: "…and so on, one token per iteration, each appending its own KV entry.",
+        run(sc) { rmCls(sc, "#t101-9", "hl"); setCls(sc, "#t101-10", "in", "hl"); } },
+      { cap: "Until the model emits a stop condition. The fix for idle compute during decode: batch <i>many</i> requests' decode steps together — which is exactly where chapter 02 begins.",
+        run(sc) { rmCls(sc, "#t101-10", "hl"); setCls(sc, "#t101-11", "in", "ok", "pulse"); } },
+    ],
+  });
+});
+</script>
+</body>
+</html>

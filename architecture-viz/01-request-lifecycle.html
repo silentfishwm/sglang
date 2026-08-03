@@ -1,0 +1,484 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>01 · Processes &amp; Request Lifecycle — SGLang Internals</title>
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/mermaid.min.js"></script>
+<script src="assets/viz.js"></script>
+</head>
+<body>
+<div class="layout">
+<main>
+  <div class="page-hero"><div class="content">
+    <span class="phase-badge">Phase I · Foundations</span>
+    <h1>01 · Processes &amp; the Life of a Request</h1>
+    <p class="lede">
+      Before diving into any subsystem, you need the skeleton: which OS processes exist,
+      how they talk over ZMQ, and exactly what happens between an HTTP request arriving
+      and tokens streaming back. Everything else in this guide hangs off this picture.
+    </p>
+  </div></div>
+
+  <div class="content">
+
+  <h2><span class="sec-num">1.1</span>The three-role architecture</h2>
+  <p>
+    An SGLang server is a small constellation of processes with <strong>three roles</strong>.
+    Only one of them touches the GPU:
+  </p>
+  <ul>
+    <li><strong>Main process</strong> — runs the uvicorn/FastAPI HTTP server <em>and</em> the
+      <code>TokenizerManager</code>. Important: <code>TokenizerManager</code> is a Python object living
+      inside the main process, <em>not</em> a separate process
+      (stated explicitly in the docstring at <code>python/sglang/srt/entrypoints/engine.py</code>).</li>
+    <li><strong>Scheduler subprocesses</strong> — one per GPU rank. Each <code>Scheduler</code> embeds a
+      <code>TpModelWorker</code>, which embeds a <code>ModelRunner</code> — so the model executor runs
+      <em>inside</em> the scheduler process. There is no separate "worker process".</li>
+    <li><strong>Detokenizer subprocess</strong> — one <code>DetokenizerManager</code> that turns token IDs
+      back into UTF-8 text incrementally.</li>
+  </ul>
+
+  <div class="diagram">
+    <div class="dg-title">Process &amp; IPC topology (tp_size = 2, dp_size = 1)</div>
+    <pre class="mermaid">
+flowchart LR
+  client([Client])
+  subgraph main ["Main process"]
+    http["uvicorn + FastAPI<br/><i>http_server.py</i>"]
+    tm["TokenizerManager<br/><i>tokenizer_manager.py</i>"]
+    http --> tm
+  end
+  subgraph s0 ["Scheduler subprocess · GPU 0 (tp_rank 0)"]
+    sched0["Scheduler"]
+    tw0["TpModelWorker"]
+    mr0["ModelRunner"]
+    sched0 --> tw0 --> mr0
+  end
+  subgraph s1 ["Scheduler subprocess · GPU 1 (tp_rank 1)"]
+    sched1["Scheduler → TpModelWorker → ModelRunner"]
+  end
+  detok["DetokenizerManager<br/>(subprocess)"]
+  client -- "HTTP / SSE" --> http
+  tm -- "ZMQ PUSH<br/>TokenizedGenerateReqInput" --> sched0
+  sched0 -. "broadcast_pyobj (gloo)" .-> sched1
+  sched0 -- "ZMQ PUSH<br/>BatchTokenIDOutput" --> detok
+  detok -- "ZMQ PUSH<br/>BatchStrOutput" --> tm
+  sched0 -- "control replies" --> tm
+  style main fill:#eef0ff,stroke:#4f46e5
+  style s0 fill:#e7f7ec,stroke:#16a34a
+  style s1 fill:#e7f7ec,stroke:#16a34a
+  style detok fill:#f5ecfe,stroke:#9333ea
+    </pre>
+    <div class="dg-caption">
+      For <code>tp_size=N</code>, <code>dp_size=1</code>: exactly <b>1 + N + 1</b> processes. Only rank-0
+      schedulers have ZMQ input sockets; other TP ranks receive the same request list via
+      <code>broadcast_pyobj</code> on a gloo CPU process group each loop iteration
+      (<code>scheduler_components/request_receiver.py</code>).
+    </div>
+  </div>
+
+  <div class="callout fact"><span class="co-title">Fact check</span>
+    Verified in code: <code>Engine._launch_subprocesses</code> spawns schedulers with
+    <code>mp.Process(target=run_scheduler_process, ...)</code> and the detokenizer with
+    <code>mp.Process(target=run_detokenizer_process, ...)</code>
+    (<code>python/sglang/srt/entrypoints/engine.py</code>). The HTTP server then starts uvicorn in the
+    main process. A readiness handshake comes back over an <code>mp.Pipe</code>:
+    each scheduler sends <code>get_init_info()</code> through <code>pipe_writer</code> before entering its loop.
+  </div>
+
+  <h3>Spawning, step by step</h3>
+  <div class="stepper" id="st-spawn">
+    <div class="st-scene">
+      <div class="sc-row" style="gap:14px">
+        <div class="sc-box" id="sp-launch">launch_server()<small>http_server.py</small></div>
+        <div class="sc-box appear" id="sp-eng">Engine._launch_subprocesses()<small>engine.py</small></div>
+      </div>
+      <div class="sc-row" style="gap:14px; margin-top:18px">
+        <div class="sc-box appear" id="sp-s0">Scheduler proc<small>gpu 0 · tp_rank 0</small></div>
+        <div class="sc-box appear" id="sp-s1">Scheduler proc<small>gpu 1 · tp_rank 1</small></div>
+        <div class="sc-box appear" id="sp-s2">Scheduler proc<small>gpu 2 · tp_rank 2</small></div>
+        <div class="sc-box appear" id="sp-s3">Scheduler proc<small>gpu 3 · tp_rank 3</small></div>
+      </div>
+      <div class="sc-row" style="gap:14px; margin-top:18px">
+        <div class="sc-box appear" id="sp-pipe" style="border-style:dashed">mp.Pipe readiness handshake<small>pipe_writer.send(get_init_info())</small></div>
+        <div class="sc-box appear" id="sp-dt">Detokenizer proc<small>run_detokenizer_process</small></div>
+        <div class="sc-box appear" id="sp-uv">uvicorn serves HTTP<small>main process</small></div>
+      </div>
+    </div>
+  </div>
+
+  <h2><span class="sec-num">1.2</span>The ZMQ wiring</h2>
+  <p>
+    All cross-process traffic flows over ZMQ sockets whose endpoints are minted once in
+    <code>PortArgs.init_new()</code> (<code>python/sglang/srt/server_args.py</code>) — normally
+    <code>ipc://&lt;tempfile&gt;</code> unix sockets, or TCP ports derived from
+    <code>dist_init_addr</code> when <code>--enable-dp-attention</code> is on
+    (port delta constant <code>ZMQ_TCP_PORT_DELTA = 233</code>).
+  </p>
+
+  <table class="tbl">
+    <tr><th>PortArgs field</th><th>Direction</th><th>Payloads</th></tr>
+    <tr><td><code>scheduler_input_ipc_name</code></td>
+      <td>TokenizerManager <b>binds PUSH</b> → Scheduler rank-0 connects PULL</td>
+      <td><code>TokenizedGenerateReqInput</code>, <code>BatchTokenizedGenerateReqInput</code>,
+          control reqs (<code>AbortReq</code>, <code>FlushCacheReqInput</code>, <code>ProfileReq</code>, …)</td></tr>
+    <tr><td><code>detokenizer_ipc_name</code></td>
+      <td>Scheduler rank-0 PUSH → Detokenizer <b>binds PULL</b></td>
+      <td><code>BatchTokenIDOutput</code>, <code>BatchEmbeddingOutput</code></td></tr>
+    <tr><td><code>tokenizer_ipc_name</code></td>
+      <td>Detokenizer PUSH (and Scheduler PUSH for control replies) → TokenizerManager <b>binds PULL</b></td>
+      <td><code>BatchStrOutput</code>, <code>HealthCheckOutput</code>, control outputs</td></tr>
+    <tr><td><code>rpc_ipc_name</code></td>
+      <td>Engine DEALER ⇄ Scheduler rank-0 DEALER</td>
+      <td><code>RpcReqInput</code> / <code>RpcReqOutput</code></td></tr>
+    <tr><td><code>metrics_ipc_name</code></td>
+      <td>Scheduler PUSH → metrics consumer</td>
+      <td>scheduler stats</td></tr>
+    <tr><td><code>nccl_port</code></td>
+      <td colspan="2">not ZMQ — torch.distributed / NCCL rendezvous</td></tr>
+  </table>
+
+  <div class="callout note"><span class="co-title">Design note</span>
+    The wire format is <b>pickle by default</b>: <code>sock_send</code> uses
+    <code>socket.send_pyobj(...)</code> because <code>SGLANG_USE_PICKLE_IPC</code> defaults to
+    <code>True</code> (<code>environ.py</code>). A msgspec/msgpack tagged-union path exists for every
+    <code>BaseReq</code>/<code>BaseBatchReq</code> struct and can be enabled by turning that env off.
+  </div>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/managers/tokenizer_manager.py:511" data-desc="TokenizerManager creates its sockets — note it BINDS both ends">
+<pre>
+def init_ipc_channels(self, port_args: PortArgs):
+    context = zmq.asyncio.Context(2)
+    self.recv_from_detokenizer = get_zmq_socket(
+        context, zmq.PULL, port_args.tokenizer_ipc_name, True
+    )
+    if self.server_args.tokenizer_worker_num == 1:
+        self.send_to_scheduler = get_zmq_socket(
+            context, zmq.PUSH, port_args.scheduler_input_ipc_name, True
+        )
+        self.tokenizer_ipc_name = None
+    else:
+        # Use tokenizer_worker_ipc_name in multi-tokenizer mode
+        self.send_to_scheduler = get_zmq_socket(
+            context, zmq.PUSH, port_args.tokenizer_worker_ipc_name, False
+        )
+</pre>
+  </div>
+
+  <h2><span class="sec-num">1.3</span>The life of a chat request — animated</h2>
+  <p>
+    Concrete example: a client sends
+    <code>POST /v1/chat/completions</code> with
+    <code>{"messages": [{"role": "user", "content": "What is the capital of France?"}], "stream": true}</code>
+    to a <code>tp=1</code> server. Step through what actually happens — every function named below
+    exists at the cited location.
+  </p>
+
+  <div class="stepper" id="st-life">
+    <div class="st-scene">
+      <div style="display:grid; grid-template-columns: repeat(5, minmax(150px, 1fr)); gap:10px; min-width:820px">
+        <div class="sc-box" id="lf-client" style="text-align:center">Client<small>curl / SDK</small></div>
+        <div class="sc-box" id="lf-http" style="text-align:center">FastAPI + OpenAIServingChat<small>main process</small></div>
+        <div class="sc-box" id="lf-tm" style="text-align:center">TokenizerManager<small>main process</small></div>
+        <div class="sc-box" id="lf-sched" style="text-align:center">Scheduler<small>GPU subprocess</small></div>
+        <div class="sc-box" id="lf-detok" style="text-align:center">Detokenizer<small>subprocess</small></div>
+
+        <div></div>
+        <div class="tok appear" id="lf-m1" style="width:100%; height:auto; padding:4px">POST …/chat/completions</div>
+        <div class="tok appear" id="lf-m2" style="width:100%; height:auto; padding:4px">GenerateReqInput</div>
+        <div class="tok appear" id="lf-m3" style="width:100%; height:auto; padding:4px">TokenizedGenerateReqInput</div>
+        <div class="tok appear" id="lf-m4" style="width:100%; height:auto; padding:4px">BatchTokenIDOutput</div>
+
+        <div class="tok appear" id="lf-m8" style="width:100%; height:auto; padding:4px">SSE: data: {…}</div>
+        <div class="tok appear" id="lf-m7" style="width:100%; height:auto; padding:4px">ChatCompletionStreamResponse</div>
+        <div class="tok appear" id="lf-m6" style="width:100%; height:auto; padding:4px">BatchStrOutput → rid_to_state</div>
+        <div class="tok appear" id="lf-m5" style="width:100%; height:auto; padding:4px; grid-column: span 2">GPU forward → sample → stream_output()</div>
+      </div>
+    </div>
+  </div>
+
+  <p>The same flow as a sequence diagram, with the exact methods:</p>
+
+  <div class="diagram">
+    <div class="dg-title">Streaming chat completion — function-level sequence</div>
+    <pre class="mermaid">
+sequenceDiagram
+  participant C as Client
+  participant H as FastAPI route<br/>openai_v1_chat_completions
+  participant T as TokenizerManager
+  participant S as Scheduler (GPU proc)
+  participant D as DetokenizerManager
+  C->>H: POST /v1/chat/completions (stream=true)
+  H->>H: OpenAIServingChat._convert_to_internal_request()<br/>apply chat template → GenerateReqInput
+  H->>T: generate_request(adapted_request)
+  T->>T: _tokenize_one_request() → TokenizedGenerateReqInput
+  T->>S: ZMQ PUSH (scheduler_input_ipc_name)
+  S->>S: handle_generate_request() → waiting_queue
+  loop every scheduler iteration
+    S->>S: get_next_batch_to_run() → run_batch()<br/>TpModelWorker.forward_batch_generation()
+    S->>D: stream_output() → BatchTokenIDOutput
+    D->>T: incremental detokenize → BatchStrOutput
+    T->>T: _handle_batch_output(): state.out_list += chunk, event.set()
+    T-->>H: _wait_one_response yields chunk
+    H-->>C: data: {"choices":[{"delta":{"content":"…"}}]}
+  end
+  S->>D: finished: finish_reason="stop"
+  D->>T: final BatchStrOutput
+  H-->>C: data: [DONE]
+    </pre>
+    <div class="dg-caption">
+      Verified call chain: <code>handle_request → _convert_to_internal_request →
+      TokenizerManager.generate_request → _tokenize_one_request → _send_one_request →
+      Scheduler.handle_generate_request → run_batch → process_batch_result →
+      output_streamer.stream_output → DetokenizerManager.handle_batch_token_id_out →
+      TokenizerManager.handle_loop → _wait_one_response</code>.
+    </div>
+  </div>
+
+  <h3>The three event loops</h3>
+  <p>
+    Each role runs one tight loop. Reading these three functions side by side is the fastest way
+    to understand SGLang's runtime:
+  </p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/managers/scheduler.py:1628" data-desc="Scheduler: the heartbeat of SGLang (comments trimmed)">
+<pre>
+@DynamicGradMode()
+def event_loop_normal(self):
+    """A normal scheduler loop."""
+    while True:
+        if self.gracefully_exit:
+            break
+        recv_reqs = self.request_receiver.recv_requests()
+        self.process_input_requests(recv_reqs)
+        if self._engine_paused:
+            continue
+        plan = self.get_next_batch_to_run(
+            running_batch=self.running_batch, last_batch=self.last_batch
+        )
+        self.running_batch = plan.running_batch
+        batch = plan.batch_to_run
+        if batch:
+            result = self.run_batch(batch)
+            self.process_batch_result(batch, result)
+        else:
+            self.on_idle()
+        self.last_batch = batch
+</pre>
+  </div>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/managers/detokenizer_manager.py:166" data-desc="Detokenizer: recv → detokenize → forward">
+<pre>
+def event_loop(self):
+    """The event loop that handles requests"""
+    while True:
+        with self.soft_watchdog.disable():
+            recv_obj = sock_recv(self.recv_from_scheduler)
+        output = self._request_dispatcher(recv_obj)
+        if output is not None:
+            sock_send(self.send_to_tokenizer, output)
+        self.soft_watchdog.feed()
+</pre>
+  </div>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/managers/tokenizer_manager.py:2068" data-desc="TokenizerManager: async loop matching outputs back to awaiting coroutines">
+<pre>
+async def handle_loop(self):
+    """The event loop that handles requests"""
+    while True:
+        with self.soft_watchdog.disable():
+            recv_obj = await async_sock_recv(self.recv_from_detokenizer)
+        if isinstance(
+            recv_obj,
+            (BatchStrOutput, BatchEmbeddingOutput, BatchTokenIDOutput),
+        ):
+            await self._handle_batch_output(recv_obj)
+        else:
+            self._result_dispatcher(recv_obj)
+        self.last_receive_tstamp = real_time()
+        self.soft_watchdog.feed()
+</pre>
+  </div>
+
+  <div class="callout note"><span class="co-title">Why split detokenization into its own process?</span>
+    Incremental detokenization is pure CPU work (and must handle multi-byte UTF-8 characters that
+    arrive split across steps — the detokenizer holds back text ending in a partial "�" until the
+    character completes). Moving it out of the scheduler process keeps the GPU loop free of
+    per-token string work, and moving it out of the main process keeps the asyncio HTTP loop
+    responsive.
+  </div>
+
+  <h2><span class="sec-num">1.4</span>Scaling the topology: dp_size, multi-node, multi-tokenizer</h2>
+
+  <div class="diagram">
+    <div class="dg-title">Topology with dp_size = 2, tp_size = 2 (DataParallelController)</div>
+    <pre class="mermaid">
+flowchart TB
+  tm["Main process<br/>FastAPI + TokenizerManager"]
+  dpc["DataParallelController<br/>(subprocess)<br/>round_robin / total_tokens /<br/>total_requests / follow_bootstrap_room"]
+  subgraph dp0 ["DP replica 0"]
+    s00["Scheduler gpu0<br/>tp_rank 0"]
+    s01["Scheduler gpu1<br/>tp_rank 1"]
+  end
+  subgraph dp1 ["DP replica 1"]
+    s10["Scheduler gpu2<br/>tp_rank 0"]
+    s11["Scheduler gpu3<br/>tp_rank 1"]
+  end
+  dt["DetokenizerManager"]
+  tm -->|"ZMQ PUSH"| dpc
+  dpc -->|"per-replica PUSH"| s00
+  dpc -->|"per-replica PUSH"| s10
+  s00 -.->|broadcast_pyobj| s01
+  s10 -.->|broadcast_pyobj| s11
+  s00 --> dt
+  s10 --> dt
+  dt --> tm
+  style dpc fill:#fdf3e3,stroke:#d97706
+  style dp0 fill:#e7f7ec,stroke:#16a34a
+  style dp1 fill:#e7f7ec,stroke:#16a34a
+    </pre>
+    <div class="dg-caption">
+      With <code>dp_size &gt; 1</code> the main process spawns a single
+      <code>DataParallelController</code> subprocess, which spawns all
+      <code>dp_size × tp_size × pp_size</code> schedulers itself and load-balances requests
+      (<code>data_parallel_controller.py</code>). Each replica gets its own
+      <code>scheduler_input_ipc_name</code>, but all replicas share one detokenizer and one
+      tokenizer return path.
+    </div>
+  </div>
+
+  <table class="tbl">
+    <tr><th>Flag</th><th>Effect on topology</th></tr>
+    <tr><td><code>--tp-size N</code></td><td>N scheduler processes per DP replica per PP stage; NCCL TP group across them.</td></tr>
+    <tr><td><code>--pp-size K</code></td><td>Multiplies scheduler count; PP ranks &gt; 0 receive requests via <code>point_to_point_pyobj</code> from the previous stage, not ZMQ.</td></tr>
+    <tr><td><code>--dp-size M</code></td><td>Activates the <code>DataParallelController</code>; M independent replicas (each a full TP×PP world).</td></tr>
+    <tr><td><code>--enable-dp-attention</code></td><td>DP nested <i>inside</i> the TP group (see chapter 07); all ZMQ switches from <code>ipc://</code> to TCP.</td></tr>
+    <tr><td><code>--nnodes / --node-rank</code></td><td>Nodes with <code>node_rank ≥ 1</code> run schedulers only — no TokenizerManager, no detokenizer, just a dummy health-check server.</td></tr>
+    <tr><td><code>--tokenizer-worker-num K</code></td><td>uvicorn forks K HTTP workers, each with a private <code>TokenizerWorker</code>; a <code>MultiTokenizerRouter</code> fans traffic in/out.</td></tr>
+    <tr><td><code>--skip-tokenizer-init</code></td><td>Client sends/receives token IDs; scheduler pushes <code>BatchTokenIDOutput</code> straight back, bypassing the detokenizer.</td></tr>
+    <tr><td><code>--load-balance-method</code></td><td>DPC policy: <code>round_robin</code>, <code>total_requests</code>, <code>total_tokens</code> (shared-memory load snapshots), <code>follow_bootstrap_room</code> (PD disaggregation).</td></tr>
+  </table>
+
+  <h2><span class="sec-num">1.5</span>Entry points: one engine, many faces</h2>
+
+  <div class="diagram">
+    <div class="dg-title">Every way into the same engine</div>
+    <pre class="mermaid">
+flowchart LR
+  cli["sglang serve<br/><i>cli/serve.py</i>"] --> rs["run_server()<br/><i>launch_server.py</i>"]
+  legacy["python -m sglang.launch_server"] --> rs
+  rs --> http["launch_server()<br/>HTTP + FastAPI<br/><i>entrypoints/http_server.py</i>"]
+  rs --> grpc["gRPC server<br/>(chapter 11)"]
+  py["import sglang as sgl<br/>sgl.Engine(...)"] --> eng["Engine<br/><i>entrypoints/engine.py</i>"]
+  http --> sub["Engine._launch_subprocesses()"]
+  eng --> sub
+  sub --> procs["Schedulers + Detokenizer<br/>+ TokenizerManager"]
+  style sub fill:#eef0ff,stroke:#4f46e5
+    </pre>
+    <div class="dg-caption">
+      The offline <code>Engine</code> API and the HTTP server share the exact same subprocess
+      launcher — <code>Engine._launch_subprocesses</code> is a classmethod used by both. The
+      <code>sglang serve</code> CLI additionally auto-detects diffusion models and routes them to the
+      separate <code>multimodal_gen</code> stack (chapter 12).
+    </div>
+  </div>
+
+  <h2><span class="sec-num">1.6</span>Notable facts &amp; gotchas</h2>
+  <div class="card">
+    <ul>
+      <li><b>The "model worker" is not a process.</b> <code>TpModelWorker</code> / <code>ModelRunner</code>
+        live inside each scheduler subprocess. The only GPU-facing processes are the schedulers.</li>
+      <li><b>Bind/connect direction is unusual:</b> the TokenizerManager <i>binds</i> both its PUSH
+        (to scheduler) and PULL (from detokenizer) sockets; schedulers and the detokenizer connect
+        to it. Exception: the detokenizer binds its own PULL.</li>
+      <li><b>Crash propagation is via signals:</b> a scheduler hitting an exception sends
+        <code>SIGQUIT</code> to the parent process; a <code>SubprocessWatchdog</code> in the parent watches
+        all children.</li>
+      <li><b>Health checks skip the queue:</b> <code>process_input_requests</code> short-circuits
+        health-check requests and replies with a bare <code>HealthCheckOutput</code> directly to the
+        tokenizer socket when the engine is busy.</li>
+      <li><b>Sessions are scheduler-side state:</b> <code>/open_session</code> creates a per-session tree
+        of <code>SessionReqNode</code>s inside the scheduler (<code>session/session_controller.py</code>),
+        letting multi-turn requests branch and continue server-side.</li>
+      <li><b>An embedded Rust server can replace three Python components:</b> with
+        <code>SGLANG_RUST_SERVER=1</code>, the rank-0 scheduler embeds a Rust API server owning HTTP +
+        tokenization + detokenization, draining an in-process ring buffer instead of ZMQ.</li>
+      <li><b>The DP controller keeps immortal threads:</b> each DP replica launcher thread sleeps
+        ~30 days in a loop forever, because exiting it would trigger
+        <code>kill_itself_when_parent_died</code> in the child schedulers.</li>
+    </ul>
+  </div>
+
+  <div id="pager"></div>
+  </div>
+</main>
+</div>
+
+<script>
+document.addEventListener("DOMContentLoaded", () => {
+
+  new Stepper("#st-spawn", {
+    title: "Server startup: from launch_server() to a ready engine (tp_size = 4)",
+    intro: "How the process tree is built at startup.",
+    reset(sc) {
+      clearState(sc, ".sc-box");
+      rmCls(sc, ".appear", "in");
+    },
+    steps: [
+      { cap: "<code>launch_server()</code> (http_server.py) parses <code>ServerArgs</code>, then calls the shared launcher used by both the HTTP server and the offline <code>Engine</code>.",
+        run(sc) { setCls(sc, "#sp-launch", "hl", "pulse"); } },
+      { cap: "<code>Engine._launch_subprocesses()</code> mints all ZMQ endpoints via <code>PortArgs.init_new()</code> — one tempfile <code>ipc://</code> path per channel.",
+        run(sc) { rmCls(sc, "#sp-launch", "pulse"); setCls(sc, "#sp-eng", "in", "hl", "pulse"); } },
+      { cap: "One <code>mp.Process(target=run_scheduler_process, ...)</code> per GPU rank. Each gets <code>(gpu_id, tp_rank, pp_rank, …)</code> and an <code>mp.Pipe</code> writer for the readiness handshake.",
+        run(sc) { rmCls(sc, "#sp-eng", "pulse"); setCls(sc, "#sp-s0,#sp-s1,#sp-s2,#sp-s3", "in", "hl"); } },
+      { cap: "Each scheduler builds its <code>TpModelWorker → ModelRunner</code>, loads weights, allocates KV cache, captures CUDA graphs … then sends <code>get_init_info()</code> back through the pipe.",
+        run(sc) { rmCls(sc, "#sp-s0,#sp-s1,#sp-s2,#sp-s3", "hl"); setCls(sc, "#sp-s0,#sp-s1,#sp-s2,#sp-s3", "ok"); setCls(sc, "#sp-pipe", "in", "hl"); } },
+      { cap: "The detokenizer subprocess starts: <code>mp.Process(target=run_detokenizer_process, ...)</code>.",
+        run(sc) { rmCls(sc, "#sp-pipe", "hl"); setCls(sc, "#sp-dt", "in", "ok"); } },
+      { cap: "Finally the main process constructs the <code>TokenizerManager</code> and runs uvicorn. The server is ready — <code>1 + 4 + 1</code> processes for tp_size=4.",
+        run(sc) { setCls(sc, "#sp-uv", "in", "ok", "pulse"); setCls(sc, "#sp-launch,#sp-eng", "ok"); } },
+    ],
+  });
+
+  new Stepper("#st-life", {
+    title: 'Life of "What is the capital of France?" (streaming)',
+    intro: "Follow one request through all five stations.",
+    autoMs: 3400,
+    reset(sc) {
+      clearState(sc, ".sc-box,.tok");
+      rmCls(sc, ".appear", "in");
+    },
+    steps: [
+      { cap: "The client opens <code>POST /v1/chat/completions</code> with <code>stream=true</code>.",
+        run(sc) { setCls(sc, "#lf-client", "hl"); setCls(sc, "#lf-m1", "in", "hl"); } },
+      { cap: "FastAPI routes to <code>openai_v1_chat_completions</code> → <code>OpenAIServingChat.handle_request</code>: validate, apply the chat template, build a <code>GenerateReqInput</code>. The first stream chunk is pulled <i>eagerly</i> so bad requests still get HTTP 400.",
+        run(sc) { rmCls(sc, "#lf-client,#lf-m1", "hl"); setCls(sc, "#lf-http", "hl"); setCls(sc, "#lf-m2", "in", "hl"); } },
+      { cap: "<code>TokenizerManager.generate_request</code>: run the HF tokenizer (<code>_tokenize_one_request</code>), register <code>rid_to_state[rid]</code>, and build a <code>TokenizedGenerateReqInput</code>.",
+        run(sc) { rmCls(sc, "#lf-http,#lf-m2", "hl"); setCls(sc, "#lf-tm", "hl"); setCls(sc, "#lf-m3", "in", "hl"); } },
+      { cap: "<code>_send_one_request</code> pushes it over ZMQ (<code>scheduler_input_ipc_name</code>) — pickle on the wire. The coroutine now parks in <code>_wait_one_response</code>, awaiting an <code>asyncio.Event</code>.",
+        run(sc) { rmCls(sc, "#lf-tm,#lf-m3", "hl"); setCls(sc, "#lf-sched", "hl"); } },
+      { cap: "Scheduler: <code>recv_requests → process_input_requests → handle_generate_request</code> creates a <code>Req</code> and appends it to <code>waiting_queue</code>. Next iteration it joins a batch (chapter 02).",
+        run(sc) { setCls(sc, "#lf-sched", "pulse"); } },
+      { cap: "<code>run_batch → TpModelWorker.forward_batch_generation → ModelRunner.forward + .sample</code> — the GPU produces the next token for every request in the batch at once.",
+        run(sc) { rmCls(sc, "#lf-sched", "pulse"); setCls(sc, "#lf-m5", "in", "ok"); } },
+      { cap: "<code>output_streamer.stream_output</code> batches per-request deltas into a <code>BatchTokenIDOutput</code> and pushes it to the detokenizer.",
+        run(sc) { setCls(sc, "#lf-m4", "in", "hl"); setCls(sc, "#lf-detok", "hl"); } },
+      { cap: "The detokenizer converts IDs to text <i>incrementally</i> — holding back trailing bytes of unfinished UTF-8 characters — and forwards a <code>BatchStrOutput</code>.",
+        run(sc) { rmCls(sc, "#lf-m4", "hl"); setCls(sc, "#lf-m6", "in", "hl"); } },
+      { cap: "<code>TokenizerManager.handle_loop</code> matches the rid, appends the chunk to <code>state.out_list</code>, and fires <code>state.event</code> — waking <code>_wait_one_response</code>.",
+        run(sc) { rmCls(sc, "#lf-detok", "hl"); setCls(sc, "#lf-tm", "ok"); } },
+      { cap: "<code>_generate_chat_stream</code> wraps the delta in an OpenAI <code>ChatCompletionStreamResponse</code> chunk…",
+        run(sc) { rmCls(sc, "#lf-m6", "hl"); setCls(sc, "#lf-m7", "in", "ok"); } },
+      { cap: "…and the <code>StreamingResponse</code> writes <code>data: {…}</code> to the socket. Steps 6–10 repeat every decode iteration until <code>finish_reason</code> arrives, then <code>data: [DONE]</code>.",
+        run(sc) { setCls(sc, "#lf-m8", "in", "ok", "pulse"); setCls(sc, "#lf-client", "ok"); } },
+      { cap: "If the client disconnects mid-stream, <code>_wait_one_response</code> sends an <code>AbortReq</code> down the same ZMQ pipe — the scheduler evicts the request and frees its KV cache.",
+        run(sc) { rmCls(sc, "#lf-m8", "pulse"); setCls(sc, "#lf-m1", "bad"); } },
+    ],
+  });
+
+});
+</script>
+</body>
+</html>
