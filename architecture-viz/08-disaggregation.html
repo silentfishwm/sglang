@@ -1,0 +1,747 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>08 · PD Disaggregation, HiCache &amp; Router — SGLang Internals</title>
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/mermaid.min.js"></script>
+<script src="assets/viz.js"></script>
+</head>
+<body>
+<div class="layout">
+<main>
+  <div class="page-hero"><div class="content">
+    <span class="phase-badge">Phase IV · Scaling Out</span>
+    <h1>08 · Serving at Scale: PD Disaggregation, HiCache &amp; the Model Gateway</h1>
+    <p class="lede">
+      One GPU node is never the whole story. This chapter covers the machinery that turns
+      SGLang instances into a fleet: splitting prefill and decode onto separate servers with
+      RDMA KV transfer, spilling the KV cache into host memory and remote storage (HiCache),
+      and the Rust model gateway that routes requests across all of it — plus the exotic
+      alternative of splitting one GPU's SMs between prefill and decode.
+    </p>
+  </div></div>
+
+  <div class="content">
+
+  <h2><span class="sec-num">8.1</span>Why split prefill from decode?</h2>
+  <p>
+    Prefill and decode are opposite workloads sharing one engine. Prefill is
+    <strong>compute-bound</strong>: thousands of tokens in one forward pass, saturating the SMs
+    for hundreds of milliseconds. Decode is <strong>latency-bound</strong>: one token per request
+    per step, dominated by memory bandwidth, and users feel every hiccup as inter-token latency.
+    Colocated, they interfere — every big prefill stalls all running decodes for that iteration
+    (chunked prefill from chapter 02 softens this, but doesn't eliminate it, and it costs prefill
+    throughput). The fix, popularized by Mooncake (Moonshot AI's serving stack, FAST'25 best
+    paper) and DistServe, is to run <em>prefill-only</em> and <em>decode-only</em> server pools
+    and ship the KV cache from P to D over RDMA. Each pool then scales, batches and
+    parallelizes independently — prefill wants max-throughput batching and can even use a
+    different TP size than decode.
+  </p>
+
+  <div class="diagram">
+    <div class="dg-title">The disaggregated fleet — big picture</div>
+    <pre class="mermaid">
+flowchart LR
+  client([Clients])
+  gw["Model Gateway (Rust)<br/><i>sgl-model-gateway</i><br/>policy per pool + bootstrap injection"]
+  subgraph pf ["Prefill fleet (--disaggregation-mode prefill)"]
+    p0["P0 · Scheduler<br/>+ KVBootstrapServer :8998"]
+    p1["P1 · Scheduler<br/>+ KVBootstrapServer :8998"]
+  end
+  subgraph df ["Decode fleet (--disaggregation-mode decode)"]
+    d0["D0 · Scheduler"]
+    d1["D1 · Scheduler"]
+  end
+  fabric["KV transfer fabric<br/>RDMA / InfiniBand<br/>(mooncake · nixl · mori · ascend)"]
+  client --> gw
+  gw -- "same request + bootstrap_room<br/>to BOTH sides" --> p0
+  gw --> d0
+  d0 -. "GET /route (topology)" .-> p0
+  p0 == "KV pages + metadata<br/>(first output token)" ==> fabric ==> d0
+  d0 -- "token stream" --> gw --> client
+  style gw fill:#eef0ff,stroke:#4f46e5
+  style pf fill:#e7f7ec,stroke:#16a34a
+  style df fill:#fdf3e3,stroke:#d97706
+  style fabric fill:#f5ecfe,stroke:#9333ea
+    </pre>
+    <div class="dg-caption">
+      The gateway sends <b>the same request to both a prefill and a decode worker</b>, correlated
+      by a minted <code>bootstrap_room</code> id. P computes the KV cache and the <i>first</i>
+      output token, RDMA-writes both to D, and D carries on decoding from token 2. The
+      bootstrap HTTP server (aiohttp, default port 8998) lives <i>inside the prefill server</i>
+      (<code>python/sglang/srt/disaggregation/common/conn.py</code>).
+    </div>
+  </div>
+
+  <h2><span class="sec-num">8.2</span>The PD architecture in code</h2>
+  <p>
+    Everything lives under <code>python/sglang/srt/disaggregation/</code>. A server's role is
+    <code>DisaggregationMode</code> — <code>NULL</code> (colocated, the default), <code>PREFILL</code>,
+    or <code>DECODE</code> — selected by <code>--disaggregation-mode</code>. The data mover is a
+    pluggable <code>TransferBackend</code>:
+  </p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/disaggregation/utils.py:100" data-desc="The two enums that define PD; TransferBackend is at utils.py:541 (classes shown back to back)">
+<pre>
+class DisaggregationMode(Enum):
+    NULL = "null"
+    PREFILL = "prefill"
+    DECODE = "decode"
+
+class TransferBackend(Enum):
+    MOONCAKE = "mooncake"
+    MORI = "mori"
+    NIXL = "nixl"
+    ASCEND = "ascend"
+    FAKE = "fake"
+</pre>
+  </div>
+
+  <p>Four moving parts make the P↔D rendezvous work:</p>
+  <ul>
+    <li><strong>Bootstrap server</strong> — an aiohttp app started by the prefill scheduler
+      (TP rank 0) on <code>--disaggregation-bootstrap-port</code> (default <b>8998</b>). Prefill
+      ranks <code>PUT /route</code> their topology (attn TP/DP/PP rank &amp; size, rank IP/port, page
+      size, KV dtype) at startup via <code>register_to_bootstrap()</code>
+      (<code>common/conn.py:674</code>); decode ranks <code>GET /route</code> to discover which
+      prefill ranks hold their KV shard — this is where asymmetric TP between P and D gets
+      resolved.</li>
+    <li><strong><code>bootstrap_room</code></strong> — an integer correlation id minted by the
+      router and injected into the request JSON sent to <em>both</em> sides
+      (<code>bootstrap_host</code>, <code>bootstrap_port</code>, <code>bootstrap_room</code> fields on
+      <code>GenerateReqInput</code>, <code>io_struct.py</code>). It keys every handshake and transfer
+      table end to end.</li>
+    <li><strong>KV sender/receiver</strong> — per-request objects from
+      <code>get_kv_class(transfer_backend, KVClassType.SENDER/RECEIVER)</code>
+      (<code>utils.py:558</code>), created by the queues below.</li>
+    <li><strong><code>MetadataBuffers</code></strong> (<code>utils.py:262</code>) — pinned tensors
+      carrying the first output token, cached-token count, logprobs and optional hidden states
+      from P to D, indexed by a <code>ReqToMetadataIdxAllocator</code>.</li>
+  </ul>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/disaggregation/common/conn.py:1564" data-desc="The whole bootstrap-server API surface">
+<pre>
+def _setup_routes(self):
+    self.app.router.add_route("*", "/route", self._handle_route)
+    self.app.router.add_post("/register_dp_rank", self._handle_register_dp_rank)
+    self.app.router.add_post("/query_dp_ranks", self._handle_query_dp_ranks)
+    self.app.router.add_get("/health", self._handle_health_check)
+</pre>
+  </div>
+
+  <p>
+    Each role adds two queues to the scheduler (created in <code>Scheduler.__init__</code>,
+    <code>managers/scheduler.py:1209–1339</code>) and swaps in a role-specific event loop
+    (mixed in via <code>SchedulerDisaggregationPrefillMixin</code> /
+    <code>SchedulerDisaggregationDecodeMixin</code>):
+  </p>
+
+  <div class="diagram">
+    <div class="dg-title">Scheduler event loop, per role</div>
+    <pre class="mermaid">
+flowchart TB
+  subgraph P ["PREFILL · event_loop_normal_disagg_prefill (prefill.py:557)"]
+    pr["recv_requests"] --> pbq["disagg_prefill_bootstrap_queue<br/>PrefillBootstrapQueue<br/>KVSender per req · poll handshake"]
+    pbq -- "pop_bootstrapped()" --> pwq["waiting_queue"]
+    pwq --> pfw["prefill forward<br/>(chunked)"]
+    pfw -- "send_kv_chunk() per chunk<br/><i>prefill.py:1106</i>" --> piq["disagg_prefill_inflight_queue"]
+    piq -- "KVPoll.Success →<br/>free or radix-cache KV" --> pdone["done"]
+  end
+  subgraph D ["DECODE · event_loop_normal_disagg_decode (decode.py:2083)"]
+    dr["recv_requests"] --> dpq["disagg_decode_prealloc_queue<br/>DecodePreallocQueue<br/>KVReceiver per req"]
+    dpq -- "pop_preallocated()<br/>alloc FULL input KV" --> dtq["disagg_decode_transfer_queue<br/>DecodeTransferQueue"]
+    dtq -- "pop_transferred()<br/>KVPoll.Success" --> dwq["waiting_queue<br/>(prebuilt batch)"]
+    dwq --> drb["running_batch · decode steps"]
+  end
+  piq == "RDMA KV pages + MetadataBuffers" ==> dtq
+  style P fill:#e7f7ec,stroke:#16a34a
+  style D fill:#fdf3e3,stroke:#d97706
+    </pre>
+    <div class="dg-caption">
+      Prefill side: <code>PrefillBootstrapQueue</code> → <code>waiting_queue</code> →
+      <code>disagg_prefill_inflight_queue</code>. Decode side: <code>DecodePreallocQueue</code> →
+      <code>DecodeTransferQueue</code> → <code>waiting_queue</code>. Overlap-scheduling variants
+      exist for both (<code>event_loop_overlap_disagg_prefill</code> at <code>prefill.py:595</code>,
+      <code>event_loop_overlap_disagg_decode</code> at <code>decode.py:2117</code>).
+    </div>
+  </div>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/disaggregation/prefill.py:557" data-desc="Prefill event loop — chapter 01's loop plus one line: drain the bootstrap queue (excerpt)">
+<pre>
+def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
+    """A normal scheduler loop for prefill worker in disaggregation mode."""
+    while True:
+        # Receive requests
+        recv_reqs = self.request_receiver.recv_requests()
+        self.process_input_requests(recv_reqs)
+        if self._engine_paused:
+            continue
+        self.waiting_queue.extend(
+            self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
+        )
+</pre>
+  </div>
+
+  <p>
+    Per-request transfer state is a five-state machine, <code>KVPoll</code>
+    (<code>base/conn.py:89</code>): <code>Failed=0 → Bootstrapping=1 → WaitingForInput=2 →
+    Transferring=3 → Success=4</code>. Because every TP rank has its own sender/receiver, ranks
+    agree on a state via a MIN all-reduce (<code>poll_and_all_reduce</code>,
+    <code>utils.py:161</code>) — one lagging rank holds the whole request back, and one
+    <code>Failed</code> rank fails it everywhere.
+  </p>
+
+  <h2><span class="sec-num">8.3</span>One request through PD, step by step</h2>
+  <p>
+    Concrete example: a 6,144-token contract-summarization prompt, page size 64 → <b>96 KV
+    pages</b>. The gateway picks prefill worker <b>P2</b> and decode worker <b>D0</b> and mints
+    <code>bootstrap_room = 771236</code>. Every function named below exists at the cited file.
+  </p>
+
+  <div class="stepper" id="st-pd">
+    <div class="st-scene">
+      <div class="sc-row" style="justify-content:center">
+        <div class="sc-box" id="pd-router">Model Gateway<small>select_pd_pair() · pd_router.rs:972</small></div>
+      </div>
+      <div style="display:grid; grid-template-columns: 1fr 1fr; gap:16px; min-width:760px; margin-top:14px">
+        <div>
+          <div class="sc-row"><div class="sc-box" id="pd-p" style="width:100%">P2 · prefill scheduler<small>bootstrap server :8998</small></div></div>
+          <div class="sc-row"><div class="sc-box" id="pd-pbq" style="width:100%">PrefillBootstrapQueue<small>KVSender · room 771236</small></div></div>
+          <div class="sc-row"><div class="sc-box appear" id="pd-pfw" style="width:100%">prefill forward<small>6144 tokens, chunked</small></div></div>
+          <div class="sc-row"><div class="sc-box appear" id="pd-piq" style="width:100%">disagg_prefill_inflight_queue<small>poll KVPoll until Success</small></div></div>
+        </div>
+        <div>
+          <div class="sc-row"><div class="sc-box" id="pd-d" style="width:100%">D0 · decode scheduler<small>KVReceiver · room 771236</small></div></div>
+          <div class="sc-row"><div class="sc-box" id="pd-dpq" style="width:100%">DecodePreallocQueue<small>prealloc FULL input KV</small></div></div>
+          <div class="sc-row"><div class="sc-box appear" id="pd-dtq" style="width:100%">DecodeTransferQueue<small>await RDMA writes</small></div></div>
+          <div class="sc-row"><div class="sc-box appear" id="pd-drb" style="width:100%">running_batch<small>decode from token 2</small></div></div>
+        </div>
+      </div>
+      <div class="sc-row" style="margin-top:14px; justify-content:center">
+        <span style="font-size:11px; color:var(--ink-faint)">KV pages in flight →</span>
+        <span class="tok" id="pd-kv1">pg 0–31</span>
+        <span class="tok" id="pd-kv2">pg 32–63</span>
+        <span class="tok" id="pd-kv3">pg 64–95</span>
+        <span class="tok" id="pd-meta">meta: tok "The" + room 771236</span>
+      </div>
+    </div>
+  </div>
+
+  <p>
+    The reason D preallocates KV for the <em>entire</em> input before any bytes move is a
+    deadlock guard. Decode can normally retract running requests to free memory (chapter 02),
+    but a request whose KV is mid-transfer <em>cannot</em> be retracted — so
+    <code>pop_preallocated</code> only admits a request if retracting the currently-running
+    batch could always free enough room:
+  </p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/disaggregation/decode.py:916" data-desc="The retractability invariant guarding decode preallocation">
+<pre>
+# We need to make sure that the sum of inflight tokens and allocatable tokens is greater than maximum input+output length of each inflight request
+# Otherwise it is possible for one request running decode out of memory, while all other requests are in the transfer queue that cannot be retracted.
+retractable_tokens = sum(
+    len(r.origin_input_ids) + len(r.output_ids)
+    for r in self.scheduler.running_batch.reqs
+)
+</pre>
+  </div>
+
+  <div class="callout note"><span class="co-title">Recovery paths</span>
+    Three escape hatches keep the pipeline from wedging: decode can <b>retract</b> transferred
+    requests back into <code>DecodePreallocQueue</code> (<code>resume_retracted_reqs</code>,
+    <code>decode.py</code>); it can <b>rebootstrap</b> — POST <code>/generate</code> directly to the
+    prefill server's advertised <code>prefill_http_port</code> to recompute KV from scratch
+    (<code>common/conn.py:102</code>); and with <code>--optimistic-prefill-attempts N</code> the
+    prefill side runs the forward <i>before</i> the handshake completes, releasing and
+    re-queueing via <code>optimistic_release_and_requeue</code> (<code>prefill.py:1254</code>) if the
+    receiver still isn't ready.
+  </div>
+
+  <h2><span class="sec-num">8.4</span>The KV transfer abstraction</h2>
+  <p>
+    Backends plug into four abstract classes in
+    <code>python/sglang/srt/disaggregation/base/conn.py</code>, all constructed through
+    <code>get_kv_class()</code>: a per-scheduler <code>BaseKVManager</code> (owns registered memory +
+    transfer threads), per-request <code>BaseKVSender</code> / <code>BaseKVReceiver</code>, and a
+    <code>BaseKVBootstrapServer</code>. The manager is fed a <code>KVArgs</code> struct — raw device
+    pointers, lengths and item sizes for every KV layer, the aux metadata buffers, and
+    auxiliary <em>state tensors</em> (<code>StateType</code>: Mamba conv/ssm, SWA, DSA and friends —
+    hybrid models transfer more than plain KV pages). All real backends share
+    <code>CommonKVManager/Sender/Receiver/BootstrapServer</code> (<code>common/conn.py</code>), which
+    implements bootstrap registration, ZMQ control-plane sockets between ranks, and the
+    rank-mapping math for heterogeneous P/D TP sizes.
+  </p>
+
+  <table class="tbl">
+    <tr><th>Backend</th><th>File</th><th>How it moves bytes</th></tr>
+    <tr><td><code>mooncake</code> <i>(default)</i></td><td><code>disaggregation/mooncake/conn.py</code></td>
+      <td>Mooncake TransferEngine — RDMA over InfiniBand/RoCE. Prefill spawns
+        <code>FastQueue</code>s drained by transfer-worker thread pools; contiguous pages are
+        coalesced (<code>group_concurrent_contiguous</code>) into <code>batch_transfer_sync</code>
+        calls. NIC choice via <code>--disaggregation-ib-device</code> (auto-detected if unset).</td></tr>
+    <tr><td><code>nixl</code></td><td><code>disaggregation/nixl/conn.py</code></td>
+      <td>NVIDIA NIXL: a <code>nixl_agent</code> registers memory regions and issues prepared
+        transfers — <code>agent.make_prepped_xfer(...)</code> + <code>agent.transfer(handle)</code> —
+        over UCX/RDMA/GDS.</td></tr>
+    <tr><td><code>mori</code></td><td><code>disaggregation/mori/conn.py</code></td>
+      <td>AMD MoRI IO engine (<code>from mori.io import ...</code>).</td></tr>
+    <tr><td><code>ascend</code></td><td><code>disaggregation/ascend/transfer_engine.py</code></td>
+      <td>Huawei Ascend NPU transfer engine.</td></tr>
+    <tr><td><code>fake</code></td><td><code>disaggregation/fake/conn.py</code></td>
+      <td>No-op: "For warmup reqs, we don't kv transfer" — polls always succeed. Also handy for
+        testing PD scheduling without RDMA hardware.</td></tr>
+  </table>
+
+  <div class="callout fact"><span class="co-title">Asymmetric TP: the staging path</span>
+    When prefill and decode use different attention-TP sizes, KV head slices don't line up
+    1:1 across ranks. With <code>SGLANG_DISAGG_STAGING_BUFFER</code> enabled, Mooncake and NIXL
+    switch to a staging pipeline — the docstring says it all: <i>"Transfer KV cache via staging
+    buffers (gather -&gt; bulk RDMA -&gt; scatter on decode)"</i>
+    (<code>mooncake/conn.py:518</code>, shared logic in <code>common/staging_buffer.py</code> /
+    <code>staging_handler.py</code>).
+  </div>
+
+  <h2><span class="sec-num">8.5</span>HiCache: the KV cache grows three tiers</h2>
+  <p>
+    Disaggregation ships KV <em>sideways</em>; HiCache ships it <em>down</em> the memory
+    hierarchy. With <code>--enable-hierarchical-cache</code>, the radix tree from chapter 03
+    becomes a <code>HiRadixCache</code> (<code>mem_cache/hiradix_cache.py:76</code>) whose nodes can
+    live in three places: <b>L1</b> device KV pool, <b>L2</b> pinned host memory
+    (<code>HostKVCache</code> pools in <code>mem_cache/memory_pool_host.py</code>, sized
+    <code>device_size × --hicache-ratio</code>, default 2.0), and <b>L3</b> external storage. A node
+    with <code>value=None</code> but <code>host_value</code> set is "evicted but backuped"; a node
+    known only by its <code>hash_value</code> chain lives in storage. The data mover is
+    <code>HiCacheController</code> (<code>managers/cache_controller.py:225</code>).
+  </p>
+
+  <div class="diagram">
+    <div class="dg-title">HiCache tiers and the controller's streams &amp; threads</div>
+    <pre class="mermaid">
+flowchart TB
+  sched["Scheduler thread<br/>match_prefix · check_hicache_events()"]
+  subgraph L1 ["L1 · device KV pool (GPU)"]
+    dev["token_to_kv_pool"]
+  end
+  subgraph ctl ["HiCacheController (cache_controller.py:225)"]
+    ws["write_stream (CUDA)<br/>device→host backup"]
+    ls["load_stream (CUDA)<br/>host→device, per-layer<br/>LayerDoneCounter"]
+    pt["prefetch_thread (daemon)<br/>hash-chain lookup + IO"]
+    bt["backup_thread (daemon)<br/>host→storage batches"]
+  end
+  subgraph L2 ["L2 · pinned host pool (HostKVCache)"]
+    host["memory_pool_host<br/>size = device × hicache-ratio"]
+  end
+  subgraph L3 ["L3 · storage backends"]
+    store["file · mooncake · hf3fs · nixl · aibrix<br/>eic · simm · mori · shm · dynamic"]
+  end
+  dev -- "write-through" --> ws --> host
+  host -- "load_back" --> ls --> dev
+  store -- "prefetch" --> pt --> host
+  host -- "backup" --> bt --> store
+  sched -. "poll event-acked queues" .-> ctl
+  style L1 fill:#e7f7ec,stroke:#16a34a
+  style L2 fill:#eef0ff,stroke:#4f46e5
+  style L3 fill:#f5ecfe,stroke:#9333ea
+  style ctl fill:#fdf3e3,stroke:#d97706
+    </pre>
+    <div class="dg-caption">
+      Device↔host copies run on dedicated CUDA <code>write_stream</code>/<code>load_stream</code>
+      with start/finish events pushed into ack queues; the scheduler polls them each round via
+      <code>tree_cache.check_hicache_events()</code> (TP-MIN-synced counts). Host↔storage moves run
+      on two daemon threads. The 10 registered L3 backends are in
+      <code>mem_cache/storage/backend_factory.py:197–247</code> (<code>dynamic</code> loads any
+      module_path/class_name from extra config).
+    </div>
+  </div>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/managers/cache_controller.py:673" data-desc="Write-through entry point: allocate host slots, enqueue, kick the write stream">
+<pre>
+def write(
+    self,
+    device_indices: torch.Tensor,
+    priority: Optional[int] = None,
+    node_id: int = -1,
+) -> Optional[torch.Tensor]:
+    """
+    Back up KV caches from device memory to host memory.
+    """
+    host_indices = self.mem_pool_host.alloc(len(device_indices))
+    if host_indices is None:
+        return None
+    self.write_queue.append(
+        CacheOperation(host_indices, device_indices, node_id, priority)
+    )
+    self.start_writing()
+    return host_indices
+</pre>
+  </div>
+
+  <p>
+    The clever part is the <strong>per-layer overlap</strong> on load-back. Host→device copies
+    happen layer by layer on <code>load_stream</code>, ticking a <code>LayerDoneCounter</code>
+    (<code>cache_controller.py:88</code>); the attention layer's
+    <code>KVCache.get_key_buffer(layer_id)</code> blocks on
+    <code>layer_transfer_counter.wait_until(layer_id)</code> (<code>memory_pool.py:2238</code>) — so
+    the prefill forward computes layer <i>k</i> while layer <i>k+1</i>'s KV is still in flight
+    over PCIe.
+  </p>
+
+  <div class="stepper" id="st-hicache">
+    <div class="st-scene">
+      <div class="sc-row">
+        <div class="sc-box" id="hc-req" style="min-width:220px">Request<small>8192-token prompt · page_size 64</small></div>
+        <div class="sc-box appear" id="hc-fwd">prefill forward<small>get_key_buffer → wait_until(layer)</small></div>
+      </div>
+      <div class="sc-row" style="margin-top:12px">
+        <div class="sc-box ghost" style="min-width:96px">L1 device</div>
+        <span class="tok" id="hc-d1">tok 0–2047</span>
+        <span class="tok free" id="hc-d2">tok 2048–6143</span>
+        <span class="tok free" id="hc-d3">tok 6144–7167</span>
+        <span class="tok free" id="hc-d4">tok 7168–8191</span>
+      </div>
+      <div class="sc-row">
+        <div class="sc-box ghost" style="min-width:96px">L2 host</div>
+        <span class="tok cache" id="hc-h2">tok 2048–6143 (backuped)</span>
+        <span class="tok free" id="hc-h3">tok 6144–7167</span>
+      </div>
+      <div class="sc-row">
+        <div class="sc-box ghost" style="min-width:96px">L3 storage</div>
+        <span class="tok cache" id="hc-s3">tok 6144–7167 (hash chain)</span>
+        <span class="tok dim" id="hc-s0">…older prefixes…</span>
+      </div>
+      <div class="sc-row" style="margin-top:12px">
+        <div class="sc-box appear" id="hc-load">load_stream<small>4096 tok · layer-by-layer</small></div>
+        <div class="sc-box appear" id="hc-pref">prefetch_thread<small>_storage_hit_query → IO</small></div>
+        <div class="sc-box appear" id="hc-wb">write_stream + backup_thread<small>write-through new KV</small></div>
+      </div>
+    </div>
+  </div>
+
+  <p>
+    The whole family is tuned by <code>--hicache-*</code> flags:
+    <code>--hicache-ratio</code> / <code>--hicache-size</code> (L2 sizing),
+    <code>--hicache-write-policy</code> (<code>write_through</code> default ·
+    <code>write_through_selective</code> backs up only nodes whose <code>hit_count</code> crosses a
+    threshold · <code>write_back</code>), <code>--hicache-mem-layout</code>
+    (<code>page_first</code> default, <code>layer_first</code>, …), <code>--hicache-io-backend</code>
+    (<code>kernel</code> | <code>direct</code>), <code>--hicache-storage-backend</code> (the 10 L3
+    backends), <code>--hicache-storage-prefetch-policy</code>
+    (<code>best_effort</code> | <code>wait_complete</code> | <code>timeout</code> default, with a
+    linear time budget per Ki-token) and <code>--hicache-storage-backend-extra-config</code>.
+    In PD deployments HiCache composes with disaggregation:
+    <code>decode_hicache_mixin.py</code> hooks the decode prealloc/transfer queues, and
+    <code>--disaggregation-decode-enable-radix-cache</code> lets D match local prefixes so only
+    the non-cached suffix is transferred.
+  </p>
+
+  <h2><span class="sec-num">8.6</span>The Rust model gateway</h2>
+  <p>
+    <code>sgl-model-gateway/</code> (formerly <b>sgl-router</b>; the pip package is still
+    <code>sglang_router</code>, built from <code>bindings/python</code>, and the binary installs as
+    <code>sgl-model-gateway</code> with aliases <code>smg</code> and <code>amg</code> —
+    <code>Cargo.toml</code>) is a standalone Rust control-and-data plane in front of the fleet:
+    OpenAI-compatible endpoints, worker registry with health checks and per-worker circuit
+    breakers, retries with exponential backoff + jitter, token-bucket rate limiting with fair
+    queuing, Kubernetes service discovery (pod selectors, with separate
+    <code>prefill_selector</code> / <code>decode_selector</code> and a bootstrap-port annotation in PD
+    mode), an MCP client, and a gRPC pipeline that talks straight to SRT gRPC schedulers using
+    a <em>native Rust tokenizer</em> plus reasoning/tool-call parsers.
+  </p>
+
+  <div class="callout warn"><span class="co-title">Don't confuse it with <code>rust/</code></span>
+    The repo has two Rust worlds. <code>sgl-model-gateway/</code> is the out-of-process router.
+    <code>rust/</code> is a separate workspace of <b>in-process PyO3 crates</b>:
+    <code>sglang-server</code> (a Rust HTTP frontend embedded inside the Python scheduler process
+    — chapter 01's <code>SGLANG_RUST_SERVER=1</code>), <code>sglang-grpc</code> (in-process gRPC
+    server) and <code>sglang-mm</code> (Rust multimodal preprocessing, compiled as
+    <code>sglang.srt.multimodal._core</code>).
+  </div>
+
+  <div class="diagram">
+    <div class="dg-title">Gateway request path (PD mode)</div>
+    <pre class="mermaid">
+flowchart LR
+  req["POST /v1/chat/completions"]
+  mw["middleware<br/>token bucket · request id"]
+  pdr["pd_router.rs<br/>select_pd_pair()"]
+  pp["prefill pool policy<br/>e.g. cache_aware"]
+  dp["decode pool policy<br/>e.g. power_of_two"]
+  inj["inject_bootstrap_into_value()<br/>host + port + room"]
+  cb["circuit breakers · retry"]
+  P["prefill worker"]
+  D["decode worker"]
+  req --> mw --> pdr
+  pdr --> pp
+  pdr --> dp
+  pp --> inj
+  dp --> inj
+  inj --> cb
+  cb --> P
+  cb --> D
+  D -- "stream (+ merged prefill logprobs)" --> req
+  sd["service_discovery.rs<br/>k8s pod watch"] -.-> pdr
+  mesh["mesh sync<br/>replicated radix trees"] -.-> pp
+  style pdr fill:#eef0ff,stroke:#4f46e5
+  style inj fill:#fdf3e3,stroke:#d97706
+    </pre>
+    <div class="dg-caption">
+      <code>select_pd_pair()</code> (<code>pd_router.rs:972</code>) filters the worker registry by
+      <code>WorkerType::Prefill/Decode</code>, applies each pool's policy (separate
+      <code>--prefill-policy</code> / <code>--decode-policy</code> override <code>--policy</code>), then
+      dispatches the same body to both workers concurrently — streaming from decode and merging
+      prefill logprobs into the response.
+    </div>
+  </div>
+
+  <p>
+    Routing policies live in <code>src/policies/</code> — the <code>PolicyConfig</code> enum
+    (<code>config/types.rs:254</code>) offers <code>random</code>, <code>round_robin</code>,
+    <code>cache_aware</code>, <code>power_of_two</code>, <code>bucket</code>, <code>manual</code> (sticky
+    sessions via <code>X-SMG-Routing-Key</code>), <code>consistent_hashing</code>, and
+    <code>prefix_hash</code>. The flagship is <strong>cache-aware</strong> routing: the gateway
+    never asks workers what they have cached. Instead it keeps an <em>approximate,
+    character-level radix tree per worker</em> (<code>policies/tree.rs</code>) of the text it has
+    already routed there — a client-side shadow of each worker's real RadixCache (chapter 03).
+    The algorithm:
+  </p>
+  <ol>
+    <li>If load is imbalanced — <code>(max−min) &gt; balance_abs_threshold</code> <b>and</b>
+      <code>max &gt; min × balance_rel_threshold</code> (<code>cache_aware.rs:401</code>) — fall back
+      to shortest-queue routing. Cache affinity never wins against a hot spot.</li>
+    <li>Otherwise <code>tree.prefix_match_with_counts(text)</code>; route to the best-matching
+      worker if <code>match_rate &gt; cache_threshold</code>, else to the worker with the
+      <em>smallest tree</em> (most free cache).</li>
+    <li>Insert the text into the chosen worker's tree; a background task LRU-evicts leaves
+      down to <code>max_tree_size</code> every <code>eviction_interval_secs</code>.</li>
+  </ol>
+
+  <div class="snippet" data-lang="rust" data-file="sgl-model-gateway/src/policies/cache_aware.rs:433" data-desc="The core cache-aware decision (comments in source)">
+<pre>
+let selected_idx = if match_rate &gt; self.config.cache_threshold {
+    // Cache hit path: find worker by URL (compare &amp;str directly, no allocation)
+    let tenant_url: &amp;str = &amp;result.tenant;
+    workers
+        .iter()
+        .position(|w| w.url() == tenant_url)
+        .filter(|&amp;idx| workers[idx].is_healthy())
+} else {
+    // Low cache match: use worker with minimum load
+    healthy_indices
+        .iter()
+        .min_by_key(|&amp;&amp;idx| workers[idx].load())
+        .copied()
+};
+</pre>
+  </div>
+
+  <p>
+    In PD mode the router is also the component that mints the correlation id from section 8.2
+    and stamps it into the request body before fan-out:
+  </p>
+
+  <div class="snippet" data-lang="rust" data-file="sgl-model-gateway/src/routers/http/pd_router.rs:233" data-desc="Bootstrap fields the PD router injects into every request JSON">
+<pre>
+const BOOTSTRAP_HOST_KEY: &amp;'static str = "bootstrap_host";
+const BOOTSTRAP_PORT_KEY: &amp;'static str = "bootstrap_port";
+const BOOTSTRAP_ROOM_KEY: &amp;'static str = "bootstrap_room";
+const DISAGG_PREFILL_DP_RANK_KEY: &amp;'static str = "disagg_prefill_dp_rank";
+
+fn inject_bootstrap_into_value(
+    mut original: Value,
+    prefill_worker: &amp;dyn Worker,
+    batch_size: Option&lt;usize&gt;,
+) -&gt; Result&lt;Value, String&gt; {
+</pre>
+  </div>
+
+  <h2><span class="sec-num">8.7</span>GPU multiplexing: PD split on a single GPU</h2>
+  <p>
+    <code>python/sglang/srt/multiplex/</code> is the opposite extreme: instead of two fleets, one
+    GPU is <em>spatially</em> partitioned with CUDA <b>green contexts</b>. Enabled by
+    <code>--enable-pdmux</code> ("Enable PD-Multiplexing, PD running on greenctx stream"),
+    <code>divide_sm()</code> computes valid (prefill_sm, decode_sm) partitions per architecture
+    (SM90: multiples of 8, min 8), and <code>initialize_stream_groups</code> builds
+    <code>--sm-group-num</code> (default 8) stream groups — group 0 is a full-GPU stream for
+    prefill, the last is full-GPU for decode, and the middle groups pin prefill and decode
+    kernels to <em>disjoint SM sets running concurrently</em>:
+  </p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/multiplex/pdmux_context.py:128" data-desc="Stream groups: normal streams at the extremes, green-context pairs in between">
+<pre>
+STREAM_GROUPS = []
+STREAM_GROUPS.append(
+    (torch.cuda.Stream(gpu_id), torch.cuda.Stream(gpu_id))
+)  # Normal stream for prefill
+for prefill_sm, decode_sm in divisions:
+    STREAM_GROUPS.append(
+        (spatial.create_greenctx_stream_by_value(prefill_sm, decode_sm, gpu_id))
+    )
+STREAM_GROUPS.append(
+    (torch.cuda.Stream(gpu_id), torch.cuda.Stream(gpu_id))
+)  # Normal stream for decode
+</pre>
+  </div>
+
+  <p>
+    <code>SchedulerMultiplexMixin.event_loop_pdmux</code> (<code>multiplexing_mixin.py:101</code>)
+    runs one scheduler that keeps the decode <code>running_batch</code> on the decode stream while
+    executing a <code>split_prefill_batch</code> in bounded slices
+    (<code>split_forward_token_budget</code>, default 65536) on the prefill stream, and
+    <code>adjust_stream_groups</code> re-picks the SM split as the decode batch size changes —
+    intra-GPU PD disaggregation with zero KV transfer. The green-context streams come from
+    <code>sgl_kernel.spatial.create_greenctx_stream_by_value(prefill_sm, decode_sm, gpu_id)</code>
+    (chapter 06 covers <code>sgl_kernel</code>).
+  </p>
+
+  <h2><span class="sec-num">8.8</span>Two small neighbors: connector/ and kv_canary/</h2>
+  <p>
+    <strong><code>python/sglang/srt/connector/</code></strong> is remote <em>storage</em>, not PD
+    transfer: URL-schemed connectors (<code>redis://</code>, <code>s3://</code>, <code>az://</code>,
+    <code>instance://</code>) created by <code>create_remote_connector()</code>, with
+    <code>BaseFileConnector</code> for pulling model weights from object stores and
+    <code>BaseKVConnector</code> for remote KV get/set (safetensors-based serde in
+    <code>connector/serde/</code>). It is orthogonal to the transfer backends of section 8.4.
+  </p>
+  <p>
+    <strong><code>python/sglang/srt/kv_canary/</code></strong> is a production integrity watchdog
+    for everything this chapter moves around: <code>install_canary()</code>
+    (<code>kv_canary/api.py:30</code>) patches KV pools to write per-slot canary metadata (token
+    id, position, optional hash of the real KV bytes) at write time and verify it at use time
+    and in periodic sweeps — catching stale-page and index-corruption bugs that would otherwise
+    surface as silently wrong text. Modes <code>none/log/raise</code> (<code>CanaryMode</code>), plus
+    a deliberate fault-injection package (<code>perturb/</code>) to self-test detection.
+  </p>
+
+  <h2><span class="sec-num">8.9</span>Flags &amp; facts</h2>
+
+  <table class="tbl">
+    <tr><th>Flag</th><th>Default</th><th>Meaning</th></tr>
+    <tr><td><code>--disaggregation-mode</code></td><td><code>null</code></td>
+      <td><code>null</code> | <code>prefill</code> | <code>decode</code> — the server's PD role.</td></tr>
+    <tr><td><code>--disaggregation-transfer-backend</code></td><td><code>mooncake</code></td>
+      <td>KV fabric: <code>mooncake</code> | <code>nixl</code> | <code>mori</code> | <code>ascend</code> | <code>fake</code>.</td></tr>
+    <tr><td><code>--disaggregation-bootstrap-port</code></td><td><code>8998</code></td>
+      <td>aiohttp bootstrap server port on the prefill server.</td></tr>
+    <tr><td><code>--disaggregation-ib-device</code></td><td>auto</td>
+      <td>IB NIC(s): single dev, comma list, per-GPU JSON map, or JSON file.</td></tr>
+    <tr><td><code>--disaggregation-decode-enable-radix-cache</code></td><td>off</td>
+      <td>Decode-side prefix cache — transfer only the non-cached suffix.</td></tr>
+    <tr><td><code>--disaggregation-decode-enable-offload-kvcache</code></td><td>off</td>
+      <td>Async decode-side KV offload (<code>decode_kvcache_offload_manager.py</code>).</td></tr>
+    <tr><td><code>--num-reserved-decode-tokens</code></td><td><code>512</code></td>
+      <td>Decode tokens reserved per request admitted to the running batch.</td></tr>
+    <tr><td><code>--optimistic-prefill-attempts</code></td><td><code>0</code></td>
+      <td>Prefill forwards allowed to skip the bootstrap wait (retry loop).</td></tr>
+    <tr><td><code>--enable-hierarchical-cache</code> + <code>--hicache-*</code></td><td>off</td>
+      <td>HiCache tiers (section 8.5).</td></tr>
+    <tr><td><code>--enable-pdmux</code> / <code>--sm-group-num</code> / <code>--pdmux-config-path</code></td><td>off / 8 / —</td>
+      <td>Green-context PD multiplexing on one GPU.</td></tr>
+    <tr><td>Gateway: <code>--pd-disaggregation --prefill URL [PORT] --decode URL</code></td><td>—</td>
+      <td>PD routing mode; <code>--policy</code> / <code>--prefill-policy</code> / <code>--decode-policy</code>
+        pick per-pool policies; <code>--enable-igw</code> = multi-model mode.</td></tr>
+  </table>
+
+  <h3>Notable facts &amp; gotchas</h3>
+  <div class="card">
+    <ul>
+      <li><b>The first decode token is computed on the prefill server</b> and shipped in
+        <code>MetadataBuffers</code> with logprobs and optional hidden states — decode starts at
+        token 2.</li>
+      <li><b>The bootstrap server is inside the prefill process</b> (aiohttp on port 8998), and
+        decode validates the <code>bootstrap_room</code> echoed back through the metadata buffer —
+        a mismatch aborts with "Context corruption detected" (<code>decode.py:1817</code>).</li>
+      <li><b>KV transfer is page-aligned:</b> <code>send_kv_chunk()</code> defers a partial trailing
+        page to the next chunk, so chunked prefill and RDMA compose cleanly.</li>
+      <li><b>More than KV moves:</b> <code>StateType</code> covers Mamba conv/ssm, SWA, DSA and
+        other auxiliary state tensors, so hybrid models (chapter 03's Mamba pools) work under
+        PD too.</li>
+      <li><b>TP ranks vote with MIN-allreduce</b> on every <code>KVPoll</code> state, so a single
+        failed rank fails the request everywhere instead of deadlocking the others.</li>
+      <li><b>The gateway's cache map is a guess:</b> cache-aware routing maintains approximate
+        char-level radix trees client-side (with mesh sync across gateway replicas). For exact
+        knowledge, schedulers can publish <code>BlockStored/BlockRemoved</code> events over ZMQ
+        (<code>disaggregation/kv_events.py</code>) to external routers.</li>
+      <li><b>The old Python mini load balancer is gone</b> — CI fixtures now launch
+        <code>python3 -m sglang_router.launch_router --pd-disaggregation --mini-lb</code>; the
+        <code>--mini-lb</code> compat flag lives in the Rust CLI.</li>
+      <li><b>Encoder disaggregation is a third axis:</b> <code>encode_server.py</code> runs a
+        multimodal encoder-only server streaming embeddings to language servers — separate
+        from the P/D KV path (and from <code>connector/</code> remote storage).</li>
+    </ul>
+  </div>
+
+  <div id="pager"></div>
+  </div>
+</main>
+</div>
+
+<script>
+document.addEventListener("DOMContentLoaded", () => {
+
+  new Stepper("#st-pd", {
+    title: "One request through PD disaggregation (6,144-token prompt, 96 KV pages)",
+    intro: "Prefill worker P2 and decode worker D0, correlated by bootstrap_room 771236.",
+    autoMs: 3400,
+    reset(sc) {
+      clearState(sc, ".sc-box,.tok");
+      rmCls(sc, ".appear", "in");
+    },
+    steps: [
+      { cap: "The gateway's <code>select_pd_pair()</code> picks P2 (cache-aware) and D0 (power-of-two), mints <code>bootstrap_room = 771236</code>, injects <code>bootstrap_host/port/room</code> into the JSON (<code>inject_bootstrap_into_value</code>), and sends the request to <b>both</b> workers.",
+        run(sc) { setCls(sc, "#pd-router", "hl", "pulse"); } },
+      { cap: "P2: the request lands in <code>PrefillBootstrapQueue</code>, which builds a <code>KVSender(mgr, bootstrap_addr, 771236, …)</code> — state <code>KVPoll.Bootstrapping</code>.",
+        run(sc) { rmCls(sc, "#pd-router", "pulse"); setCls(sc, "#pd-p,#pd-pbq", "hl"); } },
+      { cap: "D0: the same request enters <code>DecodePreallocQueue</code>, which builds a <code>KVReceiver</code>. The receiver does <code>GET /route</code> against P2's bootstrap server to learn the prefill rank topology (and how P's TP shards map onto its own).",
+        run(sc) { setCls(sc, "#pd-d,#pd-dpq", "hl"); } },
+      { cap: "<code>pop_preallocated()</code> allocates <code>req_to_token</code> slots and KV pages for <b>all 6,144 input tokens</b> up front — admitted only if the retractability invariant holds (snippet below). It then ZMQ-sends its page indices to P2's ranks via <code>send_metadata(...)</code> and moves the request to <code>DecodeTransferQueue</code>.",
+        run(sc) { rmCls(sc, "#pd-dpq", "hl"); setCls(sc, "#pd-dpq", "ok"); setCls(sc, "#pd-dtq", "in", "hl"); } },
+      { cap: "P2's sender sees the handshake complete → <code>KVPoll.WaitingForInput</code>. <code>pop_bootstrapped()</code> moves the request into <code>waiting_queue</code>, and the prefill forward runs (chunked prefill, chapter 02).",
+        run(sc) { rmCls(sc, "#pd-pbq", "hl"); setCls(sc, "#pd-pbq", "ok"); setCls(sc, "#pd-pfw", "in", "hl", "pulse"); } },
+      { cap: "As each chunk finishes, <code>send_kv_chunk()</code> enqueues <b>page-aligned</b> KV ranges (a partial trailing page waits for the next chunk); background transfer threads RDMA-write pages 0–31, then 32–63 into D0's preallocated slots.",
+        run(sc) { rmCls(sc, "#pd-pfw", "pulse"); setCls(sc, "#pd-kv1,#pd-kv2", "cache"); } },
+      { cap: "Last chunk: P2 samples the <b>first output token</b> (\"The\") and writes it — with logprobs and the room id — into <code>MetadataBuffers.set_buf(req)</code>. Pages 64–95 and the metadata buffer go out; the request parks in <code>disagg_prefill_inflight_queue</code>.",
+        run(sc) { rmCls(sc, "#pd-pfw", "hl"); setCls(sc, "#pd-pfw", "ok"); setCls(sc, "#pd-kv3", "cache"); setCls(sc, "#pd-meta", "hl"); setCls(sc, "#pd-piq", "in", "hl"); } },
+      { cap: "D0: <code>pop_transferred()</code> polls the receiver → <code>KVPoll.Success</code>. <code>_commit_transfer_to_req</code> cross-checks the room id from the metadata buffer against 771236 (mismatch = \"Context corruption detected\") and copies the first token into the <code>Req</code>.",
+        run(sc) { setCls(sc, "#pd-kv1,#pd-kv2,#pd-kv3", "ok"); rmCls(sc, "#pd-meta", "hl"); setCls(sc, "#pd-meta", "ok"); rmCls(sc, "#pd-dtq", "hl"); setCls(sc, "#pd-dtq", "ok"); } },
+      { cap: "P2's inflight poll also sees <code>Success</code> (MIN-allreduced across TP ranks): prefill KV is freed — or kept in P2's radix tree for future prefix hits. P2 is done with this request.",
+        run(sc) { rmCls(sc, "#pd-piq", "hl"); setCls(sc, "#pd-piq", "ok"); } },
+      { cap: "D0 builds a \"prebuilt\" batch entry — KV already resident, first token already known — and the request joins <code>running_batch</code>, streaming tokens from token 2 onward exactly like chapter 01.",
+        run(sc) { setCls(sc, "#pd-drb", "in", "ok", "pulse"); setCls(sc, "#pd-d", "ok"); } },
+    ],
+  });
+
+  new Stepper("#st-hicache", {
+    title: "HiCache in action: device miss → host hit → storage prefetch",
+    intro: "An 8,192-token prompt whose prefix history spans all three tiers.",
+    autoMs: 3400,
+    reset(sc) {
+      clearState(sc, ".sc-box,.tok");
+      rmCls(sc, ".appear", "in");
+      setCls(sc, "#hc-d2,#hc-d3,#hc-d4,#hc-h3", "free");
+      setCls(sc, "#hc-h2,#hc-s3", "cache");
+      setCls(sc, "#hc-s0", "dim");
+    },
+    steps: [
+      { cap: "<code>match_prefix</code> walks the <code>HiRadixCache</code> tree — including <i>evicted</i> nodes. Result: tokens 0–2047 are on-device, tokens 2048–6143 exist only on host (<code>value=None</code>, <code>host_value</code> set) → <code>host_hit_length=4096</code> and a <code>last_host_node</code>.",
+        run(sc) { setCls(sc, "#hc-req", "hl"); setCls(sc, "#hc-d1", "ok"); setCls(sc, "#hc-h2", "hl"); } },
+      { cap: "The uncovered suffix (2,048 tokens) exceeds <code>prefetch_threshold</code> (256), so <code>Scheduler._prefetch_kvcache</code> calls <code>prefetch_from_storage(...)</code>. The <code>prefetch_thread</code> runs <code>_storage_hit_query</code>: each page's SHA256 chains the previous hash, and the L3 backend is probed page by page — tokens 6144–7167 hit.",
+        run(sc) { setCls(sc, "#hc-pref", "in", "hl"); setCls(sc, "#hc-s3", "hl"); } },
+      { cap: "Hit counts are MIN-allreduced across TP ranks; below-threshold prefetches are revoked (<code>prefetch_revoke_queue</code>). This one survives: host slots are allocated lazily and an aux IO thread pulls the pages into the host pool — tokens 6144–7167 now live in L2.",
+        run(sc) { rmCls(sc, "#hc-s3", "hl"); setCls(sc, "#hc-h3", "cache"); rmCls(sc, "#hc-h3", "free"); rmCls(sc, "#hc-pref", "hl"); setCls(sc, "#hc-pref", "ok"); } },
+      { cap: "The <code>PrefillAdder</code> admits the request → <code>init_load_back</code>: <code>cache_controller.load()</code> allocates device slots for the whole 4,096-token host chain (\"load it all or not at all\"), evicting L1 leaves if needed.",
+        run(sc) { setCls(sc, "#hc-load", "in", "hl"); rmCls(sc, "#hc-d2", "free"); setCls(sc, "#hc-d2", "hl"); } },
+      { cap: "<code>start_loading()</code> copies host→device <b>layer by layer</b> on <code>load_stream</code>, ticking the <code>LayerDoneCounter</code>. The forward pass starts immediately: <code>get_key_buffer(layer_id)</code> blocks on <code>wait_until(layer_id)</code>, so layer <i>k</i> computes while layer <i>k+1</i> is still crossing PCIe.",
+        run(sc) { setCls(sc, "#hc-fwd", "in", "hl", "pulse"); } },
+      { cap: "Loads complete (CUDA events → <code>ack_load_queue</code>, polled by <code>check_hicache_events()</code>). Tokens 0–6143 are on-device; the prefetched 6144–7167 chain loads back the same way; only the final 1,024 tokens are computed from scratch.",
+        run(sc) { rmCls(sc, "#hc-load", "hl"); setCls(sc, "#hc-load", "ok"); rmCls(sc, "#hc-d2", "hl"); setCls(sc, "#hc-d2", "ok"); rmCls(sc, "#hc-d3", "free"); setCls(sc, "#hc-d3", "ok"); rmCls(sc, "#hc-fwd", "pulse"); } },
+      { cap: "After prefill, write-through kicks in: <code>cache_controller.write()</code> backs the new 1,024 tokens up to host on <code>write_stream</code>; once the write is acked, <code>write_backup_storage</code> hands it to <code>backup_thread</code>, which pushes host→L3 in batches. Every tier now holds the full prefix for the next request.",
+        run(sc) { rmCls(sc, "#hc-d4", "free"); setCls(sc, "#hc-d4", "ok"); setCls(sc, "#hc-wb", "in", "ok"); setCls(sc, "#hc-fwd", "ok"); rmCls(sc, "#hc-req", "hl"); setCls(sc, "#hc-req", "ok"); } },
+    ],
+  });
+
+});
+</script>
+</body>
+</html>

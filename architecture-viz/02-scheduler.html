@@ -1,0 +1,815 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>02 · Scheduler &amp; Continuous Batching — SGLang Internals</title>
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/mermaid.min.js"></script>
+<script src="assets/viz.js"></script>
+</head>
+<body>
+<div class="layout">
+<main>
+  <div class="page-hero"><div class="content">
+    <span class="phase-badge">Phase II · The Core Engine</span>
+    <h1>02 · The Scheduler — Continuous Batching &amp; Policies</h1>
+    <p class="lede">
+      The <code>Scheduler</code> is SGLang's heartbeat: a per-GPU-rank process that, every few
+      milliseconds, decides which requests prefill, which decode, and which get thrown back in the
+      queue when memory runs out. This chapter walks the real event loop, the request state machine,
+      the token-budget admission math, and the overlap trick that hides all CPU work behind GPU compute.
+    </p>
+  </div></div>
+
+  <div class="content">
+
+  <h2><span class="sec-num">2.1</span>Why continuous batching exists</h2>
+  <p>
+    Classic serving systems batched at <em>request</em> granularity: collect N prompts, run all of
+    them to completion, return. That wastes enormous GPU time — a request that finishes after 10
+    tokens sits idle while its batchmate generates 2,000. The fix, introduced by
+    <strong>Orca</strong> (OSDI '22) as <em>iteration-level scheduling</em> and now universal
+    (vLLM, SGLang, TensorRT-LLM), is <strong>continuous batching</strong>: the scheduler re-decides
+    batch membership <em>every forward pass</em>. Finished requests leave immediately; waiting
+    requests join as soon as memory allows; one iteration might be a prefill, the next a decode of a
+    completely different composition.
+  </p>
+  <p>
+    In SGLang this loop lives in <code>python/sglang/srt/managers/scheduler.py</code>
+    (the <code>Scheduler</code> class — one instance per TP rank, running inside the GPU subprocess
+    you met in chapter 01). Its two central data structures:
+  </p>
+  <ul>
+    <li><code>self.waiting_queue: List[Req]</code> — requests admitted by
+      <code>handle_generate_request</code> but not yet running.</li>
+    <li><code>self.running_batch: ScheduleBatch</code> — the <em>persistent decode pool</em>. Requests
+      enter it after their prefill completes and stay until they finish or get retracted.</li>
+  </ul>
+
+  <div class="diagram">
+    <div class="dg-title">CONTINUOUS BATCHING AT A GLANCE</div>
+    <pre class="mermaid">
+flowchart LR
+  cl["new requests<br/>(ZMQ from TokenizerManager)"] --> wq
+  subgraph iter ["re-decided every iteration"]
+    wq["waiting_queue"] -->|"policy sort +<br/>PrefillAdder budgets"| pf["EXTEND batch<br/>(prefill admissions)"]
+    pf -->|"next iteration:<br/>merge_batch()"| rb["running_batch<br/>(persistent decode pool)"]
+    rb -->|"+1 token / req / iteration"| rb
+  end
+  rb -->|"finished_reason set"| out["stream_output →<br/>Detokenizer"]
+  rb -.->|"KV pool full:<br/>retract_decode()"| wq
+  style wq fill:#eef0ff,stroke:#4f46e5
+  style rb fill:#e7f7ec,stroke:#16a34a
+  style pf fill:#fdf3e3,stroke:#d97706
+    </pre>
+    <div class="dg-caption">
+      The scheduler's whole job is moving <code>Req</code> objects between these stations.
+      Prefill has <b>strict priority</b> over decode (<code>scheduler.py:2977-2986</code>): if an
+      EXTEND batch can be formed, the decode pool waits an iteration. The dashed edge is the
+      out-of-memory backpressure path (§2.7).
+    </div>
+  </div>
+
+  <h2><span class="sec-num">2.2</span>The event loop</h2>
+  <p>
+    Chapter 01 showed <code>event_loop_normal</code> (scheduler.py:1628). The production default is
+    actually <code>event_loop_overlap</code>: <code>self.enable_overlap = not
+    server_args.disable_overlap_schedule and not use_mlx()</code> (scheduler.py:404), and
+    <code>dispatch_event_loop</code> (scheduler.py:4708) picks the loop variant
+    (overlap / normal / <code>event_loop_pp</code> for pipeline parallelism / disaggregation
+    variants). Both loops share the exact same five-station iteration:
+  </p>
+
+  <div class="diagram">
+    <div class="dg-title">ONE SCHEDULER ITERATION — EXACT METHOD NAMES</div>
+    <pre class="mermaid">
+flowchart TD
+  recv["request_receiver.recv_requests()<br/><i>scheduler_components/request_receiver.py</i>"] --> pir["process_input_requests(recv_reqs)<br/>handle_generate_request → Req → waiting_queue"]
+  pir --> gnbtr["get_next_batch_to_run(running_batch, last_batch)<br/><i>scheduler.py:2868</i>"]
+  gnbtr --> stash["chunked_req? stash_chunked_request()<br/>+ exclude it from the merge"]
+  stash --> dec{"last_batch was<br/>EXTEND?"}
+  dec -->|"yes"| fm["last_batch.filter_batch()<br/>running_batch.merge_batch(last_batch)"]
+  dec -->|"no"| gp
+  fm --> gp["get_new_batch_prefill(running_batch)"]
+  gp -->|"EXTEND batch built"| plan["NextBatchPlan(batch_to_run, running_batch)"]
+  gp -->|"None"| urb["update_running_batch()<br/>check_decode_mem → retract_decode?<br/>prepare_for_decode()"]
+  urb --> plan
+  plan --> rb["run_batch(batch)<br/>model_worker.forward_batch_generation()"]
+  rb --> pbr["process_batch_result(batch, result)<br/><i>batch_result_processor.py</i>"]
+  pbr -->|"self.last_batch = batch"| recv
+  style plan fill:#eef0ff,stroke:#4f46e5
+  style rb fill:#e7f7ec,stroke:#16a34a
+    </pre>
+    <div class="dg-caption">
+      <code>recv_requests</code>: rank 0 pulls ZMQ messages and broadcasts them to other TP ranks via
+      a gloo group. <code>get_next_batch_to_run</code> returns a <code>NextBatchPlan</code>
+      (a msgspec Struct with exactly two fields, <code>batch_to_run</code> and
+      <code>running_batch</code> — <code>schedule_batch.py:3283</code>). Idle iterations call
+      <code>on_idle()</code> instead of <code>run_batch</code>.
+    </div>
+  </div>
+
+  <p>
+    The subtle part is the <b>merge</b>: how does a prefill batch "become" decode? It doesn't —
+    last iteration's EXTEND batch is folded into <code>running_batch</code> at the top of the
+    <em>next</em> <code>get_next_batch_to_run</code>, after dropping requests that already finished
+    (a single-token answer can finish during its own prefill) and the still-in-flight chunked request:
+  </p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/managers/scheduler.py:2933" data-desc="get_next_batch_to_run: how an EXTEND batch joins the decode pool">
+<pre>
+# Filter batch
+last_bs = last_batch.batch_size()
+last_batch.filter_batch(chunked_req_to_exclude=list(chunked_req_to_exclude))
+if last_batch.batch_size() &lt; last_bs:
+    running_batch.batch_is_full = False
+
+# Merge the new batch into the running batch.
+if not last_batch.is_empty():
+    if running_batch.is_empty():
+        running_batch = last_batch
+    else:
+        # Merge running_batch with prefill batch
+        running_batch.merge_batch(last_batch)
+</pre>
+  </div>
+
+  <div class="callout note"><span class="co-title">"running_batch" is not what runs</span>
+    <code>self.running_batch</code> is the persistent decode pool. The object actually forwarded each
+    iteration is <code>plan.batch_to_run</code>, which may be a fresh EXTEND batch, the filtered +
+    <code>prepare_for_decode</code>'d running batch, a MIXED batch (§2.8), or a DP-attention IDLE
+    batch injected by <code>dp_attn_adapter.maybe_prepare_mlp_sync_batch</code> so all DP ranks step
+    together.
+  </div>
+
+  <h2><span class="sec-num">2.3</span>Anatomy of a <code>Req</code> — the lifecycle state machine</h2>
+  <p>
+    A <code>Req</code> (<code>schedule_batch.py:771</code>) has no explicit status enum — its state is
+    <em>which container holds it</em> plus a handful of fields:
+  </p>
+  <table class="tbl">
+    <tr><th>Field</th><th>Meaning</th></tr>
+    <tr><td><code>origin_input_ids</code> / <code>output_ids</code></td>
+      <td>The prompt, and the append-only generated tokens (<code>array("q")</code>).</td></tr>
+    <tr><td><code>full_untruncated_fill_ids</code></td>
+      <td>prompt + outputs, kept fresh by <code>_refresh_fill_ids()</code>.</td></tr>
+    <tr><td><code>extend_range: Optional[Range]</code></td>
+      <td>Start/end of <em>this pass's</em> extend window into the fill ids —
+        <code>get_fill_ids()</code> returns <code>full_untruncated_fill_ids[:extend_range.end]</code>.</td></tr>
+    <tr><td><code>prefix_indices</code>, <code>last_node</code>, <code>num_matched_prefix_tokens</code></td>
+      <td>KV indices + tree node of the matched radix-cache prefix (chapter 03), filled by
+        <code>init_next_round_input()</code>.</td></tr>
+    <tr><td><code>req_pool_idx</code>, <code>kv_committed_len</code></td>
+      <td>Slot in the request-to-token pool; how many KV entries are committed.</td></tr>
+    <tr><td><code>finished_reason: Optional[BaseFinishReason]</code></td>
+      <td>One of <code>FINISH_MATCHED_TOKEN</code>, <code>FINISH_MATCHED_STR</code>,
+        <code>FINISHED_MATCHED_REGEX</code>, <code>FINISH_LENGTH</code>, <code>FINISH_ABORT</code>
+        (<code>schedule_batch.py:199-265</code>). <code>finished()</code> ⇔ it is not None.</td></tr>
+    <tr><td><code>inflight_middle_chunks</code></td>
+      <td>Counts scheduled-but-unprocessed non-final prefill chunks (§2.8).</td></tr>
+    <tr><td><code>is_retracted</code>, <code>retracted_stain</code>, <code>retraction_count</code></td>
+      <td>Retraction state; <code>retracted_stain</code> is sticky ("was ever retracted") and feeds
+        cache-hit metrics.</td></tr>
+  </table>
+
+  <div class="callout warn"><span class="co-title">Rename vs upstream: <code>fill_ids</code> → <code>extend_range</code></span>
+    Upstream SGLang tracks each pass's prefill window with <code>req.fill_ids</code> +
+    <code>req.extend_input_len</code>. This repo replaced both with a single
+    <code>extend_range</code> (<code>Range</code> with <code>start</code>/<code>end</code>/<code>length</code>)
+    set via <code>req.set_extend_range(start, end)</code>. If you're reading upstream docs or blog
+    posts, mentally map <code>fill_ids</code> → <code>get_fill_ids()</code> and
+    <code>extend_input_len</code> → <code>extend_range.length</code>.
+  </div>
+
+  <div class="diagram">
+    <div class="dg-title">REQ LIFECYCLE STATE MACHINE</div>
+    <pre class="mermaid">
+stateDiagram-v2
+  QUEUED : QUEUED — in waiting_queue
+  EXTEND : EXTEND — in a prefill ScheduleBatch
+  CHUNKED : CHUNKED — held as self.chunked_req
+  DECODE : DECODE — in running_batch
+  FINISHED : FINISHED — finished_reason set
+  [*] --> QUEUED : handle_generate_request()
+  QUEUED --> EXTEND : PrefillAdder.add_one_req()
+  EXTEND --> CHUNKED : prompt exceeds rem_chunk_tokens
+  CHUNKED --> CHUNKED : stash chunk KV, add_chunked_req() truncated
+  CHUNKED --> EXTEND : final chunk (truncated == False)
+  EXTEND --> DECODE : merge_batch() into running_batch
+  DECODE --> DECODE : prepare_for_decode(), +1 token
+  DECODE --> QUEUED : retract_decode() + reset_for_retract()
+  DECODE --> FINISHED : update_finish_state() sets FINISH_*
+  QUEUED --> FINISHED : abort / queue timeout
+  FINISHED --> [*] : release_kv_cache() then filter_batch()
+    </pre>
+    <div class="dg-caption">
+      Every transition is a real code path: admission in <code>schedule_policy.py</code>, merge in
+      <code>scheduler.py:2939-2945</code>, finish detection in
+      <code>Req.update_finish_state</code> (<code>schedule_batch.py:1568</code>), retraction in
+      <code>ScheduleBatch.retract_decode</code> (<code>schedule_batch.py:2734</code>). Note the
+      two-phase finish: KV is freed when <code>finished_reason</code> is set, but the req leaves
+      <code>running_batch.reqs</code> only on the next <code>filter_batch()</code>.
+    </div>
+  </div>
+
+  <h2><span class="sec-num">2.4</span>Continuous batching, iteration by iteration</h2>
+  <p>
+    Time to watch it happen. Three requests — <b>A</b> (512-token prompt), <b>B</b> (3,000-token
+    prompt), <b>C</b> (64-token prompt) — arrive at different times on an initially idle server.
+    Step through eight scheduler iterations:
+  </p>
+
+  <div class="stepper" id="st-cb">
+    <div class="st-scene">
+      <div class="sc-row" style="justify-content:space-between">
+        <div class="sc-box" id="cb-iterbox">iteration <span id="cb-iter">0</span><small>one pass of event_loop_overlap</small></div>
+        <div class="sc-box" id="cb-mode"><span id="cb-modetxt">—</span><small>batch_to_run.forward_mode</small></div>
+      </div>
+      <div class="sc-row" style="margin-top:14px">
+        <div class="sc-box" id="cb-wq" style="min-width:320px">waiting_queue<small>sorted by policy each pass</small>
+          <div style="margin-top:6px">
+            <span class="tok appear" id="wq-A" style="width:auto;padding:0 10px">A · 512 tok</span>
+            <span class="tok appear" id="wq-B" style="width:auto;padding:0 10px">B · 3,000 tok</span>
+            <span class="tok appear" id="wq-C" style="width:auto;padding:0 10px">C · 64 tok</span>
+          </div>
+        </div>
+      </div>
+      <div class="sc-row" style="margin-top:10px">
+        <div class="sc-box" id="cb-bt" style="min-width:320px">batch_to_run<small>this iteration's forward</small>
+          <div style="margin-top:6px">
+            <span class="tok appear" id="bt-A" style="width:auto;padding:0 10px">A · prefill 512</span>
+            <span class="tok appear" id="bt-B" style="width:auto;padding:0 10px">B · prefill 3,000</span>
+            <span class="tok appear" id="bt-C" style="width:auto;padding:0 10px">C · prefill 64</span>
+          </div>
+        </div>
+      </div>
+      <div class="sc-row" style="margin-top:10px">
+        <div class="sc-box" id="cb-rb" style="min-width:320px">running_batch<small>persistent decode pool</small>
+          <div style="margin-top:6px">
+            <span class="tok appear" id="rb-A" style="width:auto;padding:0 10px">A · 0 out</span>
+            <span class="tok appear" id="rb-B" style="width:auto;padding:0 10px">B · 0 out</span>
+            <span class="tok appear" id="rb-C" style="width:auto;padding:0 10px">C · 0 out</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <h2><span class="sec-num">2.5</span>Scheduling policies — who goes first?</h2>
+  <p>
+    Before admission, <code>self.policy.calc_priority(self.waiting_queue, running_batch)</code>
+    (scheduler.py:3080) sorts the waiting queue <b>in place</b>. The policy comes from
+    <code>--schedule-policy</code> (<code>server_args.py:796-811</code>, default
+    <code>"fcfs"</code>) and resolves to one of two enum families in
+    <code>schedule_policy.py</code>:
+  </p>
+
+  <table class="tbl">
+    <tr><th>CLI value</th><th>Enum</th><th>Behavior</th></tr>
+    <tr><td><code>fcfs</code> <b>(default)</b></td><td><code>CacheAgnosticPolicy.FCFS</code></td>
+      <td>Arrival order. With <code>--enable-priority-scheduling</code>, sorts by
+        <code>(priority × sign, wait_queue_entry_time)</code> instead.</td></tr>
+    <tr><td><code>lpm</code></td><td><code>CacheAwarePolicy.LPM</code></td>
+      <td>Longest-prefix-match: requests with the biggest radix-cache hit first, maximizing KV reuse.
+        Auto-degrades to FCFS when the queue exceeds <b>128</b> requests
+        (<code>_determine_active_policy</code>, schedule_policy.py:239-243).</td></tr>
+    <tr><td><code>dfs-weight</code></td><td><code>CacheAwarePolicy.DFS_WEIGHT</code></td>
+      <td>Weights radix-tree nodes by descendant request count and emits requests in DFS order of the
+        heaviest subtrees — batches cache-sharing siblings together.</td></tr>
+    <tr><td><code>lof</code></td><td><code>CacheAgnosticPolicy.LOF</code></td>
+      <td>Longest output first (by <code>max_new_tokens</code>).</td></tr>
+    <tr><td><code>random</code></td><td><code>CacheAgnosticPolicy.RANDOM</code></td><td>Shuffle.</td></tr>
+    <tr><td><code>routing-key</code></td><td><code>CacheAgnosticPolicy.ROUTING_KEY</code></td>
+      <td>Groups queued requests with the running batch's routing keys (router affinity).</td></tr>
+    <tr><td><code>priority</code></td><td>⚠ none</td>
+      <td>Accepted by the CLI parser but <b>not a policy enum</b> — see the warning below.</td></tr>
+  </table>
+
+  <div class="callout warn"><span class="co-title">The "priority" gotcha</span>
+    <code>"priority"</code> appears in the <code>--schedule-policy</code> choices, but
+    <code>SchedulePolicy._validate_and_adjust_policy</code> only accepts
+    lpm / dfs-weight / fcfs / lof / random / routing-key and raises <code>ValueError</code> for
+    anything else. Real priority scheduling is a <em>layer</em>:
+    <code>--enable-priority-scheduling</code> on top of <code>fcfs</code> or <code>lof</code>
+    (asserted at <code>server_args.py:8636-8639</code>). Any cache-aware policy also silently
+    degrades to FCFS if the radix cache is disabled.
+  </div>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/managers/schedule_policy.py:313" data-desc="The classic LPM sort — one line of key function">
+<pre>
+@staticmethod
+def _sort_by_longest_prefix(
+    waiting_queue: List[Req], temporary_deprioritized: Set[int]
+) -> None:
+    """Sorts the waiting queue based on the longest prefix match."""
+    waiting_queue.sort(
+        key=lambda r: (
+            -r.num_matched_prefix_tokens
+            if r.rid not in temporary_deprioritized
+            else float("inf")
+        )
+    )
+</pre>
+  </div>
+
+  <p>
+    <code>temporary_deprioritized</code> implements <b>in-batch prefix caching</b>
+    (<code>_compute_prefix_matches</code>, schedule_policy.py:263): each pass builds a throwaway
+    simulated radix tree over the waiting queue itself. A request with a small real-cache hit
+    (≤ 32 tokens) that shares ≥ 32 tokens with <em>another queued request</em> is pushed to the back
+    — one representative runs first and warms the cache for its siblings.
+  </p>
+
+  <h2><span class="sec-num">2.6</span>PrefillAdder — the token-budget bouncer</h2>
+  <p>
+    Sorting decides <em>order</em>; <code>PrefillAdder</code> (<code>schedule_policy.py:444</code>)
+    decides <em>how many</em>. <code>get_new_batch_prefill</code> constructs one per pass
+    (scheduler.py:3097) and feeds it the queue head-first via <code>adder.add_one_req(req, ...)</code>
+    until a budget runs dry. Four budgets, two failure modes:
+  </p>
+
+  <table class="tbl">
+    <tr><th>Budget</th><th>Initialized from</th><th>Question it answers</th><th>Exhausted →</th></tr>
+    <tr><td><code>rem_total_tokens</code></td>
+      <td><code>available_size() + evictable_size()</code> − reserved decode headroom of running reqs
+        (each charged <code>min(remaining max_new_tokens, 4096) × new_token_ratio</code>)</td>
+      <td>Will this request fit through its <em>whole decode</em>?</td>
+      <td><code>NO_TOKEN</code> — stop admitting, set <code>batch_is_full</code></td></tr>
+    <tr><td><code>cur_rem_tokens</code></td>
+      <td>Same pool arithmetic, but only charged for <em>this pass's</em> extend allocations</td>
+      <td>Does the prefill itself fit right now?</td>
+      <td><code>NO_TOKEN</code></td></tr>
+    <tr><td><code>rem_input_tokens</code></td>
+      <td><code>--max-prefill-tokens</code> (default 16,384)</td>
+      <td>Compute cap: total extend tokens in one forward</td>
+      <td><code>OTHER</code> — stop, but memory is fine</td></tr>
+    <tr><td><code>rem_chunk_tokens</code></td>
+      <td><code>--chunked-prefill-size</code> (GPU-tier default 2,048-16,384; −1 disables)</td>
+      <td>Chunk cap for this pass; overflow triggers a chunked split</td>
+      <td><code>OTHER</code></td></tr>
+  </table>
+
+  <p>
+    Per admission, <code>add_one_req</code> computes
+    <code>total_tokens = cand_extend_input_len + max_new + page_size</code> and gates it against
+    <code>rem_total_tokens</code>; if the extend fits <code>rem_chunk_tokens</code> the whole prompt
+    is admitted, otherwise the request is <b>split</b>:
+  </p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/managers/schedule_policy.py:1213" data-desc="add_one_req: the chunked-split branch (long explanatory comments trimmed)">
+<pre>
+else:
+    # Make sure at least one page is available
+    trunc_len = chunk_tokens_limit // self.page_size * self.page_size
+
+    if trunc_len &lt;= 0:
+        return AddReqResult.OTHER
+
+    if truncation_align_size is not None:
+        if trunc_len &lt; truncation_align_size:
+            return AddReqResult.OTHER
+        else:
+            trunc_len = truncation_align_size * (
+                trunc_len // truncation_align_size
+            )
+
+    now_input_len = trunc_len + len(req.prefix_indices)
+    now_input_len = now_input_len // self.page_size * self.page_size
+    trunc_len = now_input_len - len(req.prefix_indices)
+
+    if trunc_len &lt;= 0:
+        return AddReqResult.OTHER
+
+    # Chunked prefill
+    req.set_extend_range(
+        len(req.prefix_indices), len(req.prefix_indices) + trunc_len
+    )
+
+    self.can_run_list.append(req)
+    self.new_chunked_req = req
+
+    self._req_inc_lock_ref(req)
+    self._update_prefill_budget(
+        prefix_len,
+        trunc_len,
+        0,
+        req.retracted_stain,
+        mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+    )
+</pre>
+  </div>
+
+  <p>
+    Note the <code>0</code> passed as <code>max_new_tokens</code>: a chunked admission defers its
+    decode reservation to the <em>final</em> chunk. Now the worked example — real numbers, budgets
+    counting down:
+  </p>
+
+  <div class="stepper" id="st-budget">
+    <div class="st-scene">
+      <div class="sc-row" style="gap:12px">
+        <div class="sc-box" id="bg-total"><span id="bg-total-v">58,880</span><small>rem_total_tokens</small></div>
+        <div class="sc-box" id="bg-cur"><span id="bg-cur-v">60,000</span><small>cur_rem_tokens</small></div>
+        <div class="sc-box" id="bg-input"><span id="bg-input-v">16,384</span><small>rem_input_tokens</small></div>
+        <div class="sc-box" id="bg-chunk"><span id="bg-chunk-v">8,192</span><small>rem_chunk_tokens</small></div>
+      </div>
+      <div class="sc-row" style="margin-top:14px">
+        <div class="sc-box" id="bg-queue" style="min-width:320px">waiting_queue
+          <div style="margin-top:6px">
+            <span class="tok" id="bg-A" style="width:auto;padding:0 10px">A · 5,000 prompt · 3,000 cached · max_new 500</span>
+          </div>
+          <div style="margin-top:6px">
+            <span class="tok" id="bg-B" style="width:auto;padding:0 10px">B · 10,000 prompt · no cache hit · max_new 2,000</span>
+          </div>
+        </div>
+      </div>
+      <div class="sc-row" style="margin-top:10px">
+        <div class="sc-box" id="bg-crl" style="min-width:320px">adder.can_run_list
+          <div style="margin-top:6px">
+            <span class="tok appear" id="cr-A" style="width:auto;padding:0 10px">A · extend 2,000</span>
+            <span class="tok appear" id="cr-B" style="width:auto;padding:0 10px">B · extend 6,192 (chunk 1/2)</span>
+          </div>
+        </div>
+        <div class="sc-box" id="bg-verdict"><span id="bg-verdict-v">CONTINUE</span><small>adder.budget_state()</small></div>
+      </div>
+    </div>
+  </div>
+
+  <h2><span class="sec-num">2.7</span>Retraction — when the decode gamble fails</h2>
+  <p>
+    Admission is probabilistic on purpose: <code>rem_total_tokens</code> discounts each running
+    request's remaining <code>max_new_tokens</code> by <code>new_token_ratio</code> (init
+    <code>0.7 × schedule_conservativeness</code>, decaying toward <code>0.7 × 0.14 ≈ 0.098</code>
+    over 600 retraction-free steps — <code>NewTokenRatioTracker</code>, values from
+    <code>environ.py:395-397</code>). Most requests stop early, so betting on that packs more in.
+    When the bet fails, <code>update_running_batch</code> notices
+    (<code>not batch.check_decode_mem()</code>, scheduler.py:3331) and calls
+    <code>retract_decode</code> — evicting decode requests back to the waiting queue:
+  </p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/managers/schedule_batch.py:2740" data-desc="retract_decode: evict until the next decode step fits; abort the last survivor rather than crash">
+<pre>
+retracted_reqs = []
+first_iter = True
+while first_iter or (
+    not self.check_decode_mem(selected_indices=sorted_indices)
+):
+    if len(sorted_indices) == 1:
+        # Always keep at least one request
+        break
+
+    first_iter = False
+    idx = sorted_indices.pop()
+    req = self.reqs[idx]
+    retracted_reqs.append(req)
+    # release memory and don't insert into the tree because we need the space instantly
+    self.release_req(idx, len(sorted_indices), server_args)
+
+reqs_to_abort: List[Req] = []
+if len(sorted_indices) &lt;= 1 and not self.check_decode_mem(
+    selected_indices=sorted_indices
+):
+    # Even the last remaining request cannot fit in memory.
+    # Instead of crashing the scheduler, gracefully abort it.
+    last_idx = sorted_indices.pop()
+    last_req = self.reqs[last_idx]
+    last_req.to_finish = FINISH_ABORT(
+        "Out of memory even after retracting all other requests "
+        "in the decode batch. Aborting the last request.",
+        status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+    )
+</pre>
+  </div>
+
+  <ul>
+    <li><b>Who gets evicted:</b> <code>_get_decode_retraction_order</code> — with the default
+      <code>--retraction-policy length</code>, victims are popped from the tail of a sort by
+      <code>(len(output_ids), -len(origin_input_ids))</code>: fewest generated tokens (least sunk
+      cost) and longest prompts (biggest memory refund) go first. <code>"priority"</code> sorts by
+      request priority first.</li>
+    <li><b>What eviction does:</b> <code>req.reset_for_retract()</code>
+      (<code>schedule_batch.py:1603</code>) zeroes <code>prefix_indices</code>,
+      <code>extend_range</code>, <code>kv_committed_len</code> … but <b>keeps
+      <code>output_ids</code></b> — on re-admission the request re-prefills prompt + everything
+      generated so far, usually recovering most KV from the radix cache.</li>
+    <li><b>Feedback loop:</b> the returned <code>new_token_ratio</code> estimate is written back to
+      the tracker (scheduler.py:3366), making future admission more conservative; each
+      retraction-free decode step decays it back down (<code>decay_step</code>).</li>
+    <li><b>Graceful degradation:</b> if even one lone request cannot decode, it gets a
+      <code>FINISH_ABORT</code> with HTTP 500 and an <code>AbortReq</code> is pushed to the
+      tokenizer — a deliberate change from older assert-crash behavior. Demo hook:
+      <code>SGLANG_TEST_RETRACT=1</code> forces retraction every few forwards.</li>
+  </ul>
+
+  <h2><span class="sec-num">2.8</span>Chunked prefill &amp; mixed batches</h2>
+  <p>
+    A 100k-token prompt prefilled in one go would stall every decoding request for seconds. Chunked
+    prefill caps each pass at <code>rem_chunk_tokens</code>; the scheduler holds the split request as
+    <code>self.chunked_req</code> and bumps <code>req.inflight_middle_chunks</code>
+    (scheduler.py:3223-3224). The chunk cycle, per iteration:
+  </p>
+  <ol>
+    <li><code>get_next_batch_to_run</code> excludes <code>chunked_req</code> from the running-batch
+      merge and calls <code>stash_chunked_request</code> — committing the finished chunk's KV into
+      the radix tree via <code>maybe_cache_unfinished_req(..., chunked=True)</code>.</li>
+    <li><code>get_new_batch_prefill</code>: <code>chunked_req.init_next_round_input()</code>
+      re-matches the prefix (now covering all finished chunks!), then
+      <code>adder.add_chunked_req(...)</code> re-admits the next window <em>before any queued
+      request</em> (scheduler.py:3115-3117).</li>
+    <li>Middle-chunk results are drained without streaming
+      (<code>inflight_middle_chunks -= 1</code> in the result processor); when
+      <code>add_chunked_req</code> finds the remainder fits (<code>truncated == False</code>,
+      <code>schedule_policy.py:917</code>) it returns <code>None</code>, <code>chunked_req</code>
+      clears, and the final chunk samples the first token like a normal prefill.</li>
+  </ol>
+  <p>
+    With <code>--enable-mixed-chunk</code>, the leftover chunk budget is spent on decode: the running
+    batch is folded <em>into</em> the prefill forward as a single
+    <code>ForwardMode.MIXED</code> batch (scheduler.py:3272-3287), so decode never stalls behind
+    chunks:
+  </p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/managers/schedule_batch.py:2667" data-desc="mix_with_running: fold the decode pool into a prefill batch (first half of the method)">
+<pre>
+def mix_with_running(self, running_batch: ScheduleBatch):
+    self.forward_mode = ForwardMode.MIXED
+    running_bs = running_batch.batch_size()
+
+    for req in running_batch.reqs:
+        req._refresh_fill_ids()
+        full_len = len(req.full_untruncated_fill_ids)
+        req.set_extend_range(full_len - 1, full_len)
+
+    # Decode tokens of the running portion live in future_map.output_tokens_buf.
+    self.input_ids = None
+    self.mix_running_indices = running_batch.req_pool_indices
+    out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
+</pre>
+  </div>
+
+  <p>
+    Two small governors blunt the prefill-first bias in special setups:
+    <code>PrefillDelayer</code> (<code>managers/prefill_delayer.py</code>) is a DP-synchronized
+    negotiation that delays prefill until all DP-attention ranks can prefill together (or a
+    watermark/max-delay hits), protecting decode latency; <code>MinFreeSlotsDelayer.should_delay
+    (running_bs, num_allocatable_reqs)</code> (<code>managers/min_free_slots_delayer.py</code>) holds
+    fresh admissions until several request slots are free so expensive admissions batch into one —
+    always-on for DFlash via the formula <code>min(4, max(2, (max_running_requests + 5) // 6))</code>.
+  </p>
+
+  <h2><span class="sec-num">2.9</span>Overlap scheduling — hiding the CPU behind the GPU</h2>
+  <p>
+    Everything above — queue sorting, budget math, radix matching, detokenizer IPC — is CPU work.
+    Done naively it serializes with GPU compute: forward, wait, process, forward. The default
+    <code>event_loop_overlap</code> instead runs the scheduler on a dedicated
+    <code>schedule_stream</code> and <em>launches</em> each forward on a separate
+    <code>forward_stream</code> without waiting, then processes the <b>previous</b> iteration's
+    result while the GPU crunches the current one:
+  </p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/managers/scheduler.py:1707" data-desc="event_loop_overlap core: launch batch N, then process batch N−1 (one comment trimmed)">
+<pre>
+# Launch the current batch
+if batch:
+    batch_result = self.run_batch(batch)
+    # Fence result processing behind this forward's shared reads.
+    self._apply_war_barrier()
+    self.result_queue.append((batch.copy(), batch_result))
+else:
+    batch_result = None
+
+# Process the last batch
+if self.last_batch:
+    if not disable_overlap_for_batch:
+        pop_and_process()
+elif batch is None:
+    # When the server is idle, do self-check and re-init some states
+    self.on_idle()
+
+# Run sample of the current batch
+if self.is_generation:
+    self.launch_batch_sample_if_needed(batch_result, batch)
+
+# Update last_batch
+self.last_batch = batch
+</pre>
+  </div>
+
+  <p>
+    But there's a paradox: to schedule decode step N+1 you need step N's sampled tokens — which
+    don't exist on the CPU yet. This repo's answer is the <b>FutureMap</b>
+    (<code>managers/overlap_utils.py</code>), a pool-indexed GPU-side relay:
+    <code>run_batch</code> stashes the sampled tokens into
+    <code>future_map.output_tokens_buf</code> at <code>req_pool_indices</code>
+    (<code>_relay_forward_payload</code>, scheduler.py:3707) and sets
+    <code>batch.input_ids = None</code> (scheduler.py:3583). At the <em>next</em> forward's entry,
+    the input ids are gathered on-GPU — the CPU never touches them:
+  </p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/managers/overlap_utils.py:84" data-desc="resolve_forward_inputs: materialize input_ids at forward entry — H2D for prefill, FutureMap gather for decode">
+<pre>
+def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
+    """Materialize input_ids at forward entry. Two sources:
+
+    - Prefill: H2D copy from pinned CPU staging (prefill_input_ids_cpu).
+    - Decode/spec_v2: gather from FutureMap (last iter's sampled token).
+    """
+    if batch.prefill_input_ids_cpu is not None:
+        prefill_gpu = batch.prefill_input_ids_cpu.to(batch.device, non_blocking=True)
+        if batch.mix_running_indices is not None:
+            decode_gpu = future_map.output_tokens_buf[batch.mix_running_indices]
+            if _DEBUG_ASSERT:
+                _assert_nonneg_and_invalidate(
+                    decode_gpu,
+                    future_map.output_tokens_buf,
+                    batch.mix_running_indices,
+                )
+            batch.input_ids = torch.cat([prefill_gpu, decode_gpu])
+        else:
+            batch.input_ids = prefill_gpu
+        batch.prefill_input_ids_cpu = None
+        batch.mix_running_indices = None
+    elif batch.input_ids is None and future_map.spec_algo.is_none():
+        batch.input_ids = future_map.output_tokens_buf[batch.req_pool_indices]
+        if _DEBUG_ASSERT:
+            _assert_nonneg_and_invalidate(
+                batch.input_ids, future_map.output_tokens_buf, batch.req_pool_indices
+            )
+</pre>
+  </div>
+
+  <div class="diagram">
+    <div class="dg-title">OVERLAP: CPU SCHEDULING RUNS ONE ITERATION AHEAD</div>
+    <pre class="mermaid">
+sequenceDiagram
+  participant CPU as schedule_stream (CPU)
+  participant GPU as forward_stream (GPU)
+  Note over CPU: iteration N
+  CPU->>CPU: get_next_batch_to_run() → batch N
+  CPU->>GPU: run_batch(N) — launch only, no sync
+  activate GPU
+  Note over GPU: resolve_forward_inputs():<br/>input_ids = output_tokens_buf[req_pool_indices]
+  CPU->>CPU: result_queue.append((N.copy(), result_N))
+  CPU->>CPU: pop_and_process() → process_batch_result(N−1)<br/>stop checks · stream_output · detok IPC
+  GPU-->>GPU: forward + sample → future_map.stash(tokens_N)
+  deactivate GPU
+  Note over CPU: iteration N+1 is being scheduled<br/>while N is still on the GPU
+    </pre>
+    <div class="dg-caption">
+      The <code>result_queue</code> holds exactly the in-flight batch, so all CPU result processing
+      for batch N−1 hides behind batch N's GPU time. In CI (<code>_DEBUG_ASSERT</code>) the token
+      buffer rows are poisoned with −1 and every gather asserts non-negative then re-poisons — a
+      consume-once discipline that catches "gather without stash" bugs. Overlap is selectively
+      disabled for two consecutive prefills or when a grammar FSM must sync
+      (<code>is_disable_overlap_for_batch</code>, scheduler.py:1735).
+    </div>
+  </div>
+
+  <p>
+    This design leaks into batch preparation: because the launched forward holds references to the
+    batch's tensors, <code>prepare_for_decode</code> must rebind fields <em>out of place</em> instead
+    of mutating them (see the project rule on ScheduleBatch mutation):
+  </p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/managers/schedule_batch.py:2978" data-desc="prepare_for_decode: allocate 1 token/req and rebind seq-lens tensors out of place">
+<pre>
+self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
+
+# Update req-level memory management fields
+for req in self.reqs:
+    req.decode_batch_idx += 1
+    req.kv_committed_len += 1
+
+# New-tensor avoids racing model_worker_batch refs queued for
+# overlap forward.
+self.seq_lens = self.seq_lens + 1
+self.seq_lens_cpu = self.seq_lens_cpu + 1
+self.orig_seq_lens = self.orig_seq_lens + 1
+# Sum is recomputed lazily by ForwardBatch.init_new.
+self.seq_lens_sum = None
+</pre>
+  </div>
+
+  <p>
+    Two more overlap layers exist beyond this loop: non-token values relay through
+    <code>FutureMap.publish</code> + pinned D2H on a private stream (<code>resolve_seq_lens_cpu</code>),
+    and <code>record_batch_in_overlap</code> pins each launched batch plus a field snapshot in a
+    2-slot ring so GPU tensors survive the caching allocator across streams (scheduler.py:3406).
+    Orthogonal to all of it is <b>two-batch overlap</b> (<code>batch_overlap/two_batch_overlap.py</code>),
+    which splits one forward into two micro-batches to hide MoE all-to-all communication — that story
+    is chapter 09.
+  </p>
+
+  <h2><span class="sec-num">2.10</span>Notable facts &amp; gotchas</h2>
+  <div class="card">
+    <ul>
+      <li><b>Prefill starves decode by design.</b> If any EXTEND batch can be formed, decode waits
+        (scheduler.py:2977-2986). <code>--enable-mixed-chunk</code>, <code>PrefillDelayer</code> and
+        <code>MinFreeSlotsDelayer</code> all exist to blunt this bias.</li>
+      <li><b>Finish is two-phase.</b> <code>finished_reason</code> is set and KV freed
+        (<code>release_kv_cache</code>) in the result processor, but the req stays in
+        <code>running_batch.reqs</code> until the next <code>filter_batch()</code>. Code walking
+        running reqs must skip <code>req.finished()</code>.</li>
+      <li><b>Overlap runs one iteration behind</b> — a finished or retracted request may receive one
+        extra speculative decode step whose over-allocated tokens are freed later; and
+        <code>mix_with_running</code> uses <code>delta = 0 if enable_overlap else -1</code> because
+        <code>output_ids</code> lags one step.</li>
+      <li><b><code>batch_is_full</code> is a sticky optimization flag</b>, reset whenever requests
+        leave the batch — not a live measurement.</li>
+      <li><b>Budgets double-book the radix cache:</b> <code>rem_total_tokens</code> counts
+        <code>evictable_size()</code> as free, so admission may rely on evicting cached prefixes;
+        the actual eviction happens later in <code>alloc_for_extend</code> /
+        <code>check_decode_mem</code>.</li>
+      <li><b>The chunked request is never merged into <code>running_batch</code> mid-flight</b> —
+        it's explicitly excluded, and its per-chunk KV committed to the radix tree between chunks is
+        exactly what makes the next chunk's prefix match work.</li>
+      <li><b>Health checks are load-shedded:</b> a health-check generate request is dropped with a
+        canned reply whenever the server is busy (scheduler.py:1788).</li>
+      <li><b>Defaults cheat sheet:</b> <code>--schedule-policy fcfs</code> ·
+        <code>--max-prefill-tokens 16384</code> · <code>--chunked-prefill-size</code> auto by GPU
+        memory tier (−1 disables) · <code>--schedule-conservativeness 1.0</code> ·
+        <code>--retraction-policy length</code> ·
+        <code>--priority-scheduling-preemption-threshold 10</code> · overlap ON unless
+        <code>--disable-overlap-schedule</code> · mixed chunk OFF unless
+        <code>--enable-mixed-chunk</code> · <code>CLIP_MAX_NEW_TOKENS 4096</code>.</li>
+    </ul>
+  </div>
+
+  <div id="pager"></div>
+  </div>
+</main>
+</div>
+
+<script>
+document.addEventListener("DOMContentLoaded", () => {
+
+  new Stepper("#st-cb", {
+    title: "Continuous batching: 3 requests, 8 iterations",
+    intro: "A (512-token prompt), B (3,000), C (64) arrive on an idle server at different times.",
+    autoMs: 3400,
+    reset(sc) {
+      clearState(sc, ".sc-box,.tok");
+      rmCls(sc, ".appear", "in");
+      setText(sc, "#cb-iter", "0");
+      setText(sc, "#cb-modetxt", "—");
+      setText(sc, "#rb-A", "A · 0 out");
+      setText(sc, "#rb-B", "B · 0 out");
+      setText(sc, "#rb-C", "C · 0 out");
+    },
+    steps: [
+      { cap: "<b>Iteration 1.</b> <code>recv_requests</code> delivers A; <code>handle_generate_request</code> builds a <code>Req</code> and appends it to <code>waiting_queue</code>.",
+        run(sc) { setText(sc, "#cb-iter", "1"); setCls(sc, "#wq-A", "in", "hl"); setCls(sc, "#cb-wq", "hl"); } },
+      { cap: "Still iteration 1: <code>get_new_batch_prefill</code> — <code>calc_priority</code> sorts the queue, <code>PrefillAdder.add_one_req(A)</code> admits it, <code>prepare_for_extend()</code> sets <code>ForwardMode.EXTEND</code>. <code>run_batch</code> prefills all 512 tokens in one forward and samples A's first token.",
+        run(sc) { rmCls(sc, "#wq-A", "hl"); rmCls(sc, "#cb-wq", "hl"); setCls(sc, "#wq-A", "dim"); setText(sc, "#cb-modetxt", "EXTEND"); setCls(sc, "#bt-A", "in", "hl"); } },
+      { cap: "<b>Iteration 2.</b> <code>last_batch</code> was EXTEND → <code>filter_batch()</code> + <code>merge_batch()</code> fold A into <code>running_batch</code>. The batch decodes: +1 token for A. Meanwhile B (3,000-token prompt) arrives.",
+        run(sc) { setText(sc, "#cb-iter", "2"); rmCls(sc, "#bt-A", "in", "hl"); setText(sc, "#cb-modetxt", "DECODE"); setCls(sc, "#rb-A", "in", "hl"); setText(sc, "#rb-A", "A · 2 out"); setCls(sc, "#wq-B", "in", "hl"); } },
+      { cap: "<b>Iteration 3.</b> Prefill-first: B's prefill batch preempts decode — A waits this iteration (its next token is delayed by B's whole 3,000-token prefill; this is exactly the latency spike <code>--enable-mixed-chunk</code> smooths out).",
+        run(sc) { setText(sc, "#cb-iter", "3"); rmCls(sc, "#wq-B", "hl"); setCls(sc, "#wq-B", "dim"); setText(sc, "#cb-modetxt", "EXTEND"); setCls(sc, "#bt-B", "in", "hl"); rmCls(sc, "#rb-A", "hl"); setCls(sc, "#rb-A", "dim"); } },
+      { cap: "<b>Iteration 4.</b> B merges in; the decode batch is now [A, B] — one forward produces one token for each. C arrives.",
+        run(sc) { setText(sc, "#cb-iter", "4"); rmCls(sc, "#bt-B", "in", "hl"); setText(sc, "#cb-modetxt", "DECODE"); rmCls(sc, "#rb-A", "dim"); setCls(sc, "#rb-B", "in", "hl"); setText(sc, "#rb-A", "A · 3 out"); setText(sc, "#rb-B", "B · 2 out"); setCls(sc, "#wq-C", "in", "hl"); } },
+      { cap: "<b>Iteration 5.</b> C's tiny 64-token prefill gets its own EXTEND batch; [A, B] pause one step.",
+        run(sc) { setText(sc, "#cb-iter", "5"); rmCls(sc, "#wq-C", "hl"); setCls(sc, "#wq-C", "dim"); setText(sc, "#cb-modetxt", "EXTEND"); setCls(sc, "#bt-C", "in", "hl"); rmCls(sc, "#rb-B", "hl"); setCls(sc, "#rb-A,#rb-B", "dim"); } },
+      { cap: "<b>Iteration 6.</b> Full house: decode [A, B, C]. Three requests that arrived at completely different times now share every forward — this is continuous batching.",
+        run(sc) { setText(sc, "#cb-iter", "6"); rmCls(sc, "#bt-C", "in", "hl"); setText(sc, "#cb-modetxt", "DECODE"); rmCls(sc, "#rb-A,#rb-B", "dim"); setCls(sc, "#rb-C", "in"); setCls(sc, "#cb-rb", "hl"); setText(sc, "#rb-A", "A · 4 out"); setText(sc, "#rb-B", "B · 3 out"); setText(sc, "#rb-C", "C · 2 out"); } },
+      { cap: "<b>Iteration 7.</b> A samples its EOS token → <code>update_finish_state</code> sets <code>FINISH_MATCHED_TOKEN</code>; <code>release_kv_cache</code> inserts its KV into the radix tree and frees the slot. But A still sits in <code>running_batch.reqs</code> — finish is two-phase.",
+        run(sc) { setText(sc, "#cb-iter", "7"); rmCls(sc, "#cb-rb", "hl"); setCls(sc, "#rb-A", "ok"); setText(sc, "#rb-A", "A · EOS ✓"); setText(sc, "#rb-B", "B · 4 out"); setText(sc, "#rb-C", "C · 3 out"); } },
+      { cap: "<b>Iteration 8.</b> <code>update_running_batch → filter_batch()</code> physically drops A and resets <code>batch_is_full</code>. Decode continues with [B, C], and the freed KV + request slot are available to the next arrival — no request ever waited for another to finish.",
+        run(sc) { setText(sc, "#cb-iter", "8"); setCls(sc, "#rb-A", "bad"); rmCls(sc, "#rb-A", "ok"); setText(sc, "#rb-B", "B · 5 out"); setText(sc, "#rb-C", "C · 4 out"); setCls(sc, "#rb-B,#rb-C", "ok"); } },
+    ],
+  });
+
+  new Stepper("#st-budget", {
+    title: "PrefillAdder budgets: one admission pass, with real numbers",
+    intro: "Pool: available 50,000 + evictable 10,000. max_prefill_tokens=16,384, chunked_prefill_size=8,192, page_size=1, new_token_ratio=0.7. Two decode reqs already run (each max_new 1,000, 200 generated).",
+    autoMs: 4200,
+    reset(sc) {
+      clearState(sc, ".sc-box,.tok");
+      rmCls(sc, ".appear", "in");
+      setText(sc, "#bg-total-v", "58,880");
+      setText(sc, "#bg-cur-v", "60,000");
+      setText(sc, "#bg-input-v", "16,384");
+      setText(sc, "#bg-chunk-v", "8,192");
+      setText(sc, "#bg-verdict-v", "CONTINUE");
+      setText(sc, "#cr-B", "B · extend 6,192 (chunk 1/2)");
+    },
+    steps: [
+      { cap: "Constructor: <code>rem_total_tokens = 60,000 − Σ reserved decode</code>. Each running req reserves <code>(1,000 − 200) × 0.7 = 560</code>, so the offset is 1,120 → <b>58,880</b>. <code>cur_rem_tokens</code> ignores decode reservations → 60,000. <code>rem_input</code>/<code>rem_chunk</code> come straight from the flags.",
+        run(sc) { setCls(sc, "#bg-total,#bg-cur,#bg-input,#bg-chunk", "hl"); } },
+      { cap: "<b>Req A</b> (5,000 prompt, 3,000-token radix hit, max_new 500): <code>cand_extend = 5,000 − 3,000 = 2,000</code>; <code>total_tokens = 2,000 + 500 + 1 = 2,501 &lt; 58,880</code> ✓ and <code>2,000 ≤ rem_chunk 8,192</code> → whole-prompt admission via <code>set_extend_range(3000, 5000)</code>.",
+        run(sc) { rmCls(sc, "#bg-total,#bg-cur,#bg-input,#bg-chunk", "hl"); setCls(sc, "#bg-A", "hl"); setCls(sc, "#cr-A", "in", "ok"); } },
+      { cap: "<code>_update_prefill_budget</code> charges A: <code>rem_total −= 2,000 + 500 + 1</code> → <b>56,379</b>; <code>cur_rem −= 2,001</code> → <b>57,999</b>; <code>rem_input −= 2,000</code> → <b>14,384</b>; <code>rem_chunk −= 2,000</code> → <b>6,192</b>. <code>budget_state()</code> → CONTINUE.",
+        run(sc) { rmCls(sc, "#bg-A", "hl"); setCls(sc, "#bg-A", "dim"); setCls(sc, "#bg-total,#bg-cur,#bg-input,#bg-chunk", "hl"); setText(sc, "#bg-total-v", "56,379"); setText(sc, "#bg-cur-v", "57,999"); setText(sc, "#bg-input-v", "14,384"); setText(sc, "#bg-chunk-v", "6,192"); } },
+      { cap: "<b>Req B</b> (10,000 prompt, no hit, max_new 2,000): <code>total_tokens = 12,001 &lt; 56,379</code> ✓ — memory is fine. But <code>extend 10,000 &gt; rem_chunk 6,192</code> → the <b>chunked split</b> branch: <code>trunc_len = 6,192</code>, <code>set_extend_range(0, 6192)</code>, <code>new_chunked_req = B</code>. Decode reservation deferred: charged as <code>max_new = 0</code>.",
+        run(sc) { rmCls(sc, "#bg-total,#bg-cur,#bg-input,#bg-chunk", "hl"); setCls(sc, "#bg-B", "hl"); setCls(sc, "#cr-B", "in", "warn"); } },
+      { cap: "Budget after B: <code>rem_total → 50,186</code>, <code>rem_chunk → 0</code>. <code>budget_state()</code> hits <code>rem_chunk_tokens &lt;= 0</code> → <b>AddReqResult.OTHER</b>: the admission loop breaks (memory is fine, this pass is just full). Batch = A (2,000) + B (6,192) = exactly 8,192 extend tokens.",
+        run(sc) { rmCls(sc, "#bg-B", "hl"); setCls(sc, "#bg-B", "dim"); setCls(sc, "#bg-chunk", "bad"); setText(sc, "#bg-total-v", "50,186"); setText(sc, "#bg-chunk-v", "0"); setCls(sc, "#bg-verdict", "warn"); setText(sc, "#bg-verdict-v", "OTHER"); } },
+      { cap: "<b>Next scheduler pass.</b> B is <code>self.chunked_req</code>: its 6,192 computed tokens were stashed into the radix tree, so <code>init_next_round_input</code> matches them as prefix. <code>add_chunked_req</code>: remaining <code>3,808 ≤ 8,192</code> → <code>truncated = False</code> — final chunk. Now <code>max_new = min(2,000, 4,096)</code> is finally reserved, the method returns <code>None</code>, <code>chunked_req</code> clears, and B samples its first token.",
+        run(sc) { rmCls(sc, "#bg-chunk", "bad"); rmCls(sc, "#bg-verdict", "warn"); setText(sc, "#bg-verdict-v", "CONTINUE"); setText(sc, "#cr-B", "B · extend 3,808 (final chunk)"); rmCls(sc, "#cr-B", "warn"); setCls(sc, "#cr-B", "ok"); setCls(sc, "#cr-A", "dim"); } },
+    ],
+  });
+
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,710 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 · Layers: TP, MoE, Quantization, LoRA, VLM — SGLang Internals</title>
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/mermaid.min.js"></script>
+<script src="assets/viz.js"></script>
+</head>
+<body>
+<div class="layout">
+<main>
+  <div class="page-hero"><div class="content">
+    <span class="phase-badge">Phase III · Models &amp; Compute</span>
+    <h1>05 · The Layer Library: Parallel Linear, MoE, Quantization, LoRA &amp; Multimodal</h1>
+    <p class="lede">
+      Every one of the 212 model files in <code>srt/models/</code> is a thin composition of a
+      shared layer library in <code>srt/layers/</code>. That library is where tensor parallelism,
+      MoE dispatch, quantization, LoRA, and multimodal embedding actually happen — a model file
+      just names the pieces. Learn the library once and every model file becomes readable.
+    </p>
+  </div></div>
+
+  <div class="content">
+
+  <h2><span class="sec-num">5.1</span>A tour of <code>srt/layers/</code></h2>
+  <p>
+    The design (inherited from Megatron via vLLM — many files carry
+    <code>Adapted from ... vllm</code> headers — then heavily extended) has one governing idea:
+    <strong>the layer owns sharding and communication; the quant method owns the math; the model
+    file owns neither.</strong> A model constructor asks for a
+    <code>QKVParallelLinear</code> and gets back a module that already knows its TP shard, its
+    quantized weight format, and whether its forward ends in an all-reduce.
+  </p>
+
+  <div class="filetree">
+<b>python/sglang/srt/layers/</b>
+├── linear.py                    <i>ColumnParallel / RowParallel / QKV / Merged — the TP workhorses (1.7k LOC)</i>
+├── vocab_parallel_embedding.py  <i>VocabParallelEmbedding, ParallelLMHead — vocab-dim sharding</i>
+├── layernorm.py                 <i>RMSNorm &amp; friends, 8 per-platform forwards + allreduce-fusion</i>
+├── activation.py                <i>SiluAndMul, GeluAndMul, … gated activations</i>
+├── rotary_embedding/            <i>get_rope() factory: llama3, yarn, deepseek_yarn, longrope, mrope…</i>
+├── radix_attention.py           <i>the attention layer models instantiate (backends: chapter 04)</i>
+├── attention/                   <i>attention backend implementations (chapter 04)</i>
+├── communicator.py              <i>LayerCommunicator + ScatterMode — DP-attention layout transitions</i>
+├── dp_attention.py              <i>dp_gather_partial / dp_scatter plumbing (chapter 07)</i>
+├── logits_processor.py, sampler.py, pooler.py
+├── parameter.py                 <i>BasevLLMParameter weight-loading params</i>
+├── <b>moe/</b>
+│   ├── topk.py                  <i>routing: fused/grouped/biased_grouped topk (2.2k LOC)</i>
+│   ├── fused_moe_triton/layer.py <i>FusedMoE — the one MoE module every model uses</i>
+│   ├── ep_moe/layer.py          <i>DeepEPMoE(FusedMoE)</i>
+│   ├── moe_runner/              <i>~11 expert-GEMM backends: triton, deep_gemm, flashinfer_*, marlin, aiter…</i>
+│   ├── token_dispatcher/        <i>standard, deepep, mooncake, nixl, moriep, pplx, flashinfer, ascend_tp</i>
+│   └── dwdp/                    <i>expert-weight paging (prefetch experts per layer)</i>
+└── <b>quantization/</b>
+    ├── __init__.py              <i>string → QuantizationConfig registry (~29 methods)</i>
+    ├── base_config.py           <i>create_weights / process_weights_after_loading / apply contract</i>
+    ├── fp8.py                   <i>Fp8Config + linear/MoE/KV-cache methods (2.6k LOC)</i>
+    ├── kv_cache.py              <i>BaseKVCacheMethod — fp8 KV cache scales</i>
+    └── awq/ gptq/ compressed_tensors/ quark/ modelslim/ …
+  </div>
+
+  <div class="callout note"><span class="co-title">Everything is a MultiPlatformOp</span>
+    <code>RMSNorm</code>, the activations, RoPE, and MoE <code>TopK</code> are all
+    <code>MultiPlatformOp</code>s carrying up to eight per-platform forwards
+    (<code>forward_cuda / forward_npu / forward_hip / forward_aiter / forward_musa /
+    forward_xpu / forward_cpu / forward_native</code>), selected once at init. That is how one
+    layer library serves NVIDIA, AMD, Ascend, MUSA, Intel and CPU builds without per-model forks.
+  </div>
+
+  <h2><span class="sec-num">5.2</span>Tensor-parallel linear layers</h2>
+  <p>
+    Two primitives carry all of tensor parallelism, and the whole trick is choosing which
+    dimension to cut so that communication is only needed <em>once per pair</em>:
+  </p>
+  <ul>
+    <li><strong><code>ColumnParallelLinear</code></strong> (<code>layers/linear.py:293</code>) —
+      <code>Y = XA</code> with <code>A</code> split along its <em>output</em> dimension,
+      <code>A = [A₁, …, A_p]</code>. Every rank has the full input and computes its own slice of
+      the output. <b>No communication</b> — as long as the next layer is happy consuming a sharded
+      tensor (<code>gather_output=True</code> exists but is rarely used).</li>
+    <li><strong><code>RowParallelLinear</code></strong> (<code>layers/linear.py:1380</code>) —
+      <code>A</code> split along its <em>input</em> dimension. Each rank holds a slice of the
+      input (exactly what the preceding ColumnParallel layer produced) and computes a
+      <em>partial</em> full-width output; the partials are summed with an
+      <b>all-reduce</b>. Bias is added only on rank 0 so it isn't summed p times.</li>
+  </ul>
+  <p>
+    On top of those come the fusions: <code>MergedColumnParallelLinear</code>
+    (<code>gate_proj</code>+<code>up_proj</code> concatenated into one GEMM,
+    <code>output_sizes=[I, I]</code>) and <code>QKVParallelLinear</code>
+    (Q, K and V concatenated, sharded <em>by attention head</em>). For grouped-query attention,
+    the KV heads run out before the ranks do — so they get replicated:
+  </p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/layers/linear.py:978" data-desc="QKVParallelLinear: GQA KV-head replication kicks in when tp_size ≥ total kv heads">
+<pre>
+self.num_heads = divide(self.total_num_heads, tp_size)
+if tp_size >= self.total_num_kv_heads:
+    self.num_kv_heads = 1
+    self.num_kv_head_replicas = divide(tp_size, self.total_num_kv_heads)
+else:
+    self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
+    self.num_kv_head_replicas = 1
+</pre>
+  </div>
+
+  <p>
+    A Llama-3-8B (8 KV heads) at TP=8 gives every rank exactly one KV head; at TP=16 each KV head
+    is <em>replicated</em> on two ranks — and the KV cache is duplicated with it. This waste is one
+    of the motivations for DP attention (chapter 07), which DeepSeek-style MLA models use to avoid
+    splitting their single latent KV head at all.
+  </p>
+
+  <div class="diagram">
+    <div class="dg-title">One transformer block under plain TP — exactly two comm points</div>
+    <pre class="mermaid">
+flowchart TB
+  x["hidden states x<br/>[tokens, hidden] — replicated on all ranks"]
+  qkv["qkv_proj — QKVParallelLinear<br/>(column split by head)"]
+  attn["RadixAttention<br/>local q/kv heads only"]
+  o["o_proj — RowParallelLinear<br/>(row split, partial output)"]
+  ar1(["all-reduce #1"])
+  norm["RMSNorm + residual"]
+  gu["gate_up_proj — MergedColumnParallelLinear<br/>(column split)"]
+  act["SiluAndMul<br/>splits fused [gate; up] in half"]
+  down["down_proj — RowParallelLinear<br/>(row split, partial output)"]
+  ar2(["all-reduce #2"])
+  x --> qkv --> attn --> o --> ar1 --> norm --> gu --> act --> down --> ar2
+  style ar1 fill:#fdf3e3,stroke:#d97706
+  style ar2 fill:#fdf3e3,stroke:#d97706
+  style qkv fill:#eef0ff,stroke:#4f46e5
+  style gu fill:#eef0ff,stroke:#4f46e5
+  style o fill:#e7f7ec,stroke:#16a34a
+  style down fill:#e7f7ec,stroke:#16a34a
+    </pre>
+    <div class="dg-caption">
+      Column layers (indigo) need no communication because their consumers accept sharded input;
+      row layers (green) each end in one all-reduce (amber). Per layer that is exactly two
+      all-reduces of <code>[tokens, hidden]</code> — the entire TP communication bill.
+    </div>
+  </div>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/layers/linear.py:1589" data-desc="RowParallelLinear.forward — where the all-reduce happens (quantize_communications computation trimmed)">
+<pre>
+if (
+    ((self.reduce_results and self.tp_size > 1) or self.use_decode_attn_tp)
+    and not skip_all_reduce
+    and not should_skip_mlp_all_reduce()
+):
+    if self.use_dp_attention_reduce:
+        output = get_parallel().attn_tp_group.all_reduce(output_parallel)
+    else:
+        ...
+        if quantize_communications:
+            output = tensor_model_parallel_quant_all_reduce(output_parallel)
+        else:
+            output = tensor_model_parallel_all_reduce(output_parallel)
+else:
+    output = output_parallel
+</pre>
+  </div>
+
+  <p>
+    Note how much policy hides in that one spot: the all-reduce can be skipped per call-site
+    (<code>skip_all_reduce</code>), suppressed by per-forward flags when the runtime fuses it into
+    the next RMSNorm or replaces it with a reduce-scatter
+    (<code>should_skip_mlp_all_reduce()</code>), rerouted to the attention-TP subgroup under DP
+    attention, or <em>quantized on the wire</em> for prefill
+    (<code>enable_quant_communications</code>). The producing GEMM even runs inside
+    <code>use_symmetric_memory(...)</code> so the output buffer is NCCL-window-allocated for
+    one-shot all-reduce. <code>VocabParallelEmbedding</code> plays the same game on the vocab
+    dimension: out-of-shard token ids are masked to zero locally and the partial embeddings are
+    summed by all-reduce.
+  </p>
+
+  <h3>Worked example: Llama-3-8B attention block at TP=2</h3>
+  <p>
+    Real numbers: hidden 4096, 32 query heads, 8 KV heads, head_dim 128, intermediate 14336.
+    Step through one attention block on two GPUs:
+  </p>
+
+  <div class="stepper" id="st-tp">
+    <div class="st-scene">
+      <div style="display:grid; grid-template-columns: 1fr 1fr; gap:12px; min-width:780px">
+        <div class="sc-box" id="tp-h0" style="text-align:center">GPU 0 · tp_rank 0<small>holds q heads 0–15, kv heads 0–3</small></div>
+        <div class="sc-box" id="tp-h1" style="text-align:center">GPU 1 · tp_rank 1<small>holds q heads 16–31, kv heads 4–7</small></div>
+
+        <div class="sc-box" id="tp-x0">x<small>[tokens, 4096] — full copy</small></div>
+        <div class="sc-box" id="tp-x1">x<small>[tokens, 4096] — full copy</small></div>
+
+        <div class="sc-box appear" id="tp-q0">qkv_proj (QKVParallelLinear)<small>W: 4096 → 3072 = 16q·128 + 4k·128 + 4v·128</small></div>
+        <div class="sc-box appear" id="tp-q1">qkv_proj (QKVParallelLinear)<small>W: 4096 → 3072 (its half of 6144)</small></div>
+
+        <div class="sc-box appear" id="tp-a0">RoPE + attention<small>16 q heads over 4 local kv heads (GQA group 4)</small></div>
+        <div class="sc-box appear" id="tp-a1">RoPE + attention<small>KV cache stores only these 4 kv heads</small></div>
+
+        <div class="sc-box appear" id="tp-o0">o_proj (RowParallelLinear)<small>W: 2048 → 4096 ⇒ partial Y₀</small></div>
+        <div class="sc-box appear" id="tp-o1">o_proj (RowParallelLinear)<small>W: 2048 → 4096 ⇒ partial Y₁</small></div>
+
+        <div class="sc-box appear" id="tp-ar" style="grid-column: span 2; text-align:center; border-style:dashed">tensor_model_parallel_all_reduce<small>Y = Y₀ + Y₁ · [tokens, 4096] · comm point #1</small></div>
+
+        <div class="sc-box appear" id="tp-mlp" style="grid-column: span 2; text-align:center">MLP repeats the pattern<small>gate_up 4096→2·7168 (column) → SiluAndMul → down_proj 7168→4096 (row) → all-reduce #2</small></div>
+      </div>
+    </div>
+  </div>
+
+  <h2><span class="sec-num">5.3</span>MoE: one module, pluggable dispatch and compute</h2>
+  <p>
+    All MoE models instantiate a single module — <code>FusedMoE</code>
+    (<code>layers/moe/fused_moe_triton/layer.py:201</code>; <code>DeepEPMoE</code> subclasses it).
+    Its forward is a fixed five-stage pipeline in which two stages are <em>plugins</em>: the
+    <b>token dispatcher</b> (how token activations reach the ranks that own their experts,
+    <code>--moe-a2a-backend</code>) and the <b>MoE runner</b> (which grouped-GEMM implementation
+    crunches them, <code>--moe-runner-backend</code>). Any of ~8 dispatchers can pair with any of
+    ~11 runners.
+  </p>
+
+  <div class="diagram">
+    <div class="dg-title">FusedMoE forward pipeline</div>
+    <pre class="mermaid">
+flowchart LR
+  hs["hidden_states"] --> gate["router gate<br/>(per-model nn.Linear)"]
+  gate --> topk["TopK / select_experts<br/><i>moe/topk.py</i><br/>fused · grouped · biased_grouped"]
+  topk --> disp["dispatcher.dispatch()"]
+  disp --> core["run_moe_core()<br/>quant_method.apply()"]
+  core --> runner["MoeRunner backend<br/>grouped GEMM1 → SiLU → GEMM2"]
+  runner --> comb["dispatcher.combine()"]
+  comb --> ar["all-reduce<br/>if moe_tp_size &gt; 1 or moe_ep_size &gt; 1"]
+  dispimpl["standard (passthrough)<br/>deepep · mooncake · pplx<br/>nixl · moriep · flashinfer"] -.-> disp
+  runimpl["triton · deep_gemm · marlin<br/>flashinfer_trtllm / cutlass / cutedsl<br/>triton_kernels · aiter · ascend"] -.-> runner
+  style disp fill:#f5ecfe,stroke:#9333ea
+  style comb fill:#f5ecfe,stroke:#9333ea
+  style runner fill:#e7f7ec,stroke:#16a34a
+  style ar fill:#fdf3e3,stroke:#d97706
+    </pre>
+    <div class="dg-caption">
+      Routing modes in <code>topk.py</code>: plain softmax <code>fused_topk</code>,
+      <code>grouped_topk</code> (DeepSeek V2/V3/R1), <code>biased_grouped_topk</code>
+      (sigmoid scoring + <code>correction_bias</code> load-balance bias), plus EPLB
+      expert-location remapping and fused shared experts. The quant method sits <i>inside</i> the
+      pipeline: <code>FusedMoEMethodBase.apply(layer, dispatch_output) → CombineInput</code>.
+    </div>
+  </div>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/layers/moe/fused_moe_triton/layer.py:1416" data-desc="FusedMoE.forward_impl — dispatch → experts → combine → all-reduce (DWDP/pre-quant branches trimmed)">
+<pre>
+dispatch_output = self.dispatcher.dispatch(
+    hidden_states=hidden_states, topk_output=topk_output
+)
+...
+combine_input = self.run_moe_core(
+    dispatch_output=dispatch_output,
+)
+...
+final_hidden_states = self.dispatcher.combine(combine_input=combine_input)
+...
+if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
+    final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+</pre>
+  </div>
+
+  <h3>EP vs TP for experts</h3>
+  <table class="tbl">
+    <tr><th></th><th>Expert TP (<code>moe_tp_size</code>)</th><th>Expert parallelism (<code>moe_ep_size</code>, <code>--ep-size</code>)</th></tr>
+    <tr><td>What is sliced</td>
+      <td>Every expert's FFN width: <code>intermediate_size_per_partition = intermediate_size // moe_tp_size</code> (layer.py:303)</td>
+      <td>Whole experts: <code>num_local_experts = _num_local_routed + num_fused_shared_experts</code> per rank; weight loading skips non-local <code>expert_id</code>s</td></tr>
+    <tr><td>Token movement</td>
+      <td>None — the standard dispatcher is a passthrough; every rank sees all tokens and computes its shard of every selected expert</td>
+      <td>All-to-all: each token's activation travels to the ranks owning its top-k experts, and back</td></tr>
+    <tr><td>Final reduction</td>
+      <td>all-reduce sums the width-shards</td>
+      <td><code>combine()</code> already returns full outputs to home ranks; all-reduce only if TP is mixed in</td></tr>
+    <tr><td>Sweet spot</td>
+      <td>Few large experts (Mixtral 8×7B)</td>
+      <td>Many small experts (DeepSeek-V3: 256 routed experts)</td></tr>
+  </table>
+
+  <h3>DeepEP: two wire protocols, chosen per forward mode</h3>
+  <p>
+    The DeepEP dispatcher (<code>layers/moe/token_dispatcher/deepep.py</code>) has two
+    implementations and <code>DeepEPMode</code> (<code>moe/utils.py:177</code>) =
+    <code>NORMAL | LOW_LATENCY | AUTO</code> picks between them.
+    <code>AUTO.resolve(is_extend_in_batch)</code> returns <b>NORMAL</b> for prefill (chunked
+    NVLink+RDMA bulk transfers, throughput-optimal) and <b>LOW_LATENCY</b> for decode (IBGDA RDMA,
+    fixed <code>num_max_dispatch_tokens_per_rank</code>, CUDA-graph-safe, returns async hooks for
+    two-batch overlap). The low-latency path can quantize activations to FP8 — or NVFP4 —
+    <em>inside the all-to-all</em>, halving wire bytes:
+  </p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/layers/moe/token_dispatcher/deepep.py:750" data-desc="Low-latency dispatch: fp8-on-the-wire, hook-based async (kwargs trimmed)">
+<pre>
+packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
+    buffer.low_latency_dispatch(
+        hidden_states,
+        topk_ids,
+        self.num_max_dispatch_tokens_per_rank,
+        self.num_experts,
+        use_fp8=self.use_fp8,
+        ...
+        async_finish=not self.return_recv_hook,
+        return_recv_hook=self.return_recv_hook,
+</pre>
+  </div>
+
+  <h3>Worked example: 4 tokens, top-2 of 8 experts, 2 EP ranks</h3>
+  <div class="stepper" id="st-moe">
+    <div class="st-scene">
+      <div style="display:grid; grid-template-columns: 1fr 1fr; gap:12px; min-width:780px">
+        <div class="sc-box" id="mo-r0" style="text-align:center">EP rank 0<small>owns experts E0 E1 E2 E3</small></div>
+        <div class="sc-box" id="mo-r1" style="text-align:center">EP rank 1<small>owns experts E4 E5 E6 E7</small></div>
+
+        <div class="sc-box" id="mo-home0">home tokens
+          <div class="sc-row" style="margin-top:6px"><span class="tok" id="mo-t0">t0</span><span class="tok" id="mo-t1">t1</span></div>
+        </div>
+        <div class="sc-box" id="mo-home1">home tokens
+          <div class="sc-row" style="margin-top:6px"><span class="tok" id="mo-t2">t2</span><span class="tok" id="mo-t3">t3</span></div>
+        </div>
+
+        <div class="sc-box appear" id="mo-route" style="grid-column: span 2; text-align:center">select_experts → TopKOutput(topk_weights, topk_ids)<small>t0→{E1·0.7, E5·0.3} &nbsp; t1→{E0·0.6, E2·0.4} &nbsp; t2→{E4·0.8, E6·0.2} &nbsp; t3→{E3·0.5, E5·0.5}</small></div>
+
+        <div class="sc-box appear" id="mo-d0">after dispatch (rank 0 recv)
+          <div class="sc-row" style="margin-top:6px; flex-wrap:wrap">
+            <span class="tok appear" id="mo-d0a">t1→E0</span>
+            <span class="tok appear" id="mo-d0b">t0→E1</span>
+            <span class="tok appear" id="mo-d0c">t1→E2</span>
+            <span class="tok appear" id="mo-d0d">t3→E3</span>
+          </div>
+        </div>
+        <div class="sc-box appear" id="mo-d1">after dispatch (rank 1 recv)
+          <div class="sc-row" style="margin-top:6px; flex-wrap:wrap">
+            <span class="tok appear" id="mo-d1a">t2→E4</span>
+            <span class="tok appear" id="mo-d1b">t0→E5</span>
+            <span class="tok appear" id="mo-d1c">t3→E5</span>
+            <span class="tok appear" id="mo-d1d">t2→E6</span>
+          </div>
+        </div>
+
+        <div class="sc-box appear" id="mo-g0">run_moe_core — grouped GEMM<small>E0:[t1] · E1:[t0] · E2:[t1] · E3:[t3]</small></div>
+        <div class="sc-box appear" id="mo-g1">run_moe_core — grouped GEMM<small>E4:[t2] · E5:[t0,t3] · E6:[t2] · E7: idle</small></div>
+
+        <div class="sc-box appear" id="mo-comb" style="grid-column: span 2; text-align:center; border-style:dashed">dispatcher.combine( ) — all-to-all back to home ranks + weighted sum<small>y0 = 0.7·E1(t0) + 0.3·E5(t0) &nbsp;&nbsp; y3 = 0.5·E3(t3) + 0.5·E5(t3) …</small></div>
+      </div>
+    </div>
+  </div>
+
+  <h2><span class="sec-num">5.4</span>Quantization: one contract, ~29 methods</h2>
+  <p>
+    SGLang never bakes a dtype into a layer. Instead every layer resolves a
+    <em>quant method</em> at construction time and delegates weight creation and the forward
+    GEMM to it:
+  </p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/layers/linear.py:176" data-desc="LinearBase.__init__ — the quant method is chosen when the layer is built">
+<pre>
+self.quant_config = quant_config
+if quant_config is None:
+    from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+    self.quant_method: Optional[QuantizeMethodBase] = UnquantizedLinearMethod()
+else:
+    self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
+</pre>
+  </div>
+
+  <div class="diagram">
+    <div class="dg-title">Quantization lifecycle: config → method → three-phase weight contract</div>
+    <pre class="mermaid">
+flowchart TB
+  ckpt["checkpoint quantization_config /<br/>hf_quant_config.json + --quantization"] --> gqc["get_quant_config()<br/><i>model_loader/loader.py</i>"]
+  gqc --> qc["one QuantizationConfig<br/>for the whole model<br/>(Fp8Config, GPTQMarlinConfig, …)"]
+  qc --> gqm["quant_config.get_quant_method(layer, prefix)<br/>called per layer at construction"]
+  gqm --> lm["LinearMethodBase"]
+  gqm --> mm["FusedMoEMethodBase"]
+  gqm --> kv["BaseKVCacheMethod"]
+  gqm --> unq["UnquantizedLinearMethod<br/>(layer in ignored_layers)"]
+  lm --> cw["create_weights()<br/>already TP-sharded:<br/>input_size_per_partition"]
+  cw --> load["weight loading<br/>(BasevLLMParameter loaders)"]
+  load --> pwal["process_weights_after_loading()<br/>requant · marlin repack · transpose"]
+  pwal --> apply["apply(layer, x, bias)<br/>every forward"]
+  style qc fill:#eef0ff,stroke:#4f46e5
+  style apply fill:#e7f7ec,stroke:#16a34a
+    </pre>
+    <div class="dg-caption">
+      The contract lives in <code>layers/quantization/base_config.py</code>. MoE quant methods have
+      a different <code>apply</code> signature — <code>apply(layer, dispatch_output) →
+      CombineInput</code> — so they plug directly into the FusedMoE dispatch/combine pipeline of
+      §5.3.
+    </div>
+  </div>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/layers/quantization/base_config.py:20" data-desc="The three-phase contract every quant method implements (process_weights_after_loading elided)">
+<pre>
+class QuantizeMethodBase(ABC):
+    """Base class for different quantized methods."""
+
+    def create_weights(
+        self, layer: torch.nn.Module, *weight_args, **extra_weight_attrs
+    ):
+        """Create weights for a layer.
+
+        The weights will be set as attributes of the layer."""
+        raise NotImplementedError()
+
+    @abstractmethod
+    def apply(self, layer: torch.nn.Module, *args, **kwargs) -> torch.Tensor:
+        """Apply the weights in layer to the input tensor.
+
+        Expects create_weights to have been called before on the layer."""
+        raise NotImplementedError()
+</pre>
+  </div>
+
+  <p>
+    The registry in <code>quantization/__init__.py:73-141</code> maps ~29 method strings to
+    configs, plus platform-specific overrides (NPU swaps in <code>GPTQAscendConfig</code>, MPS adds
+    MLX methods, CPU has its own subset):
+  </p>
+
+  <table class="tbl">
+    <tr><th>Family</th><th>Method strings</th><th>Notes</th></tr>
+    <tr><td>FP8</td><td><code>fp8</code>, <code>mxfp8</code>, <code>w8a8_fp8</code>, <code>w4afp8</code>, <code>mxfp_w4a8</code></td>
+      <td><code>fp8</code>/<code>mxfp8</code> → <code>Fp8Config</code>: per-tensor or 128×128 block-wise (DeepSeek-V3 format); Marlin fallback pre-Hopper</td></tr>
+    <tr><td>FP4</td><td><code>mxfp4</code>, <code>modelopt_fp4</code>, <code>nvfp4_online</code>, <code>petit_nvfp4</code>, <code>quark_mxfp4</code></td>
+      <td><code>mxfp4</code> is platform-conditional (CUDA/CPU/HIP vs NPU <code>Mxfp4W4A4Config</code>); gpt-oss ships mxfp4</td></tr>
+    <tr><td>INT8</td><td><code>w8a8_int8</code>, <code>blockwise_int8</code>, <code>auto-round-int8</code></td><td></td></tr>
+    <tr><td>Weight-only GPTQ/AWQ</td><td><code>awq</code>, <code>awq_marlin</code>, <code>gptq</code>, <code>gptq_marlin</code>, <code>moe_wna16</code>, <code>auto-round</code></td>
+      <td>Marlin variants repack at load time in <code>process_weights_after_loading</code></td></tr>
+    <tr><td>ModelOpt</td><td><code>modelopt</code> / <code>modelopt_fp8</code>, <code>modelopt_fp4</code>, <code>modelopt_mixed</code></td>
+      <td>NVIDIA TensorRT ModelOpt checkpoints; mixed-precision per-layer</td></tr>
+    <tr><td>Container formats</td><td><code>compressed-tensors</code>, <code>gguf</code>, <code>bitsandbytes</code></td>
+      <td><code>compressed-tensors</code> is itself a scheme registry (llm-compressor checkpoints)</td></tr>
+    <tr><td>Vendor / platform</td><td><code>quark</code>, <code>quark_int4fp8_moe</code> (ROCm), <code>modelslim</code> (Ascend), <code>mlx_q4</code> / <code>mlx_q8</code> (MPS), <code>humming</code></td>
+      <td>AMD Quark, Huawei ModelSlim, Apple MLX each get first-class configs</td></tr>
+  </table>
+
+  <div class="callout fact"><span class="co-title">KV-cache quantization is a quant method too</span>
+    <code>BaseKVCacheMethod</code> (<code>quantization/kv_cache.py:18</code>) attaches to
+    <code>RadixAttention</code> layers, loading per-tensor <code>k_scale</code>/<code>v_scale</code>
+    from the checkpoint (ROCm fnuz-format fp8 gets its scales doubled, kv_cache.py:56-72).
+    The cache dtype is user-selectable independently of weight quant:
+    <code>--kv-cache-dtype {auto, bf16, fp8_e5m2, fp8_e4m3, mxfp8, nvfp4, fp4_mx_block16, ...}</code>
+    (<code>server_args.py:648</code>). FP4 KV cache has its own
+    <code>fp4_kv_cache_quant_method.py</code>.
+  </div>
+
+  <h2><span class="sec-num">5.5</span>LoRA serving: fixed slots, chunked-SGMV kernels</h2>
+  <p>
+    Multi-LoRA serving is owned by <code>LoRAManager</code> (<code>lora/lora_manager.py:59</code>)
+    inside each TP worker. Design: a <b>fixed-slot GPU pool</b> —
+    <code>LoRAMemoryPool</code> (<code>lora/mem_pool.py:131</code>) preallocates unified A/B
+    buffers shaped <code>(max_loras_per_batch, max_lora_dim · c, input_dim)</code> — into which
+    adapters are swapped per batch (LRU/FIFO eviction). One batch can therefore mix up to
+    <code>--max-loras-per-batch</code> (default 8) different adapters plus base-only requests, and
+    adapters hot-load/unload at runtime via the <code>/load_lora_adapter</code> /
+    <code>/unload_lora_adapter</code> HTTP endpoints (even from in-memory tensors,
+    <code>load_lora_adapter_from_tensors</code>).
+  </p>
+
+  <div class="diagram">
+    <div class="dg-title">Multi-LoRA batch execution</div>
+    <pre class="mermaid">
+flowchart LR
+  reqs["batch: req A (lora_1)<br/>req B (lora_2), req C (base)"] --> mgr["LoRAManager.prepare_lora_batch()<br/>segment indices: token run → slot"]
+  reg["LoRARegistry<br/>/load_lora_adapter<br/>/unload_lora_adapter"] --> pool
+  mgr --> pool["LoRAMemoryPool<br/>fixed slots: (max_loras_per_batch, r·c, dim)<br/>LRU eviction"]
+  pool --> wrap["wrapper layers<br/>QKVParallelLinearWithLoRA<br/>RowParallelLinearWithLoRA<br/>FusedMoEWithLoRA …"]
+  wrap --> shrink["chunked_sgmv_lora_shrink<br/>(x · Aᵀ, per-segment)"]
+  shrink --> expand["chunked_sgmv_lora_expand<br/>(+= s · Bᵀ into base output)"]
+  style pool fill:#f5ecfe,stroke:#9333ea
+  style shrink fill:#e7f7ec,stroke:#16a34a
+  style expand fill:#e7f7ec,stroke:#16a34a
+    </pre>
+    <div class="dg-caption">
+      The wrapper layers in <code>lora/layers.py</code> monkey-patch the base parallel-linear
+      modules and call backend hooks (<code>run_lora_a_sgemm</code>/<code>run_lora_b_sgemm</code>).
+      Coverage extends to the embedding, the LM head (<code>ParallelLMHeadWithLoRA</code>) and MoE
+      experts (<code>FusedMoEWithLoRA</code>, lora/layers.py).
+    </div>
+  </div>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/lora/backend/chunked_backend.py:24" data-desc="The default LoRA backend — chunked SGMV Triton kernels">
+<pre>
+class ChunkedSgmvLoRABackend(BaseLoRABackend):
+    """
+    Chunked LoRA backend using segmented matrix-vector multiplication.
+
+    This backend is largely based on the SGMV (Segmented Gather Matrix-Vector
+    multiplication) algorithm introduced in the Punica paper
+    (https://arxiv.org/pdf/2310.18547). One main variation made here is to
+    segment the input sequences into fixed-size chunks, which reduces excessive
+    kernel launches especially when the LoRA distribution is skewed.
+    """
+
+    name = "csgmv"
+    supports_prefill_cuda_graph = True
+</pre>
+  </div>
+
+  <p>
+    <code>csgmv</code> is the default of <code>--lora-backend</code> (choices also include
+    <code>triton</code>, torch-native and Ascend backends); its kernels
+    (<code>chunked_sgmv_lora_shrink_forward</code> / <code>chunked_sgmv_lora_expand_forward</code>)
+    serve both prefill and CUDA-graph decode — there is no separate BGMV decode kernel. Extras
+    worth knowing: <code>lora_overlap_loader.py</code> overlaps adapter H2D copies with the
+    forward pass, and eviction respects <code>pinned</code> adapters.
+  </p>
+
+  <h2><span class="sec-num">5.6</span>Multimodal: placeholder tokens in, embeddings scattered back</h2>
+  <p>
+    VLM support is split across the process boundary from chapter 01. The tokenizer side makes
+    images <em>look like ordinary tokens</em> to the scheduler; the model side swaps the real
+    embeddings in at the last moment:
+  </p>
+
+  <div class="diagram">
+    <div class="dg-title">VLM pipeline across processes (Qwen2.5-VL example)</div>
+    <pre class="mermaid">
+flowchart LR
+  subgraph tok ["TokenizerManager process"]
+    img["image / video / audio"] --> proc["BaseMultimodalProcessor subclass<br/>~50 model-specific processors<br/><i>multimodal/processors/</i>"]
+    proc --> pad["pad prompt with placeholder runs<br/>MultiModalityDataPaddingPatternTokenPairs<br/>hash-derived ids → RadixCache-safe"]
+  end
+  subgraph sched ["Scheduler process"]
+    pad --> q["waiting_queue: looks like<br/>a normal token sequence"]
+    q --> fwd["model.forward →<br/>general_mm_embed_routine()"]
+    fwd --> vit["get_image_feature() — ViT<br/>(CUDA-graphed via vit_cuda_graph_runner)"]
+    vit --> scatter["embed_mm_inputs: scatter image<br/>embeddings over placeholder positions"]
+    scatter --> llm["language model layers<br/>(everything above in this chapter)"]
+  end
+  style proc fill:#eef0ff,stroke:#4f46e5
+  style vit fill:#e7f7ec,stroke:#16a34a
+  style scatter fill:#fdf3e3,stroke:#d97706
+    </pre>
+    <div class="dg-caption">
+      Model-side merge: <code>managers/mm_utils.py</code> —
+      <code>general_mm_embed_routine</code> (:1252) runs only on extend batches containing mm
+      inputs (decode steps skip it entirely), calls the model's
+      <code>get_image_feature</code>, and <code>embed_mm_inputs</code> (:1011) writes the result
+      into the text-embedding tensor. Each placeholder run carries a hash-derived id, so radix
+      prefix caching works across requests that share images.
+    </div>
+  </div>
+
+  <p>
+    Chunked prefill works too: if an image's 1,247 placeholder tokens straddle a chunk boundary,
+    <code>get_embedding_chunk</code> (<code>managers/mm_utils.py:376</code>) slices the
+    precomputed ViT output by <code>extend_prefix_len</code>/<code>extend_seq_len</code> so each
+    chunk consumes only its in-window rows. Vision encoders are ordinary model files
+    (<code>clip.py</code>, <code>siglip.py</code>, the Qwen-VL ViT…) built from the same parallel
+    linear layers; Qwen-VL's M-RoPE position ids live in
+    <code>layers/rotary_embedding/mrope.py</code>, and disaggregated encoders hand embeddings
+    across processes via <code>TransportProxyTensor</code>.
+  </p>
+
+  <h2><span class="sec-num">5.7</span>The model zoo</h2>
+
+  <div class="card">
+    <p style="margin-top:0"><b>212 model files</b> in <code>srt/models/</code>, 193 of which export an
+    <code>EntryClass</code> (the rest are shared helpers like <code>deepseek_common/</code>).
+    Rough census by family:</p>
+    <table class="tbl">
+      <tr><th>Category</th><th>Representative files</th></tr>
+      <tr><td>Dense decoders</td><td><code>llama.py</code> (also serves Phi-3/InternLM3 via its <code>EntryClass</code> list), <code>qwen2.py</code>/<code>qwen3.py</code>, <code>gemma*.py</code> (14 files), <code>mistral*.py</code>, <code>olmo*.py</code>, <code>phi*.py</code>…</td></tr>
+      <tr><td>MoE</td><td><code>mixtral.py</code>, <code>deepseek_v2.py</code> (V2/V3/R1), <code>qwen2_moe.py</code>/<code>qwen3_moe.py</code>, <code>glm4_moe.py</code>, <code>gpt_oss.py</code>, <code>grok.py</code>, <code>dbrx.py</code>, <code>olmoe.py</code>…</td></tr>
+      <tr><td>Hybrid Mamba / linear attention</td><td><code>qwen3_next.py</code> (Gated DeltaNet), <code>falcon_h1.py</code> (parallel Mamba2+attention), <code>kimi_linear.py</code> (KDA), <code>nemotron_h.py</code>, <code>granitemoehybrid.py</code>, <code>lfm2.py</code></td></tr>
+      <tr><td>VLM / vision / OCR (~40 files)</td><td><code>qwen2_5_vl.py</code>, <code>llava.py</code>, <code>internvl.py</code>, <code>mllama4.py</code>, <code>clip.py</code>, <code>siglip.py</code>, <code>*ocr*.py</code></td></tr>
+      <tr><td>Embedding / reward / classification</td><td><code>bert.py</code>, <code>qwen3_embedding.py</code>, <code>llama_reward.py</code>, <code>qwen2_rm.py</code>, <code>*_classification.py</code></td></tr>
+      <tr><td>Speculative draft heads</td><td>~20 <code>*_nextn.py</code> / <code>*_mtp.py</code> / <code>llama_eagle3.py</code> companions (chapter on speculative decoding)</td></tr>
+      <tr><td>Audio &amp; diffusion-LM</td><td><code>whisper.py</code>, <code>qwen2_audio.py</code>, <code>voxtral.py</code>; <code>llada2.py</code>, <code>sdar.py</code></td></tr>
+      <tr><td>Fallback</td><td><code>transformers.py</code> — generic HF-Transformers backend, tried last</td></tr>
+    </table>
+    <p style="margin-bottom:0">
+      <code>deepseek_v2.py</code> deserves a star: <code>DeepseekV2AttentionMLA</code> (:1719)
+      implements MLA with latent-KV compression and per-batch switching between absorbed-MLA
+      decode and MHA prefill — covered with the attention backends in chapter 04 and DP attention
+      in chapter 07.
+    </p>
+  </div>
+
+  <p>Registration is a filename scan plus one convention — export <code>EntryClass</code>, keyed
+  by class name against HF <code>config.architectures</code>:</p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/models/registry.py:111" data-desc="The whole model registry mechanism (else-branch for single class elided)">
+<pre>
+if hasattr(module, "EntryClass"):
+    entry = module.EntryClass
+    if isinstance(
+        entry, list
+    ):  # To support multiple model classes in one module
+        for tmp in entry:
+            assert (
+                tmp.__name__ not in model_arch_name_to_cls
+            ), f"Duplicated model implementation for {tmp.__name__}"
+            model_arch_name_to_cls[tmp.__name__] = tmp
+</pre>
+  </div>
+
+  <h3>Key flags for this chapter</h3>
+  <table class="tbl">
+    <tr><th>Flag</th><th>Default</th><th>Effect</th></tr>
+    <tr><td><code>--quantization</code></td><td>None</td><td>Pick one of the ~29 method strings; usually auto-detected from checkpoint <code>quantization_config</code></td></tr>
+    <tr><td><code>--kv-cache-dtype</code></td><td><code>auto</code></td><td><code>fp8_e5m2</code> / <code>fp8_e4m3</code> / <code>mxfp8</code> / <code>nvfp4</code> / <code>fp4_mx_block16</code> / <code>bf16</code></td></tr>
+    <tr><td><code>--ep-size</code></td><td>1</td><td>Expert-parallel world size (aliases <code>--expert-parallel-size</code>, <code>--ep</code>)</td></tr>
+    <tr><td><code>--moe-a2a-backend</code></td><td><code>none</code></td><td>Token dispatcher: <code>deepep</code>, <code>mooncake</code>, <code>nixl</code>, <code>mori</code>, <code>flashinfer</code>, <code>pplx</code>, <code>megamoe</code>, <code>ascend_fuseep</code></td></tr>
+    <tr><td><code>--moe-runner-backend</code></td><td><code>auto</code></td><td>Expert GEMM backend: <code>triton</code>, <code>deep_gemm</code>, <code>flashinfer_trtllm</code>, <code>flashinfer_cutlass</code>, <code>marlin</code>…</td></tr>
+    <tr><td><code>--deepep-mode</code></td><td><code>auto</code></td><td><code>normal</code> / <code>low_latency</code> / <code>auto</code> (= low_latency for decode, normal for prefill)</td></tr>
+    <tr><td><code>--lora-paths</code></td><td>None</td><td>Adapters to preload (<code>name=path</code> or JSON with <code>pinned</code>)</td></tr>
+    <tr><td><code>--max-loras-per-batch</code></td><td>8</td><td>GPU pool slots = max distinct adapters in one running batch</td></tr>
+    <tr><td><code>--lora-backend</code></td><td><code>csgmv</code></td><td>Kernel backend for multi-LoRA serving</td></tr>
+  </table>
+
+  <h2><span class="sec-num">5.8</span>Notable facts &amp; gotchas</h2>
+  <div class="card">
+    <ul>
+      <li><b>Two all-reduces per layer is the whole TP bill</b> — after <code>o_proj</code> and after
+        <code>down_proj</code>. Everything else (column layers, activations, norms) is
+        communication-free, and even those two can be fused, reduce-scattered, subgrouped, or
+        quantized on the wire.</li>
+      <li><b>Dispatcher × runner is a free matrix:</b> ~8 token dispatchers pair with ~11 MoE GEMM
+        backends through the typed <code>DispatchOutput</code>/<code>CombineInput</code> interfaces —
+        <code>--moe-a2a-backend</code> and <code>--moe-runner-backend</code> are independent knobs.</li>
+      <li><b>GQA replication doubles KV cache silently:</b> once <code>tp_size ≥ total_num_kv_heads</code>,
+        each extra doubling of TP replicates every KV head (and its cache) on more ranks —
+        a key reason MLA models prefer DP attention (chapter 07).</li>
+      <li><b>Quant tensors are born sharded:</b> <code>create_weights</code> receives
+        <code>input_size_per_partition</code> / <code>output_partition_sizes</code>, so a marlin-repacked
+        or block-fp8 tensor never exists in unsharded form on any rank.</li>
+      <li><b>DeepEP AUTO switches wire protocol per forward:</b> chunked NVLink/RDMA
+        <code>NORMAL</code> for prefill, IBGDA <code>LOW_LATENCY</code> (CUDA-graph-safe, fp8/nvfp4
+        on the wire, async recv hooks for two-batch overlap) for decode.</li>
+      <li><b>MoE experts can be paged like virtual memory:</b> <code>FusedMoE.forward_impl</code> carries
+        DWDP hooks (<code>wait_prefetch</code> / <code>record_compute_and_prefetch_next</code>) that
+        stream expert weights from a page pool one layer ahead.</li>
+      <li><b>LoRA reaches places you'd not expect:</b> <code>FusedMoEWithLoRA</code> and
+        <code>ParallelLMHeadWithLoRA</code> exist; adapters hot-swap through HTTP endpoints into
+        fixed pool slots without touching base weights.</li>
+      <li><b>Images are radix-cacheable:</b> placeholder runs use hash-derived ids per image, so two
+        requests sharing an image get a KV-cache prefix hit (chapter 03) even though the "tokens"
+        are synthetic.</li>
+      <li><b>Adding a model = one file:</b> drop <code>my_model.py</code> in <code>srt/models/</code>
+        with an <code>EntryClass</code> whose class name matches HF
+        <code>config.architectures</code> — the registry scan does the rest
+        (external packages can override via <code>SGLANG_EXTERNAL_MODEL_PACKAGE</code>).</li>
+    </ul>
+  </div>
+
+  <div id="pager"></div>
+  </div>
+</main>
+</div>
+
+<script>
+document.addEventListener("DOMContentLoaded", () => {
+
+  new Stepper("#st-tp", {
+    title: "Llama-3-8B attention block at TP=2 (hidden 4096, 32 q heads, 8 kv heads, head_dim 128)",
+    intro: "Where the tensors split and where the ranks must talk.",
+    autoMs: 3400,
+    reset(sc) {
+      clearState(sc, ".sc-box");
+      rmCls(sc, ".appear", "in");
+    },
+    steps: [
+      { cap: "Input hidden states <code>x [tokens, 4096]</code> arrive <b>replicated</b> — both ranks hold the full tensor (that's the postcondition of the previous layer's all-reduce).",
+        run(sc) { setCls(sc, "#tp-x0,#tp-x1", "hl"); } },
+      { cap: "<code>qkv_proj</code> is a <code>QKVParallelLinear</code> (column-parallel by head). Full weight is 4096 → 6144; each rank holds 4096 → 3072 = 16 q·128 + 4 k·128 + 4 v·128. Since <code>tp_size=2 &lt; 8</code> kv heads, <code>num_kv_heads = 8/2 = 4</code> — <b>no replication</b>, no communication.",
+        run(sc) { rmCls(sc, "#tp-x0,#tp-x1", "hl"); setCls(sc, "#tp-q0,#tp-q1", "in", "hl"); } },
+      { cap: "RoPE + attention run entirely locally: rank 0's 16 query heads attend using its 4 kv heads (each GQA group of 4 q heads shares one kv head). The KV cache is sharded the same way — each rank stores only its 4 heads.",
+        run(sc) { rmCls(sc, "#tp-q0,#tp-q1", "hl"); setCls(sc, "#tp-q0,#tp-q1", "ok"); setCls(sc, "#tp-a0,#tp-a1", "in", "hl"); } },
+      { cap: "<code>o_proj</code> is a <code>RowParallelLinear</code>: its input is the 2048-wide local attention output (16 heads · 128), its weight slice is 2048 → 4096. Each rank now holds a full-width but <b>partial</b> result Y₀ / Y₁.",
+        run(sc) { rmCls(sc, "#tp-a0,#tp-a1", "hl"); setCls(sc, "#tp-a0,#tp-a1", "ok"); setCls(sc, "#tp-o0,#tp-o1", "in", "warn"); } },
+      { cap: "<code>tensor_model_parallel_all_reduce</code> sums the partials: Y = Y₀ + Y₁ (linear.py:1608). This is <b>comm point #1</b> — and bias was fused only on rank 0 so it isn't added twice.",
+        run(sc) { setCls(sc, "#tp-o0,#tp-o1", "ok"); setCls(sc, "#tp-ar", "in", "hl", "pulse"); } },
+      { cap: "The MLP replays the identical pattern: <code>gate_up_proj</code> (column, 4096 → 2·7168 per rank) → <code>SiluAndMul</code> halves it → <code>down_proj</code> (row, 7168 → 4096) → <b>all-reduce #2</b>. Total: exactly two [tokens, 4096] all-reduces per layer.",
+        run(sc) { rmCls(sc, "#tp-ar", "pulse"); setCls(sc, "#tp-ar", "ok"); setCls(sc, "#tp-mlp", "in", "hl"); } },
+    ],
+  });
+
+  new Stepper("#st-moe", {
+    title: "EP MoE: 4 tokens, top-2 of 8 experts, 2 EP ranks",
+    intro: "Follow token activations through dispatch → grouped GEMM → combine.",
+    autoMs: 3400,
+    reset(sc) {
+      clearState(sc, ".sc-box,.tok");
+      rmCls(sc, ".appear", "in");
+    },
+    steps: [
+      { cap: "EP slices <b>whole experts</b>: rank 0 owns E0–E3, rank 1 owns E4–E7 (<code>num_local_experts = 4</code>). Tokens t0,t1 live on rank 0; t2,t3 on rank 1.",
+        run(sc) { setCls(sc, "#mo-r0,#mo-r1", "hl"); setCls(sc, "#mo-t0,#mo-t1,#mo-t2,#mo-t3", "hl"); } },
+      { cap: "The router gate (a per-model <code>nn.Linear</code>) scores all 8 experts; <code>select_experts</code> picks top-2 per token and returns a <code>TopKOutput(topk_weights, topk_ids)</code>. Note t0 and t3 both picked E5 — experts get uneven load.",
+        run(sc) { rmCls(sc, "#mo-r0,#mo-r1", "hl"); setCls(sc, "#mo-route", "in", "hl"); } },
+      { cap: "<code>dispatcher.dispatch()</code> — the all-to-all. A copy of each token's activation travels to every rank owning one of its experts: t0 sends a copy to rank 1 (for E5), t3 sends one to rank 0 (for E3). t1 and t2 stay fully local. With DeepEP low-latency, these payloads are <b>fp8-quantized on the wire</b>.",
+        run(sc) { rmCls(sc, "#mo-route", "hl"); setCls(sc, "#mo-d0,#mo-d1", "in"); setCls(sc, "#mo-d0a,#mo-d0b,#mo-d0c,#mo-d0d,#mo-d1a,#mo-d1b,#mo-d1c,#mo-d1d", "in", "hl"); setCls(sc, "#mo-d0d,#mo-d1b", "warn"); } },
+      { cap: "<code>run_moe_core()</code> → <code>quant_method.apply()</code> → the MoeRunner backend executes a <b>grouped GEMM</b>: each local expert processes its gathered batch (E5 gets two rows, E7 gets none and does no work). GEMM1 → SiLU → GEMM2, all experts in one kernel launch.",
+        run(sc) { rmCls(sc, "#mo-d0a,#mo-d0b,#mo-d0c,#mo-d0d,#mo-d1a,#mo-d1b,#mo-d1c,#mo-d1d", "hl", "warn"); setCls(sc, "#mo-g0,#mo-g1", "in", "hl"); } },
+      { cap: "<code>dispatcher.combine()</code> — the reverse all-to-all returns expert outputs to each token's home rank, where they are summed with the router's <code>topk_weights</code>: y0 = 0.7·E1(t0) + 0.3·E5(t0).",
+        run(sc) { rmCls(sc, "#mo-g0,#mo-g1", "hl"); setCls(sc, "#mo-g0,#mo-g1", "ok"); setCls(sc, "#mo-comb", "in", "hl", "pulse"); } },
+      { cap: "Done — each home rank holds final outputs for its own tokens. A trailing <code>tensor_model_parallel_all_reduce</code> fires only if expert-TP is mixed in (<code>moe_tp_size &gt; 1</code>) or the standard passthrough dispatcher was used (layer.py:1449).",
+        run(sc) { rmCls(sc, "#mo-comb", "pulse"); setCls(sc, "#mo-comb", "ok"); setCls(sc, "#mo-t0,#mo-t1,#mo-t2,#mo-t3", "ok"); } },
+    ],
+  });
+
+});
+</script>
+</body>
+</html>
