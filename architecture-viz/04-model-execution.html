@@ -203,12 +203,12 @@ flowchart TB
     <pre class="mermaid">
 flowchart TB
   f["ModelRunner.forward(forward_batch)"] --> raw["_forward_raw<br/><i>model_runner.py:1467</i>"]
-  raw --> d1{"forward_mode.is_cuda_graph() and<br/>decode_cuda_graph_runner.can_run_graph()?"}
+  raw --> d1{"decode graph<br/>hit?"}
   d1 -- "yes (hot path)" --> replay["DecodeCudaGraphRunner.execute<br/>pad → graph.replay() → slice"]
   d1 -- no --> prep["_prepare_eager_forward_batch()<br/>DP / MLP-sync padding, deferred mamba ops"]
-  prep --> d2{"is_split_prefill()?"}
+  prep --> d2{"split<br/>prefill?"}
   d2 -- yes --> sp["forward_split_prefill<br/>layer-range chunks (PD multiplexing)"]
-  d2 -- no --> d3{"is_extend() and<br/>prefill_cuda_graph_runner.can_run_graph()?"}
+  d2 -- no --> d3{"prefill graph<br/>hit?"}
   d3 -- yes --> pcg["PrefillCudaGraphRunner.execute<br/>breakable / full / tc_piecewise"]
   d3 -- no --> eager["EagerRunner.execute"]
   eager --> e1["_execute_decode / _execute_extend / _execute_idle"]
@@ -222,11 +222,12 @@ flowchart TB
   style out fill:#fdf3e3,stroke:#d97706
     </pre>
     <div class="dg-caption">
-      The decode-graph path returns early, before DP padding — the graph runner pre-pads its own
-      static buffers. All other paths run the live batch through
-      <code>_prepare_eager_forward_batch</code> first. Sampling is <em>not</em> in this tree: the
-      worker calls <code>ModelRunner.sample(logits_output, forward_batch)</code> as a separate step
-      (§4.6).
+      "Decode graph hit" = <code>forward_mode.is_cuda_graph() and
+      decode_cuda_graph_runner.can_run_graph(fb)</code>; "prefill graph hit" =
+      <code>is_extend() and prefill_cuda_graph_runner.can_run_graph(fb)</code> (exact conditions in
+      the snippet below). The decode-graph path returns early, before DP padding — the graph runner
+      pre-pads its own static buffers. Sampling is <em>not</em> in this tree: the worker calls
+      <code>ModelRunner.sample(logits_output, forward_batch)</code> as a separate step (§4.6).
     </div>
   </div>
 
@@ -483,18 +484,12 @@ def _pad_to_bucket(raw_size: int, buckets: Sequence[int]) -> int:
     </div>
   </div>
 
-  <div class="snippet" data-lang="python" data-file="python/sglang/srt/model_executor/runner_backend/full_cuda_graph_backend.py:123" data-desc="Replay is two lines — all the work happened at capture time">
-<pre>
-def replay(
-    self,
-    shape_key: ShapeKey,
-    static_forward_batch: ForwardBatch,
-    **kwargs,
-) -> Any:
-    self._graphs[shape_key].replay()
-    return self._outputs[shape_key]
-</pre>
-  </div>
+  <p>
+    Replay itself is two lines — <code>FullCudaGraphBackend.replay</code>
+    (<code>runner_backend/full_cuda_graph_backend.py:123</code>) is just
+    <code>self._graphs[shape_key].replay(); return self._outputs[shape_key]</code>. All the cost was
+    paid at capture time.
+  </p>
 
   <h2><span class="sec-num">4.6</span>From hidden states to a token</h2>
   <p>

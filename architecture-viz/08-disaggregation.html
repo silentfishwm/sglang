@@ -142,14 +142,14 @@ def _setup_routes(self):
     <div class="dg-title">Scheduler event loop, per role</div>
     <pre class="mermaid">
 flowchart TB
-  subgraph P ["PREFILL · event_loop_normal_disagg_prefill (prefill.py:557)"]
+  subgraph P ["PREFILL · prefill.py:557"]
     pr["recv_requests"] --> pbq["disagg_prefill_bootstrap_queue<br/>PrefillBootstrapQueue<br/>KVSender per req · poll handshake"]
     pbq -- "pop_bootstrapped()" --> pwq["waiting_queue"]
     pwq --> pfw["prefill forward<br/>(chunked)"]
     pfw -- "send_kv_chunk() per chunk<br/><i>prefill.py:1106</i>" --> piq["disagg_prefill_inflight_queue"]
     piq -- "KVPoll.Success →<br/>free or radix-cache KV" --> pdone["done"]
   end
-  subgraph D ["DECODE · event_loop_normal_disagg_decode (decode.py:2083)"]
+  subgraph D ["DECODE · decode.py:2083"]
     dr["recv_requests"] --> dpq["disagg_decode_prealloc_queue<br/>DecodePreallocQueue<br/>KVReceiver per req"]
     dpq -- "pop_preallocated()<br/>alloc FULL input KV" --> dtq["disagg_decode_transfer_queue<br/>DecodeTransferQueue"]
     dtq -- "pop_transferred()<br/>KVPoll.Success" --> dwq["waiting_queue<br/>(prebuilt batch)"]
@@ -160,8 +160,10 @@ flowchart TB
   style D fill:#fdf3e3,stroke:#d97706
     </pre>
     <div class="dg-caption">
-      Prefill side: <code>PrefillBootstrapQueue</code> → <code>waiting_queue</code> →
-      <code>disagg_prefill_inflight_queue</code>. Decode side: <code>DecodePreallocQueue</code> →
+      Prefill runs <code>event_loop_normal_disagg_prefill</code>:
+      <code>PrefillBootstrapQueue</code> → <code>waiting_queue</code> →
+      <code>disagg_prefill_inflight_queue</code>. Decode runs
+      <code>event_loop_normal_disagg_decode</code>: <code>DecodePreallocQueue</code> →
       <code>DecodeTransferQueue</code> → <code>waiting_queue</code>. Overlap-scheduling variants
       exist for both (<code>event_loop_overlap_disagg_prefill</code> at <code>prefill.py:595</code>,
       <code>event_loop_overlap_disagg_decode</code> at <code>decode.py:2117</code>).

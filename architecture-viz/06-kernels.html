@@ -1,0 +1,772 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>06 · Kernels, torch.compile &amp; Hardware — SGLang Internals</title>
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/mermaid.min.js"></script>
+<script src="assets/viz.js"></script>
+</head>
+<body>
+<div class="layout">
+<main>
+  <div class="page-hero"><div class="content">
+    <span class="phase-badge">Phase III · Models &amp; Compute</span>
+    <h1>06 · The Kernel Stack: AOT, JIT, Triton, torch.compile &amp; Hardware Backends</h1>
+    <p class="lede">
+      Every matmul, norm, and attention call in chapters 04–05 eventually bottoms out in a
+      kernel. SGLang keeps <em>four</em> in-tree implementation tiers (prebuilt CUDA wheel,
+      JIT-compiled CUDA, Triton, pure torch) plus external libraries, and picks between them
+      per-op, per-device, at runtime. This chapter maps that machinery: the unified
+      <code>sglang.kernels</code> package, the backend-selection contract, torch.compile with
+      piecewise CUDA graphs, deterministic batch-invariant ops, and how seven hardware
+      families plug into one codebase.
+    </p>
+  </div></div>
+
+  <div class="content">
+
+  <h2><span class="sec-num">6.1</span>One package: <code>sglang.kernels</code> (RFC #29630)</h2>
+  <p>
+    Historically SGLang shipped kernels from a separate repo-root <code>sgl-kernel/</code>
+    project plus a scattered <code>sglang.jit_kernel</code> package. In this repo both are gone:
+    everything was unified under <code>python/sglang/kernels/</code>.
+  </p>
+
+  <div class="callout warn"><span class="co-title">Renames to keep straight</span>
+    The old repo-root <code>sgl-kernel/</code> tree now lives at
+    <code>python/sglang/kernels/aot/</code>. Its wheel is published as
+    <b><code>sglang-kernel</code></b> ("prior sgl-kernel"), but <em>"the Python import path
+    remains <code>sgl_kernel</code>"</em> (<code>python/sglang/kernels/aot/README.md</code>).
+    The legacy <code>sglang.jit_kernel</code> package was <b>removed</b> in the RFC finale
+    (#32072): its build infra moved to <code>sglang.kernels.jit</code>, and each JIT op into
+    <code>sglang.kernels.ops.&lt;group&gt;._jit_&lt;op&gt;</code>. If you read upstream docs
+    mentioning <code>sgl-kernel/</code> at the repo root — this repo wins.
+  </div>
+
+  <div class="filetree"><b>python/sglang/kernels/</b>
+├── spec.py        <i>KernelSpec · KernelBackend · CapabilityRequirement · PlatformInfo</i>
+├── registry.py    <i>process-wide KernelRegistry + register_kernel()</i>
+├── selector.py    <i>select_kernel() / cached get_kernel()</i>
+├── fused_op.py    <i>BaseFusedOp — per-operator multi-backend contract</i>
+├── <b>ops/</b>           <i>public wrappers, one subpackage per group:</i>
+│                  <i>activation attention communication diffusion elementwise embeddings</i>
+│                  <i>gemm grammar kv_canary kvcache layernorm lplb mamba memory mm moe</i>
+│                  <i>quantization sampling speculative (+ model-specific kimi_k3)</i>
+├── <b>jit/</b>           <i>TVM-FFI JIT infra</i>
+│   ├── csrc/      <i>header-only .cuh sources: elementwise/ attention/ gemm/ moe/ dsa/ …</i>
+│   ├── include/sgl_kernel/   <i>shared device library: utils.cuh, vec.cuh, mbarrier.cuh …</i>
+│   └── utils/compile.py      <i>load_jit + content-addressed cache</i>
+└── <b>aot/</b>           <i>the ENTIRE former repo-root sgl-kernel tree</i>
+    ├── CMakeLists.txt · pyproject{,_cpu,_rocm,_musa}.toml · setup_{rocm,musa,metal}.py
+    ├── csrc/      <i>18 kernel categories + per-platform extension .cc files</i>
+    └── python/sgl_kernel/    <i>import path unchanged: `import sgl_kernel`</i></div>
+
+  <p>
+    The review rule, verbatim from <code>python/sglang/kernels/README.md</code>:
+    <em>"SGLang runtime code and tests should import callable kernels from
+    <code>sglang.kernels.ops.*</code>."</em> The <code>ops.&lt;group&gt;</code> wrappers are the
+    stable surface; the tiers behind them are implementation detail.
+  </p>
+
+  <div class="diagram">
+    <div class="dg-title">THE FOUR IN-TREE TIERS + EXTERNAL BACKENDS</div>
+    <pre class="mermaid">
+flowchart TB
+  caller["SGLang runtime code<br/><i>from sglang.kernels.ops.layernorm import rmsnorm</i>"]
+  subgraph pkg ["python/sglang/kernels — unified namespace"]
+    ops["ops/&lt;group&gt;/<br/>public callable wrappers"]
+    reg["spec.py + registry.py + selector.py<br/>KernelSpec inventory, lazy load()"]
+    fop["fused_op.py<br/>BaseFusedOp priority auto-selection"]
+  end
+  subgraph tiers ["In-tree implementation tiers"]
+    aot["AOT — aot/ (sgl_kernel wheel)<br/>CMake + CUTLASS, prebuilt per platform"]
+    jit["JIT — jit/ (TVM-FFI)<br/>nvcc / hipcc on first call, cached"]
+    tri["Triton — @triton.jit<br/>defined next to call sites"]
+    nat["torch native<br/>forward_native reference"]
+  end
+  ext["External libraries as backends<br/>flashinfer · deepgemm · aiter · torch_npu · cute_dsl"]
+  caller --> ops
+  ops --> reg
+  ops --> fop
+  fop --> aot
+  fop --> jit
+  fop --> tri
+  fop --> nat
+  fop --> ext
+  style pkg fill:#eef0ff,stroke:#4f46e5
+  style tiers fill:#e7f7ec,stroke:#16a34a
+  style ext fill:#fdf3e3,stroke:#d97706
+    </pre>
+    <div class="dg-caption">
+      Rough division of labor: <b>AOT</b> for heavyweight kernels needing CUTLASS or big C++
+      deps (stable wheel boundary, broadest shape support — the default for public wrappers);
+      <b>JIT</b> is preferred for new kernels that <i>don't</i> need CUTLASS
+      (<code>.claude/skills/add-jit-kernel</code>); <b>Triton</b> is the portability tier
+      (CUDA/ROCm/XPU); <b>torch native</b> is the correctness oracle every other backend is
+      parity-tested against (<code>test/registered/kernels/</code>).
+    </div>
+  </div>
+
+  <div class="callout note"><span class="co-title">Import stays cheap</span>
+    <code>register_kernel(KernelSpec(...))</code> records metadata only — an operator id like
+    <code>"layernorm.rmsnorm"</code>, a backend, and a <code>"module:attr"</code> import path.
+    No <code>torch</code>, no <code>sgl_kernel</code>, no JIT compile happens until a kernel is
+    actually <em>called</em> (<code>KernelSpec.load()</code> is lazy), so
+    <code>import sglang.kernels</code> works on a CPU-only box.
+  </div>
+
+  <h2><span class="sec-num">6.2</span>The backend spectrum &amp; auto-selection</h2>
+  <p>
+    A crucial subtlety baked into the type system: <code>KernelBackend</code> names the
+    <em>provenance</em> of an implementation (how it is built), <b>not</b> the hardware it runs
+    on. Both JIT and AOT sources build for CUDA <em>and</em> ROCm; which devices a given op
+    supports is per-<code>(op, backend)</code> metadata (<code>CapabilityRequirement</code>):
+  </p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/kernels/spec.py:29" data-desc="the full backend vocabulary (docstring trimmed to one line)">
+<pre>
+class KernelBackend(str, Enum):
+    """Provenance of a kernel implementation (how it is built), not its device."""
+
+    TORCH = "torch"  # pure-torch reference (forward_native)
+    TORCH_COMPILE = "torch_compile"  # torch.compile(forward_native)
+    TRITON = "triton"
+    JIT = "jit"  # sglang.kernels.jit (nvcc / hipcc)
+    AOT = "aot"  # sgl_kernel wheel (CUDA / ROCm builds)
+    CUTE_DSL = "cute_dsl"
+    FLASHINFER = "flashinfer"
+    DEEPGEMM = "deepgemm"
+    AITER = "aiter"  # AMD aiter library (device=HIP)
+    TORCH_NPU = "torch_npu"  # Ascend NPU vendor runtime (device=NPU)
+</pre>
+  </div>
+
+  <p>
+    Plain registry ops have <b>no heuristic ranking</b> — <code>select_kernel()</code> resolves a
+    single-backend op directly, and multi-backend ops must be pinned by name. The richer
+    contract is <code>BaseFusedOp</code> (currently the <code>layernorm</code> and
+    <code>activation</code> groups): one logical operator, one <code>forward_&lt;backend&gt;</code>
+    method per backend, all behind one <code>forward()</code>. <code>forward_native</code> is
+    required; <code>forward_torch_compile</code> is inherited for free as
+    <code>torch.compile(forward_native)</code>; everything else is opt-in.
+  </p>
+
+  <div class="diagram">
+    <div class="dg-title">BaseFusedOp.forward() — PER-CALL BACKEND RESOLUTION</div>
+    <pre class="mermaid">
+flowchart TD
+  call["op.forward(x, weight)"] --> forced{"SGLANG_FORCE_FUSED_OP_BACKEND<br/>set?"}
+  forced -- "yes" --> usef["use the forced backend<br/>('torch' = every op runs its reference)"]
+  forced -- "no" --> walk["walk class priority, e.g. layernorm:<br/>AOT → JIT → AITER → TORCH_NPU → TORCH"]
+  walk --> elig{"backend_eligible()?<br/>CapabilityRequirement vs live PlatformInfo<br/>+ optional per-call shape/dtype gates"}
+  elig -- "no · try next" --> walk
+  elig -- "yes" --> run["getattr(self, 'forward_&lt;backend&gt;')(x, weight)"]
+  walk -- "nothing eligible" --> nat["forward_native fallback"]
+  run --> tr["enable_fused_op_trace()?<br/>record op · backend · shapes"]
+  nat --> tr
+  style usef fill:#fdf3e3,stroke:#d97706
+  style nat fill:#f5ecfe,stroke:#9333ea
+    </pre>
+    <div class="dg-caption">
+      <code>_resolve_backend</code> (<code>python/sglang/kernels/fused_op.py:295</code>): a forced
+      env value short-circuits everything; otherwise the first eligible backend in
+      <code>priority</code> wins, degrading to <code>KernelBackend.TORCH</code>. Priority is
+      device-agnostic — the same tuple resolves to AOT on CUDA, <code>aiter</code> on HIP,
+      <code>torch_npu</code> on Ascend, because capabilities gate per device
+      (<code>ops/layernorm/__init__.py:41</code>: <code>_NORM_PRIORITY = (AOT, JIT, AITER,
+      TORCH_NPU, TORCH)</code>).
+    </div>
+  </div>
+
+  <div class="callout fact"><span class="co-title">One-switch numerical bisection</span>
+    <code>SGLANG_FORCE_FUSED_OP_BACKEND=torch</code> (defined at
+    <code>python/sglang/srt/environ.py:822</code>) flips <em>every</em> fused op in the process
+    to its pure-torch reference — the fastest way to test whether a bad logit comes from an
+    optimized kernel. The parity harness
+    (<code>test/registered/kernels/ops/layernorm/test_fused_op_gpu_parity.py</code>) enumerates
+    <code>available_backends()</code> and asserts each matches <code>forward_native</code>, so
+    new backends are tested automatically.
+  </div>
+
+  <h2><span class="sec-num">6.3</span>The AOT tier: <code>aot/</code>, CMake &amp; the dispatcher boundary</h2>
+  <p>
+    The AOT wheel is a classic C++/CUDA extension built with <b>CMake
+    (<code>cmake_minimum_required 3.26</code>, <code>aot/CMakeLists.txt:1</code>) +
+    scikit-build-core + ninja</b>, with separate pyproject files per platform
+    (<code>pyproject.toml</code>, <code>pyproject_cpu.toml</code>, <code>pyproject_rocm.toml</code>,
+    <code>pyproject_musa.toml</code>) plus <code>setup_rocm.py</code>, <code>setup_musa.py</code>,
+    and — yes — <code>setup_metal.py</code> for Apple. Third-party dependencies are vendored by
+    <code>FetchContent</code> at pinned commits with SHA256 hashes
+    (<code>CMakeLists.txt:49–87</code>):
+  </p>
+
+  <table class="tbl">
+    <tr><th>FetchContent pin</th><th>What for</th></tr>
+    <tr><td><code>repo-cutlass</code> (NVIDIA/cutlass @ 57e3cfb4…)</td><td>GEMM / MLA / MoE template metaprogramming</td></tr>
+    <tr><td><code>repo-fmt</code> (fmtlib/fmt)</td><td>C++ formatting</td></tr>
+    <tr><td><code>repo-triton</code> (triton-lang/triton <b>v3.6.0</b>)</td><td>Triton's C++ AOT bits</td></tr>
+    <tr><td><code>repo-flashinfer</code> (flashinfer-ai/flashinfer @ bc29697b…)</td><td><code>csrc/norm.cu</code> + <code>csrc/renorm.cu</code> compiled <em>straight into</em> the wheel (CMakeLists.txt:298–299)</td></tr>
+    <tr><td><code>repo-flash-attention</code> (sgl-project/sgl-attn fork)</td><td>sparse FA2 forward kernels + <code>flash_sparse_api.cpp</code> (CMakeLists.txt:301–305)</td></tr>
+  </table>
+
+  <div class="filetree"><b>python/sglang/kernels/aot/csrc/</b> — 18 kernel categories
+├── <b>allreduce/</b>      <i>custom_all_reduce.cu (+.hip), quick_all_reduce.cu, deterministic_all_reduce.hip (ROCm-only!)</i>
+├── <b>attention/</b>      <i>cutlass_mla_kernel.cu, cutlass_sm100_mla/, merge_attn_states.cu, vertical_slash_index.cu</i>
+├── <b>cpu/</b> · <b>cutlass_extensions/</b> · <b>elementwise/</b>  <i>activation.cu, pos_enc.cu, fused_add_rms_norm_kernel.cu, topk.cu</i>
+├── <b>expert_specialization/</b> · <b>gemm/</b>  <i>fp8/int8 GEMM, awq, gptq/, per_token_group_quant_8bit.cu</i>
+├── <b>grammar/</b>        <i>apply_token_bitmask_inplace_cuda.cu (xgrammar constrained decoding)</i>
+├── <b>infllm_v2/</b> · <b>kvcacheio/</b> · <b>mamba/</b> · <b>memory/</b>  <i>weak_ref_tensor.cpp</i>
+├── <b>metal/</b>          <i>rope_pool_fused.metal + .cpp — fused RoPE+KV-scatter for Apple MLX</i>
+├── <b>moe/</b>            <i>moe_align_kernel.cu, topk softmax/sigmoid, fp8_blockwise_moe, cutlass_moe/</i>
+├── <b>musa/</b>           <i>.mu sources for Moore Threads GPUs</i>
+├── <b>quantization/</b> · <b>spatial/</b> · <b>speculative/</b>  <i>speculative_sampling.cu, eagle_utils.cu, ngram_utils.cu</i>
+└── common_extension.cc (+_rocm.cc, +_musa.cc) · flash_extension.cc · flashmla_extension.cc · spatial_extension.cc</div>
+
+  <p>A representative device kernel — the warp-shuffle group-max at the heart of per-token-group
+     FP8/INT8 quantization (used for DeepSeek-style blockwise FP8, with UE8M0 packed scales as a
+     template parameter):</p>
+
+  <div class="snippet" data-lang="cpp" data-file="python/sglang/kernels/aot/csrc/gemm/per_token_group_quant_8bit.cu:9" data-desc="butterfly-reduce a group max in 4 shuffles; parameter list trimmed">
+<pre>
+__device__ __forceinline__ float GroupReduceMax(float val, const int tid) {
+  unsigned mask = threadIdx.x % 32 >= 16 ? 0xffff0000 : 0x0000ffff;
+
+  val = fmaxf(val, __shfl_xor_sync(mask, val, 8));
+  val = fmaxf(val, __shfl_xor_sync(mask, val, 4));
+  val = fmaxf(val, __shfl_xor_sync(mask, val, 2));
+  val = fmaxf(val, __shfl_xor_sync(mask, val, 1));
+  return val;
+}
+
+template &lt;
+    typename T,
+    typename DST_DTYPE,
+    bool IS_COLUMN_MAJOR = false,
+    bool SCALE_UE8M0 = false,
+    typename scale_packed_t = std::conditional_t&lt;SCALE_UE8M0, uint32_t, float&gt;&gt;
+__global__ void per_token_group_quant_8bit_kernel(
+    const T* __restrict__ input,
+    void* __restrict__ output_q,
+    scale_packed_t* __restrict__ output_s,
+    const int group_size,
+    const int num_groups,
+</pre>
+  </div>
+
+  <p>
+    Every host function is registered on the torch dispatcher via one
+    <code>TORCH_LIBRARY_FRAGMENT(sgl_kernel, m)</code> per platform extension file — <b>85
+    <code>m.def(</code> calls</b> in the CUDA <code>common_extension.cc</code> alone. Ops with
+    tensor-mutating semantics get a full schema string; the AOT README explains why:
+    <em>"We need def with schema here for torch.compile"</em> — a schema-registered custom op
+    is something Dynamo/Inductor can see, trace through, and keep in a compiled graph.
+  </p>
+
+  <div class="snippet" data-lang="cpp" data-file="python/sglang/kernels/aot/csrc/common_extension.cc:21" data-desc="fragment header (line 21) + the elementwise block (lines 61–68); intervening op registrations elided">
+<pre>
+TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+  /*
+   * From csrc/elementwise
+   */
+  m.def("rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps, bool enable_pdl) -> ()");
+  m.impl("rmsnorm", torch::kCUDA, &amp;rmsnorm);
+
+  m.def("fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps, bool enable_pdl) -> ()");
+  m.impl("fused_add_rmsnorm", torch::kCUDA, &amp;sgl_fused_add_rmsnorm);
+</pre>
+  </div>
+
+  <div class="callout note"><span class="co-title">The call path, end to end</span>
+    <code>sglang.kernels.ops.layernorm.rmsnorm(x, w)</code> → <code>RMSNormOp.forward()</code>
+    resolves <code>AOT</code> on CUDA → the wheel's Python wrapper
+    (<code>aot/python/sgl_kernel/elementwise.py</code>) calls
+    <code>torch.ops.sgl_kernel.rmsnorm.default(out, input, weight, eps, enable_pdl)</code>
+    through the dispatcher. Note <code>enable_pdl</code>: Hopper+ Programmatic Dependent Launch
+    is a first-class argument on the norm/activation kernels, defaulted from
+    <code>is_arch_support_pdl()</code>.
+  </div>
+
+  <h2><span class="sec-num">6.4</span>The JIT tier: TVM-FFI + a content-addressed cache</h2>
+  <p>
+    JIT kernels are header-only <code>.cuh</code> templates under
+    <code>python/sglang/kernels/jit/csrc/</code>, compiled on first call through
+    <b>TVM-FFI</b> (<code>tvm_ffi.cpp.load</code> / <code>load_inline</code>) and exported via
+    generated <code>TVM_FFI_DLL_EXPORT_TYPED_FUNC</code> wrapper lines. The killer feature is
+    that <b>C++ template specialization is chosen from Python</b>: <code>make_cpp_args()</code>
+    turns a torch dtype and flags into a C++ template argument string, so one
+    <code>.cuh</code> serves every dtype/arch combination without a single runtime branch on
+    the device:
+  </p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/kernels/ops/activation/activation.py:21" data-desc="arch-dependent fast-math policy + template-specialized load; wrapper list trimmed">
+<pre>
+def _fast_math_flags() -> list[str]:
+    # Mirrors sgl-kernel's CMake policy: fast-math on SM90, precise on
+    # SM100+ (Blackwell needs bit-exact expf), off on HIP (clang rejects).
+    if is_hip_runtime():
+        return []
+    if get_jit_cuda_arch().major >= 10:
+        return []
+    return ["--use_fast_math"]
+
+
+@cache_once
+def activation_module(dtype: torch.dtype, *, fast_math: bool = True) -> Module:
+    fast_math_flags = _fast_math_flags()
+    if not fast_math and not fast_math_flags:
+        return activation_module(dtype)
+    args = make_cpp_args(dtype, is_arch_support_pdl())
+    return load_jit(
+        "activation" if fast_math else "rounded_activation",
+        *args,
+        cuda_files=["elementwise/activation.cuh"],
+        extra_cuda_cflags=fast_math_flags if fast_math else [],
+        cuda_wrappers=[
+            ("run_activation", f"ActivationKernel&lt;{args}&gt;::run_activation"),
+</pre>
+  </div>
+
+  <p>
+    Compilation is slow (tens of seconds), so caching is everything.
+    <code>_local_jit_source_hash()</code> SHA256-hashes the source <em>and every transitively
+    <code>#include</code>'d local header</em> and appends the 16-hex digest to the module name;
+    the build dir additionally keys on GPU arch and tvm-ffi ABI, <em>"so a shared cache volume
+    never reuses a cross-arch/ABI .so"</em> (<code>compile.py:166</code>). A cached
+    <code>.so</code> is loaded directly — skipping even ninja, whose mtime check would rebuild
+    every CI run:
+  </p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/kernels/jit/utils/compile.py:259" data-desc="inside load_jit(): module name = args + source hash; cache probe under ~/.cache/tvm-ffi">
+<pre>
+    module_name = "sgl_kernel_jit_" + "_".join(str(arg) for arg in args)
+    if cpp_files or cuda_files:
+        module_name += "_" + _local_jit_source_hash(cpp_files + cuda_files)
+
+    # A built .so under a deterministic dir is content-addressed: load it
+    # directly to skip ninja, whose mtime check rebuilds every CI run (pip
+    # install bumps dep header mtimes).
+    if build_directory is None:
+        cache_dir = os.environ.get("TVM_FFI_CACHE_DIR", "~/.cache/tvm-ffi")
+        build_directory = str(
+            pathlib.Path(cache_dir).expanduser() / _jit_build_dir_name(module_name)
+        )
+    prebuilt = pathlib.Path(build_directory) / f"{module_name}.so"
+    if prebuilt.is_file():
+        from tvm_ffi import load_module
+
+        try:
+            module = load_module(str(prebuilt))
+            logger.debug("Reused cached JIT module %s", module_name)
+            return module
+</pre>
+  </div>
+
+  <div class="stepper" id="st-jit">
+    <div class="st-scene">
+      <div class="sc-row" style="gap:14px">
+        <div class="sc-box" id="jc-call">silu_and_mul(x) · bf16<small>ops/activation → forward_jit</small></div>
+        <div class="sc-box appear" id="jc-args">make_cpp_args(bf16, pdl)<small>→ "bf16_t, true"</small></div>
+        <div class="sc-box appear" id="jc-hash">_local_jit_source_hash<small>SHA256 walk of .cuh + headers</small></div>
+      </div>
+      <div class="sc-row" style="gap:8px; margin-top:16px">
+        <div class="tok appear" id="jc-h1" style="width:auto; padding:2px 8px">activation.cuh</div>
+        <div class="tok appear" id="jc-h2" style="width:auto; padding:2px 8px">sgl_kernel/utils.cuh</div>
+        <div class="tok appear" id="jc-h3" style="width:auto; padding:2px 8px">sgl_kernel/vec.cuh</div>
+        <div class="tok appear" id="jc-digest" style="width:auto; padding:2px 8px">9f3c2b7a01d4e6c8</div>
+      </div>
+      <div class="sc-row" style="gap:14px; margin-top:16px">
+        <div class="sc-box appear" id="jc-name" style="max-width:460px">sgl_kernel_jit_activation_bf16_t_true_9f3c2b7a01d4e6c8<small>module name = args + content digest</small></div>
+        <div class="sc-box appear" id="jc-dir">…__arch_9.0a__tvmffi_0.1.x<small>build dir adds arch + ABI</small></div>
+      </div>
+      <div class="sc-row" style="gap:14px; margin-top:16px">
+        <div class="sc-box appear" id="jc-probe" style="border-style:dashed">prebuilt .so in ~/.cache/tvm-ffi?<small>prebuilt.is_file()</small></div>
+        <div class="sc-box appear" id="jc-nvcc">nvcc -std=c++20 -O3 --use_fast_math<small>tvm_ffi.cpp.load_inline + ninja</small></div>
+        <div class="sc-box appear" id="jc-so">module .so stored<small>TVM_FFI_DLL_EXPORT_TYPED_FUNC exports</small></div>
+      </div>
+      <div class="sc-row" style="gap:14px; margin-top:16px">
+        <div class="sc-box appear" id="jc-second">second call · same dtype/arch<small>e.g. next server restart</small></div>
+        <div class="sc-box appear" id="jc-hit">load_module(prebuilt) — cache HIT<small>no ninja, no nvcc</small></div>
+      </div>
+    </div>
+  </div>
+
+  <h2><span class="sec-num">6.5</span>torch.compile &amp; piecewise CUDA graphs</h2>
+  <p>
+    Full-model <code>torch.compile</code> struggles with attention: variable sequence lengths,
+    paged KV indices, backend-specific metadata. SGLang's answer (vLLM-lineage, adapted, under
+    <code>python/sglang/srt/compilation/</code>) is to compile <em>around</em> attention: cut the
+    FX graph at every attention/mamba op, compile and CUDA-graph-capture the pure-compute pieces
+    between them, and run the cut ops eagerly.
+  </p>
+
+  <div class="diagram">
+    <div class="dg-title">install_torch_compiled → SGLangBackend → PIECEWISE CAPTURE</div>
+    <pre class="mermaid">
+flowchart LR
+  inst["install_torch_compiled(module)<br/><i>compilation/compile.py:150</i><br/>Dynamo bytecode hook pins the<br/>compiled code to this instance"]
+  dyn["torch._dynamo traces forward<br/>dynamic dims inferred from<br/>type annotations"]
+  be["SGLangBackend<br/><i>compilation/backend.py:366</i><br/>post-grad FX passes"]
+  split["split_graph()<br/><i>backend.py:225</i><br/>cut at SPLIT_OPS"]
+  pieces["compute subgraphs<br/>+ attention islands (eager)"]
+  pw["per-platform piecewise backend<br/>current_platform.get_piecewise_backend_cls()<br/>CUDA · NPU · XPU"]
+  ind["per-shape inductor compile<br/>ConcreteSizeEntry(runtime_shape, …)"]
+  cg["1 warmup, then capture<br/>torch.cuda.CUDAGraph per size<br/>into shared graph_pool"]
+  inst --> dyn --> be --> split --> pieces --> pw --> ind --> cg
+  style split fill:#eef0ff,stroke:#4f46e5
+  style cg fill:#f5ecfe,stroke:#9333ea
+    </pre>
+    <div class="dg-caption">
+      <code>CompilerManager</code> hashes config + graph and persists inductor artifacts to disk
+      (<code>backend.py:103</code>); <code>compilation_counter</code> tracks
+      <code>num_piecewise_capturable_graphs_seen</code>. If Dynamo silently recompiles
+      mid-serving (a dynamic multimodal guard) there is no capture stream — the backend logs
+      and falls back to eager for that subgraph instead of crashing the scheduler
+      (<code>cuda_piecewise_backend.py:154–170</code>).
+    </div>
+  </div>
+
+  <p>Split points are declared with a decorator; the canonical ones are the unified attention
+     custom ops (<code>@register_split_op()</code> on
+     <code>unified_attention_with_output</code>, <code>srt/layers/radix_attention.py:400</code>),
+     mamba/linear-attention ops (<code>radix_linear_attention.py:124</code>), DSA indexer ops,
+     and model-specific ops (deepseek_v4, nemotron_h):</p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/compilation/compilation_config.py:7" data-desc="the entire split-op registration mechanism">
+<pre>
+SPLIT_OPS = []
+
+
+def register_split_op(op_name: Optional[str] = None):
+    def decorator(op_func: Callable):
+        name = op_name or op_func.__name__
+        SPLIT_OPS.append(f"sglang.{name}")
+        return op_func
+
+    return decorator
+</pre>
+  </div>
+
+  <div class="stepper" id="st-split">
+    <div class="st-scene">
+      <div class="sc-row" style="gap:8px; flex-wrap:wrap">
+        <div class="sc-box" id="fx-embed" style="padding:6px 10px">embed</div>
+        <div class="sc-box" id="fx-n1" style="padding:6px 10px">rmsnorm</div>
+        <div class="sc-box" id="fx-qkv" style="padding:6px 10px">qkv_proj + rope</div>
+        <div class="sc-box" id="fx-a0" style="padding:6px 10px">sglang.unified_attention_with_output<small>layer 0</small></div>
+        <div class="sc-box" id="fx-o" style="padding:6px 10px">o_proj</div>
+        <div class="sc-box" id="fx-n2" style="padding:6px 10px">add + rmsnorm</div>
+        <div class="sc-box" id="fx-mlp" style="padding:6px 10px">mlp (silu_and_mul)</div>
+        <div class="sc-box" id="fx-a1" style="padding:6px 10px">sglang.unified_attention_with_output<small>layer 1</small></div>
+        <div class="sc-box" id="fx-head" style="padding:6px 10px">norm_f + lm_head</div>
+      </div>
+      <div class="sc-row" style="gap:10px; margin-top:20px; flex-wrap:wrap">
+        <div class="sc-box appear" id="pc-0">Piece 0<small>embed → qkv_proj+rope</small></div>
+        <div class="sc-box appear" id="pc-a0" style="border-style:dashed">attn island 0<small>runs eager</small></div>
+        <div class="sc-box appear" id="pc-1">Piece 1<small>o_proj → mlp → …</small></div>
+        <div class="sc-box appear" id="pc-a1" style="border-style:dashed">attn island 1<small>runs eager</small></div>
+        <div class="sc-box appear" id="pc-2">Piece 2<small>norm_f → lm_head</small></div>
+      </div>
+      <div class="sc-row" style="gap:10px; margin-top:20px">
+        <div class="sc-box appear" id="pc-entry">ConcreteSizeEntry(runtime_shape=8)<small>need_to_compile · use_cudagraph</small></div>
+        <div class="sc-box appear" id="pc-graph">torch.cuda.CUDAGraph × capture sizes<small>shared graph_pool</small></div>
+      </div>
+    </div>
+  </div>
+
+  <p>User-facing control is per-phase JSON — <code>--cuda-graph-settings</code>
+     (<code>server_args.py:1779</code>), which wins over the per-phase
+     <code>--cuda-graph-*</code> convenience flags and legacy flags:</p>
+
+  <table class="tbl">
+    <tr><th>Backend (per phase)</th><th>Meaning</th></tr>
+    <tr><td><code>full</code></td><td>Classic whole-forward CUDA graph capture (decode-only) — chapter 04's graph runner.</td></tr>
+    <tr><td><code>breakable</code></td><td>CUDA graph with graph breaks; also powers the debug/eager mode where every op runs eagerly through the capture/replay path.</td></tr>
+    <tr><td><code>tc_piecewise</code></td><td>This section: torch.compile piecewise graphs (<code>tc_compiler</code> picks the compiler, e.g. <code>eager</code> or inductor); runner in <code>srt/model_executor/runner_backend/tc_piecewise_cuda_graph_backend.py</code>.</td></tr>
+    <tr><td><code>disabled</code></td><td>No CUDA graphs for that phase.</td></tr>
+  </table>
+
+  <div class="callout note"><span class="co-title">Example</span>
+    <code>--cuda-graph-settings '{"decode":{"backend":"full","max_bs":256},"prefill":{"backend":"tc_piecewise","tc_compiler":"eager"}}'</code>
+    — classic full capture for decode, torch.compile-piecewise for prefill. A separate
+    <code>--enable-torch-compile</code> still exists for full-model compile.
+  </div>
+
+  <h2><span class="sec-num">6.6</span>Batch-invariant ops: buying determinism</h2>
+  <p>
+    Why is LLM inference nondeterministic even at temperature 0? Because cuBLAS/cuDNN pick
+    different reduction strategies for different batch sizes, and floating-point addition is not
+    associative — the same request batched with 3 neighbors vs 30 produces bitwise-different
+    logits. <code>--enable-deterministic-inference</code> fixes this by hot-swapping the guilty
+    ATen ops process-wide with Triton kernels that use a <em>fixed reduction order</em>
+    (adapted from Thinking Machines' <code>batch_invariant_ops</code>). The swap is wired in
+    <code>ModelRunner.maybe_enable_batch_invariant_mode()</code>
+    (<code>model_runner.py:714</code>) and uses the torch dispatcher itself:
+  </p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/batch_invariant_ops/batch_invariant_ops.py:980" data-desc="hot-swapping aten kernels through torch.library (NPU branch below this, elided)">
+<pre>
+def enable_batch_invariant_mode(enable_bmm: bool = True):
+    global _batch_invariant_MODE, _batch_invariant_LIB, _original_torch_bmm
+    if _batch_invariant_MODE:
+        return
+
+    dispatch_key = get_dispatch_device_backend()
+
+    _batch_invariant_MODE = True
+    _batch_invariant_LIB = torch.library.Library("aten", "IMPL")
+
+    if not _is_npu:
+        # Register for detected device
+        _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, dispatch_key)
+        _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, dispatch_key)
+        _batch_invariant_LIB.impl(
+            "aten::_log_softmax", _log_softmax_batch_invariant, dispatch_key
+        )
+        _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant, dispatch_key)
+        _batch_invariant_LIB.impl("aten::rms_norm", _rms_norm_aten_compat, dispatch_key)
+        _batch_invariant_LIB.impl("aten::mm.dtype", _mm_dtype_compat, dispatch_key)
+
+        if enable_bmm:
+            _batch_invariant_LIB.impl("aten::bmm", bmm_batch_invariant, dispatch_key)
+            # Also monkeypatch torch.bmm directly as a fallback
+            _original_torch_bmm = torch.bmm
+            torch.bmm = bmm_batch_invariant
+</pre>
+  </div>
+
+  <p>The replacements are persistent Triton kernels (<code>matmul_kernel_persistent</code>,
+     <code>bmm_kernel_persistent</code>, <code>_log_softmax_kernel</code>,
+     <code>mean_kernel</code>, <code>_rms_norm_kernel</code>); matmul can route to DeepGEMM when
+     eligible. The RMSNorm shows the trick — one program per row, columns reduced in a fixed
+     sequential loop, so the summation order never depends on batch size:</p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/batch_invariant_ops/batch_invariant_ops.py:820" data-desc="fixed-order reduction (docstring + normalize loop trimmed)">
+<pre>
+@triton.jit
+def _rms_norm_kernel(
+    input_ptr,
+    weight_ptr,
+    output_ptr,
+    input_row_stride: tl.constexpr,
+    output_row_stride: tl.constexpr,
+    n_cols: tl.constexpr,
+    eps,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row_idx = tl.program_id(0).to(tl.int64)
+    row_start_ptr = input_ptr + row_idx * input_row_stride
+    output_row_start_ptr = output_ptr + row_idx * output_row_stride
+
+    # Step 1: Compute sum of squares in float32 to avoid overflow
+    sum_sq = tl.zeros([1], dtype=tl.float32)
+    for col_offset in range(0, n_cols, BLOCK_SIZE):
+        col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
+        mask = col_idx &lt; n_cols
+
+        vals = tl.load(row_start_ptr + col_idx, mask=mask, other=0.0)
+        # Convert to float32 for accumulation to prevent overflow
+        vals_f32 = vals.to(tl.float32)
+        sq_vals = vals_f32 * vals_f32
+        sum_sq += tl.sum(tl.where(mask, sq_vals, 0.0))
+</pre>
+  </div>
+
+  <div class="callout fact"><span class="co-title">Determinism reaches beyond GEMMs</span>
+    Attention must cooperate too: only
+    <code>RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["ascend", "fa3", "fa4",
+    "triton"]</code> qualify (<code>server_args.py:228</code>), with a fixed split size from
+    <code>get_batch_invariant_attention_block_size()</code>. Even collectives: ROCm ships a
+    dedicated <code>deterministic_all_reduce.hip</code> in the AOT tree. NPU registers its own
+    batch-invariant variants under <code>hardware_backend/npu/batch_invariant_ops/</code>, and
+    <code>disable_batch_invariant_mode()</code> destroys the <code>Library</code> to restore
+    stock kernels.
+  </div>
+
+  <h2><span class="sec-num">6.7</span>Platform abstraction: one codebase, seven hardware families</h2>
+  <p>
+    Two complementary layers keep vendor code from leaking everywhere.
+    <b><code>srt/platforms/</code></b> is the object model: <code>SRTPlatform</code>
+    (<code>interface.py:26</code>) exposes device queries plus subsystem factories —
+    <code>get_default_attention_backend()</code>, <code>get_graph_runner_cls()</code>,
+    <code>get_piecewise_backend_cls()</code>, KV-pool/allocator classes, capability flags
+    (<code>supports_fp8</code>, <code>support_cuda_graph</code>,
+    <code>support_piecewise_cuda_graph</code>) and <code>apply_server_args_defaults()</code>.
+    <code>current_platform</code> is a lazy module-level singleton resolved through setuptools
+    entry-point plugins (group <code>"sglang.srt.platforms"</code>):
+  </p>
+
+  <div class="diagram">
+    <div class="dg-title">_resolve_platform() — PLUGIN DISCOVERY &amp; FALLBACK CHAIN</div>
+    <pre class="mermaid">
+flowchart TD
+  s{"SGLANG_PLATFORM set?"}
+  s -- "yes · front-loading filter" --> ep["load ONLY the named entry-point plugin<br/>(others never imported — their deps never pulled)"]
+  ep --> okp{"activate() returned<br/>a platform?"}
+  okp -- "no" --> e1["RuntimeError<br/>(hardware unavailable)"]
+  okp -- "yes" --> use["current_platform singleton"]
+  s -- "no · auto-discover" --> all["import + activate ALL plugins in<br/>entry_points group sglang.srt.platforms"]
+  all --> n{"activated count?"}
+  n -- "1" --> use
+  n -- "&gt;1" --> e2["RuntimeError:<br/>must set SGLANG_PLATFORM"]
+  n -- "0 · fallback chain" --> fb["SGLANG_USE_CPU_ENGINE=1 → CpuSRTPlatform<br/>CUDA → CudaSRTPlatform<br/>ROCm → RocmSRTPlatform<br/>XPU → XpuSRTPlatform<br/>else base SRTPlatform"]
+  fb --> use
+  style fb fill:#e7f7ec,stroke:#16a34a
+  style use fill:#eef0ff,stroke:#4f46e5
+    </pre>
+    <div class="dg-caption">
+      <code>python/sglang/srt/platforms/__init__.py:49</code>. The CPU opt-in is checked
+      <em>first</em> — <em>"an explicit opt-in wins over CUDA/ROCm availability, so developers
+      on GPU hosts can intentionally exercise the CPU path."</em> ROCm subtlety:
+      <code>RocmDeviceMixin</code> inherits everything from <code>CudaDeviceMixin</code> and its
+      <code>device_type</code> stays <code>"cuda"</code> — <code>torch.device("rocm")</code> does
+      not exist; HIP is a binary shim behind <code>torch.cuda</code>
+      (<code>platforms/rocm.py</code>).
+    </div>
+  </div>
+
+  <p>
+    <b><code>srt/hardware_backend/</code></b> is the code drop zone — per-vendor implementation
+    trees: <code>cpu/</code> &amp; <code>gpu/</code> (AWQ/GPTQ quant kernels), <code>npu/</code>
+    (five Ascend attention backends, NPU graph runners including EAGLE draft runners, its own
+    allocator/memory pool), <code>xpu/</code> (graph runner + Triton FLA kernels),
+    <code>musa/</code>, and <code>mlx/</code> — a <em>full parallel stack</em> for Apple Silicon
+    with its own <code>model_runner.py</code>, <code>tp_worker.py</code>,
+    <code>scheduler_mixin.py</code>, KV-cache pool and fused SwiGLU MoE. MPS is made viable by
+    two root-level shims: <code>sglang/_mps_stub.py</code> patches missing
+    <code>torch.mps</code> APIs, and <code>sglang/_triton_stub.py</code> installs a mock
+    <code>triton</code> module whose <code>@triton.jit</code> is a pass-through decorator so
+    Triton-importing modules load on macOS (the kernels are never executed there).
+  </p>
+
+  <table class="tbl">
+    <tr><th>Platform</th><th>Default attention (MHA)</th><th>Default attention (MLA)</th><th>Vendor notes</th></tr>
+    <tr><td>CUDA Hopper (+CUDA ≥ 12.3)</td><td><code>fa3</code></td><td><code>fa3</code></td><td rowspan="3">from <code>ServerArgs._get_default_attn_backend</code> (<code>server_args.py:5627</code>); OOT platforms answer via <code>current_platform.get_default_attention_backend()</code></td></tr>
+    <tr><td>CUDA SM100 (Blackwell)</td><td><code>trtllm_mha</code> (<code>fa4</code> if asymmetric K/V head dims)</td><td><code>flashinfer</code></td></tr>
+    <tr><td>Other CUDA</td><td><code>flashinfer</code> if available &amp; no attention sinks, else <code>triton</code></td><td><code>triton</code></td></tr>
+    <tr><td>ROCm / HIP</td><td><code>aiter</code></td><td><code>aiter</code> only if KV head count ∈ {16, 128}, else <code>triton</code></td><td><code>.hip</code> kernels, deterministic allreduce, <code>docker/rocm.Dockerfile</code> (gfx942/gfx950 stages), <code>3rdparty/amd</code> profiling+tuning</td></tr>
+    <tr><td>Ascend NPU</td><td colspan="2"><code>ascend</code></td><td><code>docker/npu.Dockerfile</code> on a CANN base image; NPU piecewise backend</td></tr>
+    <tr><td>Intel CPU / XPU</td><td colspan="2"><code>intel_amx</code> (x86) · <code>torch_native</code> (ARM64)</td><td><code>SGLANG_USE_CPU_ENGINE=1</code>; <code>docker/xeon.Dockerfile</code>, <code>docker/xpu.Dockerfile</code></td></tr>
+    <tr><td>Apple MPS / MLX</td><td colspan="2"><code>torch_native</code></td><td>MLX backend + AOT Metal shader <code>rope_pool_fused.metal</code> via <code>setup_metal.py</code></td></tr>
+    <tr><td>MUSA (Moore Threads)</td><td colspan="2">—</td><td><code>.mu</code> kernels, <code>common_extension_musa.cc</code>, <code>pyproject_musa.toml</code></td></tr>
+  </table>
+
+  <p>
+    <code>docker/</code> mirrors the matrix with per-vendor images —
+    <code>Dockerfile</code> (CUDA), <code>arm64.Dockerfile</code>, <code>rocm.Dockerfile</code>,
+    <code>npu.Dockerfile</code>, <code>xeon.Dockerfile</code>, <code>xpu.Dockerfile</code>,
+    <code>sagemaker.Dockerfile</code>, <code>sgl-deep-gemm.Dockerfile</code> — plus infra images
+    (<code>sgl-router</code>, <code>gateway</code>). <code>3rdparty/</code> contains only
+    <code>amd/</code>: rpd-tracer profiling patches and MoE tuning scripts.
+  </p>
+
+  <h2><span class="sec-num">6.8</span>Notable facts &amp; gotchas</h2>
+  <div class="card">
+    <ul>
+      <li><b>The wheel/import split trips everyone:</b> pip package <code>sglang-kernel</code>,
+        source tree <code>python/sglang/kernels/aot/</code>, import path <code>sgl_kernel</code>,
+        dispatcher namespace <code>torch.ops.sgl_kernel.*</code> — four names, one artifact.</li>
+      <li><b>85 op schemas</b> in the CUDA <code>common_extension.cc</code> alone; ROCm and MUSA
+        have their own extension files, so per-platform wheels expose different op subsets —
+        which is why <code>CapabilityRequirement</code> is per-<code>(op, backend)</code>, not
+        per-backend (sgl_kernel builds <code>silu_and_mul</code> for ROCm but not
+        <code>rmsnorm</code>).</li>
+      <li><b>The AOT wheel compiles other projects' sources into itself:</b> flashinfer's
+        <code>norm.cu</code>/<code>renorm.cu</code> and flash-attention sparse kernels are built
+        straight into <code>sgl_kernel</code> at pinned commits (CMakeLists.txt:298–305).</li>
+      <li><b>JIT fast-math policy is arch-aware:</b> fast-math on SM90, precise on SM100+
+        ("Blackwell needs bit-exact expf"), off on HIP (clang rejects the flag) —
+        <code>ops/activation/activation.py:22</code>.</li>
+      <li><b><code>weak_ref_tensor</code> exists twice</b> — C++ in the AOT tree
+        (<code>csrc/memory/weak_ref_tensor.cpp</code>) and Python in
+        <code>srt/compilation/weak_ref_tensor.py</code>: the trick that lets CUDA-graph outputs
+        be aliased without extending tensor lifetimes.</li>
+      <li><b>Speculative tree verification defaults to deterministic:</b>
+        <code>tree_speculative_sampling_target_only(..., bool deterministic = true)</code>
+        (<code>csrc/speculative/speculative_sampling.cu:31</code>) — see chapter on speculative
+        decoding.</li>
+      <li><b>Piecewise never crashes the scheduler:</b> a Dynamo mid-serving recompile without a
+        capture stream logs a warning and runs that subgraph eagerly
+        (<code>cuda_piecewise_backend.py</code>).</li>
+      <li><b><code>split_module(keep_original_order=True)</code> is load-bearing</b> — the FX
+        graph contains mutations (in-place attention output), and reordering would change
+        semantics (comment at <code>backend.py:243</code>).</li>
+      <li><b>IDE support for JIT headers is generated:</b> <code>python -m sglang.kernels.jit</code>
+        writes a <code>.clangd</code> file so the header-only <code>.cuh</code> tree gets
+        completion and diagnostics.</li>
+      <li><b>Heavy header-only deps are pluggable for JIT:</b>
+        <code>@register_dependency("flashinfer")</code> (<code>jit/utils/deps.py:31</code>)
+        resolves include paths out of the installed flashinfer wheel — the sanctioned way for a
+        JIT kernel to use CUTLASS without moving to the AOT tier.</li>
+    </ul>
+  </div>
+
+  <div id="pager"></div>
+  </div>
+</main>
+</div>
+
+<script>
+document.addEventListener("DOMContentLoaded", () => {
+
+  new Stepper("#st-jit", {
+    title: "First vs second call of a JIT kernel: silu_and_mul in bf16 on an H100",
+    intro: "How load_jit turns a Python call into a cached, template-specialized .so.",
+    autoMs: 3400,
+    reset(sc) {
+      clearState(sc, ".sc-box,.tok");
+      rmCls(sc, ".appear", "in");
+    },
+    steps: [
+      { cap: "First call: <code>silu_and_mul(x)</code> with a bf16 tensor. The fused-op layer resolved <code>KernelBackend.JIT</code>; <code>activation_module(torch.bfloat16)</code> runs (it is <code>@cache_once</code>, so only once per process).",
+        run(sc) { setCls(sc, "#jc-call", "hl", "pulse"); } },
+      { cap: "<code>make_cpp_args(dtype, is_arch_support_pdl())</code> → the C++ template argument string <code>\"bf16_t, true\"</code>. The kernel compiled will literally be <code>ActivationKernel&lt;bf16_t, true&gt;</code> — dtype and PDL specialization chosen from Python, zero device-side branches.",
+        run(sc) { rmCls(sc, "#jc-call", "pulse"); setCls(sc, "#jc-args", "in", "hl"); } },
+      { cap: "<code>_local_jit_source_hash</code> SHA256-walks <code>elementwise/activation.cuh</code> plus every transitively <code>#include</code>'d <code>sgl_kernel/</code> header, hashing paths relative to the kernel root (content, not install location).",
+        run(sc) { rmCls(sc, "#jc-args", "hl"); setCls(sc, "#jc-hash", "in", "hl"); setCls(sc, "#jc-h1,#jc-h2,#jc-h3", "in", "cache"); } },
+      { cap: "The 16-hex digest is appended to the module name: <code>sgl_kernel_jit_activation_bf16_t_true_9f3c2b7a01d4e6c8</code>. Edit any header → new hash → new module, automatically.",
+        run(sc) { rmCls(sc, "#jc-hash", "hl"); setCls(sc, "#jc-digest", "in", "cache", "pulse"); setCls(sc, "#jc-name", "in", "hl"); } },
+      { cap: "The build directory adds what the source hash can't see: GPU arch (<code>9.0a</code> on H100) and the tvm-ffi ABI version — <i>\"so a shared cache volume never reuses a cross-arch/ABI .so\"</i> (compile.py:166).",
+        run(sc) { rmCls(sc, "#jc-digest", "pulse"); rmCls(sc, "#jc-name", "hl"); setCls(sc, "#jc-dir", "in", "hl"); } },
+      { cap: "Cache probe: <code>~/.cache/tvm-ffi/&lt;dir&gt;/&lt;module&gt;.so</code> does not exist yet — cache MISS on the very first call.",
+        run(sc) { rmCls(sc, "#jc-dir", "hl"); setCls(sc, "#jc-probe", "in", "bad"); } },
+      { cap: "<code>tvm_ffi.cpp.load_inline</code> generates a source that <code>#include</code>s the .cuh and adds one <code>TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_activation, ActivationKernel&lt;bf16_t, true&gt;::run_activation)</code> line per export, then ninja + nvcc compile it (<code>-std=c++20 -O3</code>, plus <code>--use_fast_math</code> on SM90). Tens of seconds, once.",
+        run(sc) { setCls(sc, "#jc-nvcc", "in", "warn", "pulse"); } },
+      { cap: "The built <code>.so</code> lands in the content-addressed cache directory. The first token of the first request paid the compile; nobody else will.",
+        run(sc) { rmCls(sc, "#jc-nvcc", "pulse"); setCls(sc, "#jc-nvcc", "ok"); setCls(sc, "#jc-so", "in", "ok"); } },
+      { cap: "Any later call — next server restart, next CI run on the same cache volume — computes the same hash, finds <code>prebuilt.is_file()</code>, and <code>load_module()</code>s it directly. No ninja (whose mtime check would rebuild every CI run), no nvcc: <i>\"Reused cached JIT module\"</i>.",
+        run(sc) { setCls(sc, "#jc-second", "in", "hl"); setCls(sc, "#jc-probe", "ok"); rmCls(sc, "#jc-probe", "bad"); setCls(sc, "#jc-hit", "in", "ok", "pulse"); } },
+    ],
+  });
+
+  new Stepper("#st-split", {
+    title: "split_graph(): from one FX graph to piecewise CUDA graphs (2-layer toy model)",
+    intro: "How SGLangBackend cuts the traced model at attention ops and captures the pieces.",
+    autoMs: 3400,
+    reset(sc) {
+      clearState(sc, ".sc-box,.tok");
+      rmCls(sc, ".appear", "in");
+    },
+    steps: [
+      { cap: "<code>install_torch_compiled(model)</code> wrapped <code>forward</code>; on the first real batch Dynamo traces the <b>whole model</b> into one FX graph. Attention is traceable because <code>unified_attention_with_output</code> is a schema-registered custom op.",
+        run(sc) { setCls(sc, "#fx-embed,#fx-n1,#fx-qkv,#fx-a0,#fx-o,#fx-n2,#fx-mlp,#fx-a1,#fx-head", "hl"); } },
+      { cap: "<code>split_graph()</code> (backend.py:225) walks the nodes. Every <code>call_function</code> whose <code>str(node.target)</code> is in <code>SPLIT_OPS</code> — here <code>\"sglang.unified_attention_with_output\"</code> — gets its <i>own</i> subgraph id and bumps the counter for what follows.",
+        run(sc) { clearState(sc, ".sc-box"); setCls(sc, "#fx-a0,#fx-a1", "warn", "pulse"); } },
+      { cap: "<code>torch.fx.passes.split_module(..., keep_original_order=True)</code> materializes the pieces. Order preservation is not cosmetic: the graph contains mutations, and reordering would change semantics (verbatim comment in backend.py).",
+        run(sc) { rmCls(sc, "#fx-a0,#fx-a1", "pulse"); setCls(sc, "#pc-0,#pc-1,#pc-2", "in", "hl"); setCls(sc, "#pc-a0,#pc-a1", "in", "warn"); } },
+      { cap: "Attention islands stay <b>eager</b> — variable sequence lengths and paged KV metadata make them graph-hostile. Each compute piece is handed to the platform's piecewise backend: <code>current_platform.get_piecewise_backend_cls()</code> → <code>CUDAPiecewiseBackend</code> (NPU/XPU variants exist).",
+        run(sc) { setCls(sc, "#pc-a0,#pc-a1", "dim"); rmCls(sc, "#pc-0,#pc-1,#pc-2", "hl"); setCls(sc, "#pc-0,#pc-1,#pc-2", "ok"); } },
+      { cap: "Per shape, each piece keeps a <code>ConcreteSizeEntry</code>: a general compiled graph serves unknown shapes; sizes in <code>compile_sizes</code> get their own inductor compile; sizes in <code>cudagraph_capture_sizes</code> are marked <code>use_cudagraph</code>. Here: decode batch size 8.",
+        run(sc) { setCls(sc, "#pc-entry", "in", "hl", "pulse"); } },
+      { cap: "After exactly 1 warmup call at that size, the runnable is replayed inside <code>torch.cuda.CUDAGraph</code> capture, all pieces sharing one <code>graph_pool</code>; outputs are weak-ref'd so capture doesn't pin memory.",
+        run(sc) { rmCls(sc, "#pc-entry", "pulse"); setCls(sc, "#pc-graph", "in", "cache", "pulse"); setCls(sc, "#pc-0,#pc-1,#pc-2", "cache"); } },
+      { cap: "Steady state for a bs=8 decode step: replay Piece 0's graph → run attention island 0 eager → replay Piece 1 → attention island 1 → replay Piece 2. GPU-side launch overhead collapses to a handful of graph replays per step.",
+        run(sc) { rmCls(sc, "#pc-graph", "pulse"); rmCls(sc, "#pc-a0,#pc-a1", "dim"); setCls(sc, "#pc-a0,#pc-a1", "warn"); setCls(sc, "#pc-entry", "ok"); } },
+    ],
+  });
+
+});
+</script>
+</body>
+</html>
