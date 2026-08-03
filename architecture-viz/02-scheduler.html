@@ -194,10 +194,10 @@ stateDiagram-v2
   [*] --> QUEUED : handle_generate_request()
   QUEUED --> EXTEND : PrefillAdder.add_one_req()
   EXTEND --> CHUNKED : prompt exceeds rem_chunk_tokens
-  CHUNKED --> CHUNKED : stash chunk KV, add_chunked_req() truncated
-  CHUNKED --> EXTEND : final chunk (truncated == False)
+  CHUNKED --> CHUNKED : stash chunk KV, add_chunked_req()
+  CHUNKED --> EXTEND : final chunk fits
   EXTEND --> DECODE : merge_batch() into running_batch
-  DECODE --> DECODE : prepare_for_decode(), +1 token
+  DECODE --> DECODE : prepare_for_decode()
   DECODE --> QUEUED : retract_decode() + reset_for_retract()
   DECODE --> FINISHED : update_finish_state() sets FINISH_*
   QUEUED --> FINISHED : abort / queue timeout

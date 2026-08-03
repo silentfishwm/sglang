@@ -404,16 +404,24 @@ def activation_module(dtype: torch.dtype, *, fast_math: bool = True) -> Module:
   <div class="diagram">
     <div class="dg-title">install_torch_compiled → SGLangBackend → PIECEWISE CAPTURE</div>
     <pre class="mermaid">
-flowchart LR
-  inst["install_torch_compiled(module)<br/><i>compilation/compile.py:150</i><br/>Dynamo bytecode hook pins the<br/>compiled code to this instance"]
-  dyn["torch._dynamo traces forward<br/>dynamic dims inferred from<br/>type annotations"]
-  be["SGLangBackend<br/><i>compilation/backend.py:366</i><br/>post-grad FX passes"]
-  split["split_graph()<br/><i>backend.py:225</i><br/>cut at SPLIT_OPS"]
-  pieces["compute subgraphs<br/>+ attention islands (eager)"]
-  pw["per-platform piecewise backend<br/>current_platform.get_piecewise_backend_cls()<br/>CUDA · NPU · XPU"]
-  ind["per-shape inductor compile<br/>ConcreteSizeEntry(runtime_shape, …)"]
-  cg["1 warmup, then capture<br/>torch.cuda.CUDAGraph per size<br/>into shared graph_pool"]
-  inst --> dyn --> be --> split --> pieces --> pw --> ind --> cg
+flowchart TB
+  subgraph trace ["1 · trace &amp; split (once per graph)"]
+    direction LR
+    inst["install_torch_compiled(module)<br/><i>compilation/compile.py:150</i><br/>bytecode hook pins compiled<br/>code to this instance"]
+    dyn["torch._dynamo traces forward<br/>dynamic dims inferred<br/>from type annotations"]
+    be["SGLangBackend<br/><i>compilation/backend.py:366</i><br/>post-grad FX passes"]
+    split["split_graph()<br/><i>backend.py:225</i><br/>cut at SPLIT_OPS"]
+    inst --> dyn --> be --> split
+  end
+  subgraph cap ["2 · compile &amp; capture (per piece, per shape)"]
+    direction LR
+    pieces["compute subgraphs +<br/>attention islands (eager)"]
+    pw["per-platform piecewise backend<br/>get_piecewise_backend_cls()<br/>CUDA · NPU · XPU"]
+    ind["per-shape inductor compile<br/>ConcreteSizeEntry(runtime_shape, …)"]
+    cg["1 warmup, then capture<br/>torch.cuda.CUDAGraph per size<br/>into shared graph_pool"]
+    pieces --> pw --> ind --> cg
+  end
+  split --> pieces
   style split fill:#eef0ff,stroke:#4f46e5
   style cg fill:#f5ecfe,stroke:#9333ea
     </pre>
