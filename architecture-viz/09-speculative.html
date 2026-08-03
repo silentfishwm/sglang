@@ -1,0 +1,966 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 · Speculative Decoding (EAGLE) &amp; Overlap — SGLang Internals</title>
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/mermaid.min.js"></script>
+<script src="assets/viz.js"></script>
+</head>
+<body>
+<div class="layout">
+<main>
+  <div class="page-hero"><div class="content">
+    <span class="phase-badge">Phase V · Advanced Inference</span>
+    <h1>09 · Speculative Decoding: EAGLE Trees, Diffusion LMs &amp; Batch Overlap</h1>
+    <p class="lede">
+      Autoregressive decode reads every weight to produce one token — the GPU's compute units
+      idle while HBM streams gigabytes. This chapter covers the three ways SGLang fills that
+      idle time: <strong>speculative decoding</strong> (draft cheap, verify many tokens in one
+      target forward), <strong>diffusion language models</strong> (denoise a whole block of
+      tokens at once), and <strong>batch overlap</strong> (hide MoE all-to-all communication
+      behind compute).
+    </p>
+  </div></div>
+
+  <div class="content">
+
+  <h2><span class="sec-num">9.1</span>Why speculate: decode is memory-bandwidth-bound</h2>
+  <p>
+    A decode step for one token must read <em>all</em> model weights from HBM but performs only
+    a tiny matrix-vector multiply per weight tile — arithmetic intensity far below what the GPU
+    can sustain. Verifying <em>k</em> candidate tokens in a single forward costs nearly the same
+    wall-clock time as producing one, because the weight traffic dominates. Speculative decoding
+    exploits this: a cheap <strong>draft</strong> proposes candidate continuations, and the
+    <strong>target</strong> model scores them all in one batched forward. Every accepted draft
+    token is a decode step you never had to run — and the output distribution is provably
+    unchanged when acceptance follows rejection sampling.
+  </p>
+  <p>
+    SGLang's flagship family is <strong>EAGLE</strong> (feature-level autoregression: the draft
+    head extrapolates on the target's <em>hidden states</em>, not just its sampled tokens, which
+    makes drafts far more accurate than a standalone small LM). <strong>EAGLE-2</strong> added
+    <em>dynamic draft trees</em>: instead of a single chain, the draft expands a token tree and
+    keeps the globally most probable nodes by joint (cumulative path) probability.
+    <strong>EAGLE-3</strong> trains the draft head on fused features from multiple target layers
+    (low/mid/high) with direct token prediction — in this repo it is a separate algorithm value
+    (<code>EAGLE3</code>) that reuses the same worker with a different hidden-state capture mode.
+    All three share one iteration shape: <em>draft a tree → verify it in one target forward →
+    accept a root-path prefix → re-seed the draft</em>.
+  </p>
+  <div class="callout note"><span class="co-title">Where the win comes from</span>
+    With <code>--speculative-num-steps 3 --speculative-eagle-topk 4 --speculative-num-draft-tokens 8</code>
+    (the auto-chosen Llama config is <code>(5, 4, 8)</code>, DeepSeek-family MTP gets
+    <code>(3, 1, 4)</code> — <code>_auto_choose_speculative_params</code>,
+    <code>python/sglang/srt/arg_groups/speculative_hook.py:795</code>), each scheduler step runs
+    2 draft forwards + 1 target verify + 1 draft-extend, and typically commits 3–4 tokens instead
+    of 1. The decode log's <code>accept length</code> (τ) is exactly that tokens-per-verify number.
+  </div>
+
+  <h2><span class="sec-num">9.2</span>The algorithm registry in this repo</h2>
+  <p>
+    Every algorithm is a member of <code>SpeculativeAlgorithm</code>
+    (<code>python/sglang/srt/speculative/spec_info.py</code>); plugins register additional names
+    at runtime via <code>SpeculativeAlgorithm.register(...)</code>, backed by
+    <code>spec_registry.CustomSpecAlgo</code> — both expose the same <code>is_*()</code> /
+    <code>create_worker()</code> interface.
+  </p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/speculative/spec_info.py:30" data-desc="The builtin algorithm roster (docstring trimmed)">
+<pre>
+class SpeculativeAlgorithm(Enum):
+    """Builtin speculative decoding algorithms. Plugin-registered ones are
+    ``CustomSpecAlgo`` instances; ``from_string`` returns either type, ..."""
+
+    DFLASH = auto()
+    DSPARK = auto()
+    EAGLE = auto()
+    EAGLE3 = auto()
+    FROZEN_KV_MTP = auto()
+    STANDALONE = auto()
+    NGRAM = auto()
+    NONE = auto()
+</pre>
+  </div>
+
+  <table class="tbl">
+    <tr><th>Algorithm</th><th>Worker class</th><th>Draft source</th></tr>
+    <tr><td><code>EAGLE</code> / <code>EAGLE3</code></td>
+      <td><code>EAGLEWorkerV2</code> + <code>EagleDraftWorker</code> (<code>eagle_worker_v2.py</code>)</td>
+      <td>EAGLE head reading target hidden states (EAGLE3: multi-layer fused features)</td></tr>
+    <tr><td><code>FROZEN_KV_MTP</code></td>
+      <td><code>FrozenKVMTPWorkerV2</code> (<code>frozen_kv_mtp_worker_v2.py</code>)</td>
+      <td>Multi-token-prediction head; <code>NEXTN</code> is a CLI alias — see warning below</td></tr>
+    <tr><td><code>STANDALONE</code></td>
+      <td><code>StandaloneWorkerV2</code> (<code>standalone_worker_v2.py</code>)</td>
+      <td>A vanilla small LLM (no hidden-state feed)</td></tr>
+    <tr><td><code>NGRAM</code></td>
+      <td><code>NGRAMWorker</code> (<code>ngram_worker.py</code>)</td>
+      <td>Host-side n-gram corpus (<code>cpp_ngram/ngram_corpus.py:NgramCorpus</code>) — no draft
+        model, no draft KV (<code>has_draft_kv()</code> is False)</td></tr>
+    <tr><td><code>DFLASH</code></td>
+      <td><code>DFlashWorkerV2</code> (<code>dflash_worker_v2.py</code>)</td>
+      <td>Block drafting; draft is a plain <code>TpModelWorker</code></td></tr>
+    <tr><td><code>DSPARK</code></td>
+      <td><code>DSparkWorkerV2</code> (<code>dspark_components/dspark_worker_v2.py</code>)</td>
+      <td>DFlash family + confidence-driven ragged verify (<code>DSparkVerifyPlanner</code>,
+        <code>RaggedVerifyMode</code> cap-accept / compact)</td></tr>
+    <tr><td>plugins</td>
+      <td>factory passed to <code>SpeculativeAlgorithm.register(name, ...)</code></td>
+      <td>anything — the decorator wires <code>from_string</code> and worker creation</td></tr>
+  </table>
+
+  <div class="callout warn"><span class="co-title">NEXTN is an alias, and it does not mean what upstream docs say</span>
+    <code>_resolve_speculative_algorithm_alias</code>
+    (<code>python/sglang/srt/arg_groups/speculative_hook.py:24</code>) normalizes
+    <code>--speculative-algorithm NEXTN</code> to <code>EAGLE</code> — <em>except</em> when the
+    draft checkpoint is a Gemma4 assistant architecture, in which case both <code>NEXTN</code>
+    and <code>EAGLE</code> are promoted to <code>FROZEN_KV_MTP</code> (with a log line). There is
+    also no V1 EAGLE worker anymore: EAGLE / EAGLE3 / STANDALONE / MTP always instantiate the V2
+    worker, and the scheduler simply drives it synchronously when overlap is off
+    (<code>spec_info.py:278</code>).
+  </div>
+
+  <p>The directory at a glance:</p>
+  <div class="filetree">
+<b>python/sglang/srt/speculative/</b>
+├─ spec_info.py                      <i>SpeculativeAlgorithm enum + SpecInputType + SpecInput base</i>
+├─ spec_registry.py                  <i>CustomSpecAlgo — plugin algorithms</i>
+├─ eagle_info.py                     <i>EagleDraftInput / EagleVerifyInput / EagleDraftExtendInput</i>
+├─ base_spec_worker.py               <i>BaseSpecWorker + EagleDraftWorkerBase (draft/draft_extend ABC)</i>
+├─ eagle_worker_v2.py                <i>EagleDraftWorker + EAGLEWorkerV2 — THE EAGLE worker</i>
+├─ eagle_worker_common.py            <i>prepare_for_draft, build_eagle_verify_input, run_eagle_verify</i>
+├─ eagle_utils.py                    <i>organize_draft_results, build_tree_kernel_efficient, eagle_sample</i>
+├─ spec_utils.py                     <i>select_top_k_tokens, spec_prepare_for_decode, GrammarTree</i>
+├─ standalone_worker_v2.py           <i>StandaloneWorkerV2(EAGLEWorkerV2)</i>
+├─ frozen_kv_mtp_worker_v2.py        <i>FrozenKVMTPWorkerV2 — MTP variant</i>
+├─ multi_layer_eagle_worker_v2.py    <i>--enable-multi-layer-eagle (per-step draft layers)</i>
+├─ ngram_worker.py + ngram_info.py   <i>NGRAMWorker + NgramVerifyInput</i>
+├─ dflash_worker_v2.py               <i>DFlashWorkerV2 — block drafting</i>
+├─ dspark_components/                <i>DSparkWorkerV2 + ragged verify planner</i>
+├─ ragged_verify.py                  <i>RaggedVerifyMode / RaggedVerifyLayout</i>
+├─ adaptive_runtime_state.py         <i>AdaptiveController + SpecRuntimeState (--speculative-adaptive)</i>
+├─ decoupled_spec_io.py              <i>ZMQ structs for --decoupled-spec-role drafter/verifier engines</i>
+├─ eagle_draft_cuda_graph_runner.py  <i>EAGLEDraftCudaGraphRunner — whole multi-step draft loop in one graph</i>
+└─ eagle_draft_extend_cuda_graph_runner.py
+  </div>
+  <p>
+    Three input classes carry state between phases (<code>eagle_info.py</code>):
+    <code>EagleDraftInput</code> (<code>topk_p</code>, <code>topk_index</code>,
+    <code>hidden_states</code>, <code>bonus_tokens</code> — the draft seed carried across
+    iterations), <code>EagleVerifyInput</code> (the tree: <code>draft_token</code>,
+    <code>tree_mask</code>, <code>retrieve_index</code> / <code>retrieve_next_token</code> /
+    <code>retrieve_next_sibling</code>, <code>draft_probs</code>, and the
+    <code>max_tree_depth</code> property), and <code>EagleDraftExtendInput</code>
+    (<code>eagle_info.py:272</code>) — split out in this repo from upstream's dual-use
+    <code>EagleDraftInput</code>.
+  </p>
+
+  <div class="diagram">
+    <div class="dg-title">ONE EAGLE DECODE ITERATION — DRAFT → VERIFY → DRAFT-EXTEND</div>
+    <pre class="mermaid">
+flowchart LR
+  di["EagleDraftInput<br/>topk_p · topk_index<br/>hidden_states · bonus_tokens"]
+  draft["EagleDraftWorker.draft()<br/>num_steps − 1 draft forwards<br/><i>eagle_worker_v2.py:463</i>"]
+  org["organize_draft_results<br/>top-(N−1) nodes by joint prob<br/><i>eagle_utils.py:100</i>"]
+  tree["build_tree_kernel_efficient<br/>tree_mask · positions · retrieve_*<br/><i>eagle_utils.py:144</i>"]
+  vfy["ForwardMode.TARGET_VERIFY<br/>one target forward over bs×N tokens"]
+  smp["eagle_sample<br/>verify_tree_greedy / sampling kernels<br/><i>eagle_utils.py:646</i>"]
+  ext["ForwardMode.DRAFT_EXTEND_V2<br/>_draft_extend_for_decode<br/><i>eagle_worker_v2.py:832</i>"]
+  di --> draft --> org --> tree --> vfy --> smp --> ext
+  ext -- "next iteration's<br/>EagleDraftInput" --> di
+  style di fill:#f5ecfe,stroke:#9333ea
+  style vfy fill:#e7f7ec,stroke:#16a34a
+  style ext fill:#eef0ff,stroke:#4f46e5
+    </pre>
+    <div class="dg-caption">
+      Entry point: <code>EAGLEWorkerV2.forward_batch_generation</code>
+      (<code>eagle_worker_v2.py:1079</code>). All three phases run inside one scheduler step;
+      with N = <code>num_draft_tokens</code>, the verify forward scores exactly N positions per
+      request (1 bonus root + N−1 drafts). Three CUDA graph families cover the loop:
+      <code>EAGLEDraftCudaGraphRunner</code> (the whole multi-step draft),
+      the regular <em>decode</em> graph runner for TARGET_VERIFY, and
+      <code>EAGLEDraftExtendCudaGraphRunner</code>.
+    </div>
+  </div>
+
+  <h2><span class="sec-num">9.3</span>Worked example: one EAGLE iteration, step by step</h2>
+  <p>
+    Server flags: <code>--speculative-algorithm EAGLE --speculative-num-steps 3
+    --speculative-eagle-topk 4 --speculative-num-draft-tokens 8</code>. The request has committed
+    <em>"… The capital of France is"</em> and last iteration's verify produced the bonus token
+    <strong>"Paris"</strong>. Watch a full draft → verify → draft-extend round commit four tokens
+    in the time of roughly one-and-a-bit decode steps:
+  </p>
+
+  <div class="stepper" id="st-eagle">
+    <div class="st-scene">
+      <div class="sc-row" style="gap:8px">
+        <div class="sc-box" id="eg-di">EagleDraftInput<small>topk_p · topk_index · hidden_states · bonus_tokens</small></div>
+        <div class="sc-box" id="eg-prep">prepare_for_draft<small>12 draft-KV slots (4×3)</small></div>
+        <div class="sc-box" id="eg-fwd">draft forwards ×2<small>attn_backends[i] per step</small></div>
+        <div class="sc-box" id="eg-org">organize_draft_results<small>topk(36 → 7)</small></div>
+        <div class="sc-box" id="eg-tree">build_tree_kernel_efficient<small>tree_mask · retrieve_*</small></div>
+        <div class="sc-box" id="eg-vfy">TARGET_VERIFY<small>1 target forward, 8 tokens</small></div>
+        <div class="sc-box" id="eg-ext">DRAFT_EXTEND_V2<small>re-seed draft</small></div>
+      </div>
+
+      <div class="sc-row" style="margin-top:16px">
+        <span style="font-size:11px; color:#8b93a7; width:110px">committed prefix</span>
+        <span class="tok dim">The</span><span class="tok dim">capital</span><span class="tok dim">of</span>
+        <span class="tok dim">France</span><span class="tok dim">is</span>
+        <span class="tok cache" id="eg-root">Paris<small style="opacity:.7">&nbsp;· bonus root</small></span>
+      </div>
+      <div class="sc-row">
+        <span style="font-size:11px; color:#8b93a7; width:110px">depth 1 (i=0)</span>
+        <span class="tok appear" id="eg-d1a">","&nbsp;·&nbsp;.55</span>
+        <span class="tok appear" id="eg-d1b">"."&nbsp;·&nbsp;.20</span>
+        <span class="tok appear" id="eg-d1c">"is"&nbsp;·&nbsp;.15</span>
+        <span class="tok appear" id="eg-d1d">"and"&nbsp;·&nbsp;.05</span>
+      </div>
+      <div class="sc-row">
+        <span style="font-size:11px; color:#8b93a7; width:110px">depth 2 (i=1)</span>
+        <span class="tok appear" id="eg-d2a">"the"&nbsp;·&nbsp;.275&nbsp;⤴","</span>
+        <span class="tok appear" id="eg-d2b">"It"&nbsp;·&nbsp;.12&nbsp;⤴"."</span>
+        <span class="tok appear" id="eg-d2c">"which"&nbsp;·&nbsp;.11&nbsp;⤴","</span>
+        <span class="tok appear" id="eg-d2d">"a"&nbsp;·&nbsp;.055&nbsp;⤴","</span>
+      </div>
+      <div class="sc-row">
+        <span style="font-size:11px; color:#8b93a7; width:110px">depth 3 (i=2)</span>
+        <span class="tok appear" id="eg-d3a">"capital"&nbsp;·&nbsp;.19&nbsp;⤴"the"</span>
+        <span class="tok appear" id="eg-d3b">"largest"&nbsp;·&nbsp;.05&nbsp;⤴"the"</span>
+        <span class="tok appear" id="eg-d3c">"city"&nbsp;·&nbsp;.03&nbsp;⤴"the"</span>
+        <span class="tok appear" id="eg-d3d">"'s"&nbsp;·&nbsp;.02&nbsp;⤴"It"</span>
+      </div>
+      <div class="sc-row" style="margin-top:12px">
+        <span style="font-size:11px; color:#8b93a7; width:110px">committed this round</span>
+        <span class="tok appear" id="eg-c1">","</span>
+        <span class="tok appear" id="eg-c2">"the"</span>
+        <span class="tok appear" id="eg-c3">"capital"</span>
+        <span class="tok appear" id="eg-c4">"of"&nbsp;·&nbsp;new&nbsp;bonus</span>
+      </div>
+    </div>
+  </div>
+
+  <p>
+    Two source facts anchor the stepper. First, the draft loop runs only
+    <code>num_steps − 1 = 2</code> forwards — the first frontier comes free from last round's
+    draft-extend logits:
+  </p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/speculative/eagle_worker_v2.py:586" data-desc="The multi-step draft loop inside EagleDraftWorker.draft_forward — the break skips the last forward">
+<pre>
+for i in range(self.speculative_num_steps):
+    if draft_tokens_topk1 is not None:
+        input_ids = topk_index.flatten()
+    else:
+        input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+            i, topk_p, topk_index, hidden_states, scores, self.topk
+        )
+        score_list.append(tree_info[0])
+        token_list.append(tree_info[1])
+        parents_list.append(tree_info[2])
+
+    # We don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
+    if i == self.speculative_num_steps - 1:
+        break
+</pre>
+  </div>
+
+  <p>
+    Second, tree expansion keeps the global top-<code>topk</code> frontier by <em>joint path
+    probability</em>: at step <code>i&gt;0</code>, <code>_select_top_k_tokens_later</code>
+    (<code>spec_utils.py:300</code>) computes
+    <code>expand_scores = scores.unsqueeze(2) * topk_p.view(-1, topk, topk)</code> — each of the
+    4 frontier nodes proposes 4 children (16 candidates), each child's score is
+    parent-score × child-probability — then <code>fast_topk(...)</code> keeps the best 4. In our
+    example "," (0.55) × "the" (0.5) = 0.275 beats "." (0.20) × "It" (0.6) = 0.12.
+    All 4 + 16 + 16 = 36 scored candidates go to <code>organize_draft_results</code>
+    (<code>eagle_utils.py:100</code>), which takes
+    <code>torch.topk(score_list, num_draft_token − 1 = 7)</code>, sorts the winning indices, and
+    gathers the 7 draft tokens plus their <code>parent_list</code>. With
+    <code>topk=1</code> the tree degenerates to a chain and a preallocated fast path
+    (<code>_rebuild_topk1_chain_buffers</code>) skips the scoring machinery entirely.
+  </p>
+
+  <h2><span class="sec-num">9.4</span>The draft tree and its attention mask</h2>
+
+  <div class="diagram">
+    <div class="dg-title">THE 8-NODE VERIFY TREE FOR THE WORKED EXAMPLE</div>
+    <pre class="mermaid">
+graph TD
+  root(["Paris — bonus root (p = 1.00)"])
+  c1["#quot;,#quot; · 0.55"]
+  c2["#quot;.#quot; · 0.20"]
+  c3["#quot;is#quot; · 0.15"]
+  d1["#quot;the#quot; · 0.275"]
+  d2["#quot;which#quot; · 0.11"]
+  d3["#quot;It#quot; · 0.12"]
+  e1["#quot;capital#quot; · 0.19"]
+  root --> c1
+  root --> c2
+  root --> c3
+  c1 --> d1
+  c1 --> d2
+  c2 --> d3
+  d1 --> e1
+  style root fill:#f5ecfe,stroke:#9333ea
+  style c1 fill:#e7f7ec,stroke:#16a34a
+  style d1 fill:#e7f7ec,stroke:#16a34a
+  style e1 fill:#e7f7ec,stroke:#16a34a
+    </pre>
+    <div class="dg-caption">
+      The 7 highest joint-probability nodes out of 36 candidates, plus the bonus token prepended
+      as root — exactly <code>num_draft_tokens = 8</code> verify positions per request. Green =
+      the path the target will accept in §9.5. The kernel also emits per-token
+      <code>positions</code> = prefix length + tree depth (docstring example in
+      <code>eagle_utils.py:214</code>: depths <code>[0,1,1,2]</code>, prompt length 7 →
+      positions <code>[7,8,8,9]</code>).
+    </div>
+  </div>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/speculative/eagle_utils.py:144" data-desc="build_tree_kernel_efficient — the bonus token becomes the tree root (body trimmed to the shape comments)">
+<pre>
+def build_tree_kernel_efficient(
+    bonus_tokens: torch.Tensor,
+    parent_list: List[torch.Tensor],
+    top_scores_index: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    seq_lens_sum: int,
+    topk: int,
+    spec_steps: int,
+    num_verify_tokens: int,
+    tree_mask_mode: TreeMaskMode = TreeMaskMode.FULL_MASK,
+    tree_mask_buf: Optional[torch.Tensor] = None,
+    fill_prefix_mask: bool = True,
+):
+    draft_tokens = torch.cat((bonus_tokens.unsqueeze(1), draft_tokens), dim=1).flatten()
+
+    # seq_lens_sum == sum(seq_lens); seq_lens: sequence length without draft tokens
+    bs = seq_lens.numel()
+    # e.g. for bs=1, tree_mask: num_draft_token, seq_lens_sum + num_draft_token (flattened)
+    # where each row indicates the attending pattern of each draft token
+    ...
+    # position: where each token belongs to
+    # e.g. if depth of each draft token is [0, 1, 1, 2] and the prompt length is 7
+    # then, positions = [7, 8, 8, 9]
+</pre>
+  </div>
+
+  <p>
+    The tree cannot be verified with an ordinary causal mask: "which" must <em>not</em> attend to
+    its cousin "the", even though "the" precedes it in the flattened token order. The kernel
+    therefore builds a <strong>tree attention mask</strong>: each draft token attends to the full
+    committed prefix plus <em>its own ancestor chain only</em>. Below is the 8×8 tree part of the
+    mask for our example (in <code>TreeMaskMode.FULL_MASK</code> each row also spans the
+    <code>seq_len</code> prefix columns, all True; <code>QLEN_ONLY</code> is this 8×8 block alone,
+    used by the CPU intel_amx verify kernel, and <code>QLEN_ONLY_BITPACKING</code> packs each row
+    into uint8/16/32 — <code>TreeMaskMode</code>, <code>eagle_utils.py:132</code>):
+  </p>
+
+  <div style="overflow-x:auto; margin:16px 0">
+    <table style="border-collapse:collapse; font-family:ui-monospace,monospace; font-size:11.5px; margin:0 auto">
+      <tr>
+        <td style="padding:4px 8px"></td>
+        <td style="padding:4px 6px; color:#8b93a7">prefix…</td>
+        <td style="padding:4px 6px; text-align:center">Paris</td>
+        <td style="padding:4px 6px; text-align:center">","</td>
+        <td style="padding:4px 6px; text-align:center">"."</td>
+        <td style="padding:4px 6px; text-align:center">"is"</td>
+        <td style="padding:4px 6px; text-align:center">"the"</td>
+        <td style="padding:4px 6px; text-align:center">"which"</td>
+        <td style="padding:4px 6px; text-align:center">"It"</td>
+        <td style="padding:4px 6px; text-align:center">"capital"</td>
+      </tr>
+      <!-- rows: filled = attends -->
+      <tr><td style="padding:3px 8px; text-align:right">Paris</td><td style="background:#e2e8f0; border:1px solid #cbd5e1; text-align:center">✓</td><td style="background:#c7d2fe; border:1px solid #a5b4fc; text-align:center">✓</td><td style="border:1px solid #e5e9f2"></td><td style="border:1px solid #e5e9f2"></td><td style="border:1px solid #e5e9f2"></td><td style="border:1px solid #e5e9f2"></td><td style="border:1px solid #e5e9f2"></td><td style="border:1px solid #e5e9f2"></td><td style="border:1px solid #e5e9f2"></td></tr>
+      <tr><td style="padding:3px 8px; text-align:right">","</td><td style="background:#e2e8f0; border:1px solid #cbd5e1; text-align:center">✓</td><td style="background:#c7d2fe; border:1px solid #a5b4fc; text-align:center">✓</td><td style="background:#c7d2fe; border:1px solid #a5b4fc; text-align:center">✓</td><td style="border:1px solid #e5e9f2"></td><td style="border:1px solid #e5e9f2"></td><td style="border:1px solid #e5e9f2"></td><td style="border:1px solid #e5e9f2"></td><td style="border:1px solid #e5e9f2"></td><td style="border:1px solid #e5e9f2"></td></tr>
+      <tr><td style="padding:3px 8px; text-align:right">"."</td><td style="background:#e2e8f0; border:1px solid #cbd5e1; text-align:center">✓</td><td style="background:#c7d2fe; border:1px solid #a5b4fc; text-align:center">✓</td><td style="border:1px solid #e5e9f2"></td><td style="background:#c7d2fe; border:1px solid #a5b4fc; text-align:center">✓</td><td style="border:1px solid #e5e9f2"></td><td style="border:1px solid #e5e9f2"></td><td style="border:1px solid #e5e9f2"></td><td style="border:1px solid #e5e9f2"></td><td style="border:1px solid #e5e9f2"></td></tr>
+      <tr><td style="padding:3px 8px; text-align:right">"is"</td><td style="background:#e2e8f0; border:1px solid #cbd5e1; text-align:center">✓</td><td style="background:#c7d2fe; border:1px solid #a5b4fc; text-align:center">✓</td><td style="border:1px solid #e5e9f2"></td><td style="border:1px solid #e5e9f2"></td><td style="background:#c7d2fe; border:1px solid #a5b4fc; text-align:center">✓</td><td style="border:1px solid #e5e9f2"></td><td style="border:1px solid #e5e9f2"></td><td style="border:1px solid #e5e9f2"></td><td style="border:1px solid #e5e9f2"></td></tr>
+      <tr><td style="padding:3px 8px; text-align:right">"the"</td><td style="background:#e2e8f0; border:1px solid #cbd5e1; text-align:center">✓</td><td style="background:#c7d2fe; border:1px solid #a5b4fc; text-align:center">✓</td><td style="background:#c7d2fe; border:1px solid #a5b4fc; text-align:center">✓</td><td style="border:1px solid #e5e9f2"></td><td style="border:1px solid #e5e9f2"></td><td style="background:#c7d2fe; border:1px solid #a5b4fc; text-align:center">✓</td><td style="border:1px solid #e5e9f2"></td><td style="border:1px solid #e5e9f2"></td><td style="border:1px solid #e5e9f2"></td></tr>
+      <tr><td style="padding:3px 8px; text-align:right">"which"</td><td style="background:#e2e8f0; border:1px solid #cbd5e1; text-align:center">✓</td><td style="background:#c7d2fe; border:1px solid #a5b4fc; text-align:center">✓</td><td style="background:#c7d2fe; border:1px solid #a5b4fc; text-align:center">✓</td><td style="border:1px solid #e5e9f2"></td><td style="border:1px solid #e5e9f2"></td><td style="border:1px solid #e5e9f2"></td><td style="background:#c7d2fe; border:1px solid #a5b4fc; text-align:center">✓</td><td style="border:1px solid #e5e9f2"></td><td style="border:1px solid #e5e9f2"></td></tr>
+      <tr><td style="padding:3px 8px; text-align:right">"It"</td><td style="background:#e2e8f0; border:1px solid #cbd5e1; text-align:center">✓</td><td style="background:#c7d2fe; border:1px solid #a5b4fc; text-align:center">✓</td><td style="border:1px solid #e5e9f2"></td><td style="background:#c7d2fe; border:1px solid #a5b4fc; text-align:center">✓</td><td style="border:1px solid #e5e9f2"></td><td style="border:1px solid #e5e9f2"></td><td style="border:1px solid #e5e9f2"></td><td style="background:#c7d2fe; border:1px solid #a5b4fc; text-align:center">✓</td><td style="border:1px solid #e5e9f2"></td></tr>
+      <tr><td style="padding:3px 8px; text-align:right">"capital"</td><td style="background:#e2e8f0; border:1px solid #cbd5e1; text-align:center">✓</td><td style="background:#c7d2fe; border:1px solid #a5b4fc; text-align:center">✓</td><td style="background:#c7d2fe; border:1px solid #a5b4fc; text-align:center">✓</td><td style="border:1px solid #e5e9f2"></td><td style="border:1px solid #e5e9f2"></td><td style="background:#c7d2fe; border:1px solid #a5b4fc; text-align:center">✓</td><td style="border:1px solid #e5e9f2"></td><td style="border:1px solid #e5e9f2"></td><td style="background:#c7d2fe; border:1px solid #a5b4fc; text-align:center">✓</td></tr>
+    </table>
+    <p style="text-align:center; font-size:12px; color:#8b93a7; margin-top:6px">
+      Rows = query (draft token), columns = key. Gray = committed prefix (always attended),
+      indigo = ancestor chain incl. self. Token column order is the flattened
+      <code>draft_tokens</code> order: bonus root first, then the 7 winners sorted by their
+      candidate index. "which" attends to root and "," but not to its sibling "the".
+    </p>
+  </div>
+
+  <p>
+    Alongside the mask, the kernel emits a <strong>first-child / next-sibling</strong> linked-list
+    encoding — <code>retrieve_index</code>, <code>retrieve_next_token</code>,
+    <code>retrieve_next_sibling</code>, each <code>(bs, 8)</code> — which is what the verify
+    kernel walks (next section). Verify itself is prepared by
+    <code>eagle_prepare_for_verify</code> (<code>eagle_utils.py:490</code>): set
+    <code>batch.input_ids = verify_input.draft_token</code>, assign 8 KV slots per request past
+    <code>seq_lens</code>, and flip <code>batch.forward_mode = ForwardMode.TARGET_VERIFY</code>
+    (<code>forward_batch_info.py:110</code>). Because TARGET_VERIFY is fixed-width per request,
+    it replays through the target's <em>decode</em> CUDA graph family, and attention-backend
+    planning runs on a separate <code>plan_stream</code> overlapped with the draft forward
+    (<code>update_verify_buffers_to_fill_after_draft</code> re-fills mask/position buffers that
+    were planned before draft tokens existed).
+  </p>
+
+  <h2><span class="sec-num">9.5</span>Verification math: greedy walk vs. sampling</h2>
+  <p>
+    <code>eagle_sample</code> (<code>eagle_utils.py:646</code>) applies relaxed penalties, logit
+    bias and grammar masks to the <code>bs×8</code> target logits, then branches on the sampling
+    mode. <strong>Greedy</strong> (all requests greedy — and always on CPU/NPU/HIP/XPU): take the
+    target argmax at every tree position, then walk the tree from the root; at each accepted node,
+    scan its children via <code>retrieve_next_token</code> / <code>retrieve_next_sibling</code>
+    for a child whose <em>draft</em> token equals the <em>target's</em> prediction at the current
+    node. Match → descend; no match → stop. The target's prediction at the last accepted node
+    becomes the new bonus token.
+  </p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/speculative/eagle_utils.py:723" data-desc="Greedy branch of eagle_sample + the return that adds the bonus (middle of function elided)">
+<pre>
+if sampling_info.is_all_greedy or _is_cpu or _is_npu or _is_hip or _is_xpu:
+    target_predict = torch.argmax(next_token_logits, dim=-1)
+    target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
+    predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
+        predicts=predict,  # mutable
+        accept_index=accept_index,  # mutable
+        accept_token_num=num_correct_drafts,  # mutable
+        candidates=candidates,
+        retrieve_index=verify_input.retrieve_index,
+        retrieve_next_token=verify_input.retrieve_next_token,
+        retrieve_next_sibling=verify_input.retrieve_next_sibling,
+        target_predict=target_predict,
+        topk=verify_input.tree_topk,
+    )
+...
+# `num_correct_drafts` stays drafts-only inside this function; the returned
+# tensor includes the trailing/bonus token via out-of-place +1 so the
+# name no longer flips semantics mid-function (naming doc C2).
+return predict, num_correct_drafts + 1, accept_index
+</pre>
+  </div>
+
+  <div class="callout fact"><span class="co-title">Naming discipline: accept vs. correct</span>
+    The kernels count <code>num_correct_drafts</code> — drafts only, bonus excluded (the sgl_kernel
+    kwarg keeps the frozen legacy name <code>accept_token_num</code>). <code>eagle_sample</code>
+    returns <code>num_correct_drafts + 1</code>, which callers store as <code>accept_lens</code> —
+    bonus <em>included</em>. In the worked example: 3 correct drafts (",", "the", "capital"),
+    <code>accept_lens = 4</code> with the bonus "of". Acceptance per verify is bounded by
+    <code>EagleVerifyInput.max_tree_depth = spec_steps + 1</code> (the <code>accept_index</code>
+    row width) — at most 4 here, at least 1 (the root always accepts). The paper-convention
+    metrics keep their own semantics: <code>accept_rate</code> α excludes the bonus,
+    <code>accept_length</code> τ includes it.
+  </div>
+
+  <p>
+    <strong>Sampling</strong>: temperature / top-k / top-p renormalized target probabilities feed
+    <code>sgl_kernel.tree_speculative_sampling_target_only</code> with per-position uniform coins.
+    This is <em>threshold/typical acceptance against the target distribution only</em> —
+    <code>draft_probs</code> is zeroed — tunable via two knobs (both default 1.0 = lossless):
+  </p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/speculative/eagle_utils.py:801" data-desc="Sampling verify + TP rank-0 broadcast (explanatory comment trimmed)">
+<pre>
+sampling_fn = (
+    chain_speculative_sampling_triton
+    if use_rejection_sampling
+    else tree_speculative_sampling_target_only
+)
+sampling_fn(
+    predicts=predict,  # mutable
+    accept_index=accept_index,  # mutable
+    accept_token_num=num_correct_drafts,  # mutable
+    candidates=candidates,
+    # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
+    retrive_index=verify_input.retrieve_index,
+    retrive_next_token=verify_input.retrieve_next_token,
+    retrive_next_sibling=verify_input.retrieve_next_sibling,
+    uniform_samples=coins,
+    uniform_samples_for_final_sampling=coins_for_final_sampling,
+    target_probs=target_probs,
+    draft_probs=draft_probs,
+    threshold_single=get_spec().speculative_accept_threshold_single,
+    threshold_acc=get_spec().speculative_accept_threshold_acc,
+    deterministic=True,
+)
+
+# Sync sampling results across TP ranks: different GPUs may produce slightly
+# different target_probs due to floating-point non-determinism ...
+tp_group = (
+    get_parallel().attn_tp_group
+    if is_dp_attention_enabled()
+    else get_tp_group()
+)
+if tp_group.world_size &gt; 1:
+    tp_group.broadcast(predict, src=0)
+    tp_group.broadcast(accept_index, src=0)
+    tp_group.broadcast(num_correct_drafts, src=0)
+</pre>
+  </div>
+
+  <p>
+    With <code>--speculative-use-rejection-sampling</code> (requires <code>topk == 1</code>,
+    EAGLE/EAGLE3 only, shared draft/target vocab), the drafter records its full per-step proposal
+    distribution (<code>EagleVerifyInput.draft_probs</code>, shape
+    <code>(bs, num_steps, vocab)</code>) and <code>chain_speculative_sampling_triton</code> runs
+    true Leviathan-style rejection sampling — accept with probability
+    <code>min(1, p_target / q_draft)</code>. Coins are deterministic per request when
+    <code>sampling_seed</code> is set (<code>_seeded_verify_coins</code>: murmur_hash32 of
+    seed × seq_len × column). Either way, results are broadcast from TP rank 0 so
+    floating-point nondeterminism cannot make ranks diverge. For perf modeling,
+    <code>SGLANG_SIMULATE_ACC_LEN</code> (+ <code>SGLANG_SIMULATE_ACC_METHOD</code> /
+    <code>SGLANG_SIMULATE_ACC_TOKEN_MODE</code>) fabricates accept lengths via
+    <code>generate_simulated_accept_index</code>. On the greedy side, the kernel is
+    <code>verify_tree_greedy</code> from sgl_kernel with a Triton fallback
+    (<code>verify_tree_greedy_triton</code>, <code>eagle_utils.py:338</code>, dispatched by
+    <code>verify_tree_greedy_func</code>).
+  </p>
+  <p>
+    After acceptance, <code>_finalize_accept_tree_path</code>
+    (<code>eagle_worker_common.py:406</code>) compacts the accepted root-path — KV slots (via
+    <code>move_accept_tokens_to_target_kvcache</code>), <code>predict</code>, hidden states — to
+    the contiguous front of each request's 8-slot block, and
+    <code>_draft_extend_for_decode</code> re-seeds the drafter: the draft model has no KV for the
+    tokens the <em>target</em> just accepted, so a <code>DRAFT_EXTEND_V2</code> forward feeds them
+    (plus target hidden states) through the draft model, and
+    <code>select_index = arange(0, bs·8, 8) + accept_lens − 1</code>
+    (<code>eagle_worker_v2.py:846</code>) picks each request's last accepted row — its logits
+    become next round's <code>topk_p / topk_index</code>, its hidden state the next
+    <code>hidden_states</code>.
+  </p>
+
+  <h2><span class="sec-num">9.6</span>Scheduler integration: committing accepts</h2>
+
+  <div class="diagram">
+    <div class="dg-title">THE DECODE LOOP WITH SPECULATION (SCHEDULER SIDE)</div>
+    <pre class="mermaid">
+flowchart TB
+  prep["ScheduleBatch.prepare_for_decode<br/><i>schedule_batch.py:2949</i>"]
+  spd["spec_prepare_for_decode → eagle_prepare_for_decode<br/>alloc KV up to kv_committed_len + 2×reserve<br/><i>spec_utils.py:964 · eagle_utils.py:879</i>"]
+  run["Scheduler.run_batch →<br/>EAGLEWorkerV2.forward_batch_generation<br/>(draft → verify → draft-extend on GPU)"]
+  res["GenerationBatchResult<br/>next_token_ids · accept_lens (CPU)"]
+  resolve["_resolve_spec_v2_tokens<br/>slice accept_tokens per req<br/><i>batch_result_processor.py:624</i>"]
+  commit["req.kv_committed_len += num_accept_tokens<br/>req.spec_verify_ct += 1<br/>req.spec_num_correct_drafts += ..."]
+  metrics["update_spec_metrics<br/>spec_num_accept_tokens · spec_num_forward_ct<br/><i>metrics_reporter.py:356</i>"]
+  adapt["on_verify_complete_cpu →<br/>AdaptiveController"]
+  swap["apply_runtime_state(SpecRuntimeState)<br/>hot-swap num_steps / backends / graphs<br/>(steps=0 ⇒ plain decode)"]
+  prep --> spd --> run --> res --> resolve --> commit
+  commit --> metrics
+  commit --> adapt --> swap
+  swap -. "next iteration" .-> prep
+  style spd fill:#eef0ff,stroke:#4f46e5
+  style run fill:#e7f7ec,stroke:#16a34a
+  style swap fill:#fdf3e3,stroke:#d97706
+    </pre>
+    <div class="dg-caption">
+      <code>prepare_for_decode</code> short-circuits for spec:
+      <code>if not self.spec_algorithm.is_none(): spec_prepare_for_decode(self); return</code>
+      (<code>schedule_batch.py:2960</code>). EAGLE allocates KV per request up to
+      <code>kv_committed_len + 2 × get_alloc_reserve_per_decode()</code> rounded to page
+      boundaries — the "honest" <code>kv_committed_len</code> lags <code>seq_lens</code> by about
+      one verify under overlap, hence the double reserve. The adaptive controller is fed
+      <em>here</em>, from CPU accept counts, to avoid a GPU→CPU sync in the worker hot path.
+    </div>
+  </div>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/managers/scheduler_components/batch_result_processor.py:633" data-desc="_resolve_spec_v2_tokens — accept accounting (middle of loop elided)">
+<pre>
+next_token_ids = result.next_token_ids.tolist()
+accept_lens = result.accept_lens.tolist()
+result.num_correct_drafts = sum(accept_lens) - len(batch.reqs)
+result.num_correct_drafts_per_req_cpu = [x - 1 for x in accept_lens]
+...
+# Commit the full accepted run (drafts + bonus).
+num_accept_tokens = len(accept_tokens)
+req.kv_committed_len += num_accept_tokens
+req.spec_verify_ct += 1
+
+num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
+req.spec_num_correct_drafts += num_correct_drafts
+req.update_spec_correct_drafts_histogram(num_correct_drafts)
+</pre>
+  </div>
+
+  <p>
+    Each request's committed run is the slice
+    <code>next_token_ids[i·stride : i·stride + accept_lens[i]]</code>, where
+    <code>stride = result.speculative_num_draft_tokens</code> — recorded <em>on the result</em>
+    because adaptive spec may have hot-swapped step counts while this (possibly overlap-delayed)
+    result was in flight. Grammar-constrained requests re-truncate the accepted run through the
+    FSM (<code>_accept_grammar_tokens</code> / <code>advance_grammar_fsm</code>); grammar decoding
+    overlaps with the GPU draft phase via a scheduler grammar barrier
+    (<code>supports_grammar_overlap()</code> — true for EAGLE/STANDALONE/DFlash-family, false for
+    NGRAM, whose draft is host-side). Metrics accounting
+    (<code>metrics_reporter.py:766</code>) recovers both paper metrics from two accumulators:
+    τ = <code>spec_num_accept_tokens / spec_num_forward_ct</code> (bonus included), and
+    α = <code>(spec_num_accept_tokens − spec_num_forward_ct) / (spec_num_forward_ct × (num_draft_tokens − 1))</code>
+    (bonus excluded). Per request, <code>TokenizerManager</code> exposes
+    <code>meta_info["spec_accept_length"] = completion_tokens / spec_verify_ct</code>.
+  </p>
+
+  <div class="callout note"><span class="co-title">Adaptive speculation — including steps = 0</span>
+    With <code>--speculative-adaptive</code>, <code>AdaptiveController</code>
+    (<code>adaptive_runtime_state.py:61</code>) watches measured acceptance and batch size, and
+    <code>EAGLEWorkerV2.build_adaptive_runtime_state</code> / <code>apply_runtime_state</code>
+    hot-swap a pre-captured <code>SpecRuntimeState</code> — attention backends + CUDA graph
+    runners — per candidate step count. Distinctive to this repo:
+    <code>speculative_num_steps == 0</code> is a valid state that degenerates to plain decode via
+    <code>EAGLEWorkerV2._build_trivial_verify_input</code> (<code>eagle_worker_v2.py:1176</code>)
+    — a 1-node "tree" rooted at the previous bonus token — and by default still runs draft-extend
+    to keep the draft KV warm (<code>SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND</code> opts out).
+    Overlap scheduling relays draft state across iterations through a <code>FutureMap</code>
+    (<code>SpeculativeAlgorithm.create_future_map</code>), and the worker exposes
+    <code>war_fastpath_runner</code> — the step's last shared-buffer reader (the draft-extend
+    runner) — for the scheduler's write-after-read barrier.
+  </div>
+
+  <h2><span class="sec-num">9.7</span>dLLM: diffusion language models (<code>srt/dllm/</code>)</h2>
+  <p>
+    A completely different attack on the same bandwidth wall: <strong>block diffusion</strong>
+    models generate a whole block of tokens by iterative mask-denoising instead of one token per
+    forward. Enabled by <code>--dllm-algorithm &lt;Name&gt;</code> (+ optional
+    <code>--dllm-algorithm-config</code> YAML). <code>DllmConfig.from_server_args</code>
+    (<code>dllm/config.py</code>) hard-codes per-architecture block geometry:
+    <code>LLaDA2MoeModelLM</code> → block_size <b>32</b>, mask_id 156895;
+    <code>SDARForCausalLM</code> / <code>SDARMoeForCausalLM</code> → block_size <b>4</b>,
+    mask_id 151669. Each round appends a block of <code>[MASK]</code> tokens
+    (<code>ForwardMode.DLLM_EXTEND</code>, <code>forward_batch_info.py:122</code>) and denoises it.
+  </p>
+  <p>
+    Algorithms are auto-discovered by module scan (<code>algorithm/__init__.py</code>, keyed by
+    class name): <code>LowConfidence</code> unmasks every masked position whose argmax confidence
+    exceeds a threshold (default 0.95), falling back to the single most confident position when
+    nothing passes; <code>JointThreshold</code> is a vectorized variant that can also
+    <em>re-edit</em> already-unmasked tokens (<code>edit_threshold</code>, bounded by
+    <code>max_post_edit_steps</code>, with repetition penalty <code>penalty_lambda</code>).
+  </p>
+
+  <div class="stepper" id="st-dllm">
+    <div class="st-scene">
+      <div class="sc-row" style="gap:8px">
+        <div class="sc-box" id="dl-ext">DLLM_EXTEND<small>append block of [M]</small></div>
+        <div class="sc-box" id="dl-fwd">model forward<small>logits for all 8 positions</small></div>
+        <div class="sc-box" id="dl-step">LowConfidence.step()<small>threshold 0.95</small></div>
+        <div class="sc-box" id="dl-emit">FDFO emit<small>accept_length_per_req_cpu = block_size</small></div>
+      </div>
+      <div class="sc-row" style="margin-top:14px">
+        <span style="font-size:11px; color:#8b93a7; width:110px">prompt</span>
+        <span class="tok dim">Translate</span><span class="tok dim">to</span><span class="tok dim">French:</span>
+        <span class="tok dim">Good</span><span class="tok dim">morning</span><span class="tok dim">everyone</span>
+      </div>
+      <div class="sc-row">
+        <span style="font-size:11px; color:#8b93a7; width:110px">block (8 shown)</span>
+        <span class="tok free" id="dm-1">[M]</span>
+        <span class="tok free" id="dm-2">[M]</span>
+        <span class="tok free" id="dm-3">[M]</span>
+        <span class="tok free" id="dm-4">[M]</span>
+        <span class="tok free" id="dm-5">[M]</span>
+        <span class="tok free" id="dm-6">[M]</span>
+        <span class="tok free" id="dm-7">[M]</span>
+        <span class="tok free" id="dm-8">[M]</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/dllm/algorithm/low_confidence.py:32" data-desc="One denoise step: unmask above-threshold positions, else the single most confident one">
+<pre>
+x = torch.argmax(logits, dim=-1)
+probs = torch.nn.functional.softmax(logits, dim=-1)
+confidence = torch.gather(probs, dim=-1, index=x.unsqueeze(-1)).squeeze(-1)
+confidence = torch.where(block_mask_index, confidence, -float("inf"))
+
+transfer_index = confidence &gt; self.threshold
+has_transfer = transfer_index.sum(dim=1) &gt; 0
+top1_indices = torch.argmax(confidence, dim=1)
+batch_indices = torch.arange(batch_size, device=top1_indices.device)
+top1_mask = torch.zeros_like(transfer_index, dtype=torch.bool)
+top1_mask[batch_indices, top1_indices] = True
+transfer_index = torch.where(
+    has_transfer.unsqueeze(-1), transfer_index, top1_mask
+)
+</pre>
+  </div>
+
+  <div class="diagram">
+    <div class="dg-title">FDFO — FIRST-DONE-FIRST-OUT BLOCK SCHEDULING</div>
+    <pre class="mermaid">
+flowchart LR
+  blk["append [MASK] block<br/>ForwardMode.DLLM_EXTEND"]
+  fwd["model forward"]
+  st["algorithm.step()<br/>LowConfidence / JointThreshold<br/>writes tokens in place via<br/>input_ids.copy_ (CUDA-graph safe)"]
+  done{"block<br/>done?"}
+  emit["emit whole block<br/>accept_length_per_req_cpu = block_size<br/><i>dllm/algorithm/base.py:127</i>"]
+  carry["carry req.dllm_algo_state +<br/>req.dllm_incomplete_ids<br/>to the next scheduler round"]
+  blk --> fwd --> st --> done
+  done -- yes --> emit
+  done -- no --> carry
+  carry -. "one denoise step per round;<br/>other requests progress too" .-> fwd
+  style emit fill:#e7f7ec,stroke:#16a34a
+  style carry fill:#fdf3e3,stroke:#d97706
+    </pre>
+    <div class="dg-caption">
+      <code>DllmAlgorithm</code> (<code>dllm/algorithm/base.py:26</code>) owns two loops:
+      <code>_run_sync</code> iterates up to <code>max_steps = block_size + 1</code> until every
+      block resolves; <code>_run_fdfo</code> (<code>--dllm-fdfo</code>, on by default) runs exactly
+      <b>one</b> denoise step per scheduler round with per-request carried
+      <code>algo_states</code>, so fast requests are not held hostage by slow blocks in the same
+      batch. FDFO deliberately reuses the spec-decoding result contract
+      (<code>accept_length_per_req_cpu</code>: block_size on completion, else 0), so the
+      batch-result plumbing is shared. Scheduler side: <code>SchedulerDllmMixin</code>
+      (<code>dllm/mixin/scheduler.py:22</code>) + <code>DllmReqPhase</code> per-request phase
+      tracking.
+    </div>
+  </div>
+
+  <div class="callout warn"><span class="co-title">Don't confuse dLLM with "SGLang Diffusion"</span>
+    <code>python/sglang/multimodal_gen</code> is a separate subsystem — <em>SGLang Diffusion</em>,
+    an inference framework for accelerated <b>image/video generation</b> (Wan, FLUX, Qwen-Image,
+    Hunyuan3D, GLM-Image; entry point
+    <code>sglang.multimodal_gen.DiffGenerator.from_pretrained(...)</code>). It has its own
+    runtime, scheduler and OpenAI-compatible API and is unrelated to <code>srt/dllm/</code>
+    (diffusion <em>language</em> models) except in spirit. See chapter 12.
+  </div>
+
+  <h2><span class="sec-num">9.8</span>Batch overlap: TBO and SBO (<code>srt/batch_overlap/</code>)</h2>
+  <p>
+    Both target the MoE communication bottleneck in expert-parallel deployments: DeepEP
+    dispatch/combine all-to-alls leave the GPU idle while traffic is in flight.
+    <strong>Two-Batch Overlap</strong> (<code>--enable-two-batch-overlap</code>) splits one
+    <code>ForwardBatch</code> into two micro-batches ("child a" / "child b") and interleaves
+    their layer stages: while A waits on its all-to-all, B computes.
+    <code>compute_split_seq_index</code> (<code>two_batch_overlap.py:78</code>) picks the
+    <code>tbo_split_seq_index</code>: decode and target-verify batches split at half the requests
+    (<code>(num_tokens // token_num_per_seq) // 2</code>, where target-verify uses
+    <code>spec_info.draft_token_num</code> per seq — TBO composes with EAGLE, and
+    <code>split_spec_info</code> slices the <code>EagleVerifyInput</code> per child); extend
+    batches split by balanced token sum, with a "two-chunk" mode that cuts one sequence across
+    both children when the distribution is too skewed
+    (<code>--tbo-token-distribution-threshold</code>, default 0.48).
+  </p>
+  <p>
+    Execution: models call <code>model_forward_maybe_tbo</code>;
+    <code>OperationsStrategy.init_new_tbo</code> (<code>operations_strategy.py:34</code>) compiles
+    each decoder layer (DeepseekV2 / Qwen3-MoE / DeepseekV4 families) into an ordered op list —
+    e.g. <code>op_comm_prepare_attn, self_attn.op_prepare, self_attn.op_core,
+    op_comm_prepare_mlp, mlp.op_gate, op_select_experts, op_dispatch_a, YieldOperation(),
+    op_dispatch_b, op_experts, op_combine_a, YieldOperation(), op_shared_experts, op_combine_b,
+    op_output, op_comm_postprocess_layer</code> — and
+    <code>execute_overlapped_operations</code> runs two <code>_StageExecutor</code>s offset by
+    <code>tbo_delta_stages</code> (0 for prefill, 2 for decode), ping-ponging at every
+    <code>YieldOperation</code>: cooperative coroutine scheduling of two micro-batches on one
+    stream, with <code>deep_gemm_num_sms</code> reserving SMs for compute while DeepEP owns the
+    rest.
+  </p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/batch_overlap/operations.py:57" data-desc="The TBO interleave: two executors, offset by delta_stage, ping-pong at YieldOperations">
+<pre>
+executor_a = _StageExecutor("a", stages_a, inputs=inputs_a, child_ctx=child_ctx_a)
+executor_b = _StageExecutor("b", stages_b, inputs=inputs_b, child_ctx=child_ctx_b)
+
+for _ in range(delta_stage):
+    executor_a.next()
+
+for _ in range(executor_a.num_stages - delta_stage):
+    executor_a.next()
+    executor_b.next()
+
+for _ in range(delta_stage):
+    executor_b.next()
+
+assert executor_a.done and executor_b.done
+return [executor_a.output, executor_b.output]
+</pre>
+  </div>
+
+  <div class="diagram">
+    <div class="dg-title">TBO TIMELINE — HIDING DEEPEP ALL-TO-ALL BEHIND THE OTHER MICRO-BATCH</div>
+    <pre class="mermaid">
+flowchart TB
+  fb["ForwardBatch (e.g. 16 decode reqs)"]
+  split["compute_split_seq_index → 8 + 8<br/><i>two_batch_overlap.py:78</i>"]
+  a1["a: attn · op_gate ·<br/>op_select_experts · op_dispatch_a (send)"]
+  y1["YieldOperation → switch to b<br/>(a's all-to-all in flight)"]
+  b1["b: attn · op_gate ·<br/>op_select_experts · op_dispatch_a (send)"]
+  a2["a: op_dispatch_b (recv) ·<br/>op_experts · op_combine_a (send)"]
+  y2["YieldOperation → switch to b<br/>(a's combine in flight)"]
+  b2["b: op_dispatch_b · op_experts ·<br/>op_combine_a"]
+  a3["a: op_shared_experts ·<br/>op_combine_b · op_output"]
+  merge["merge child outputs → next layer"]
+  fb --> split
+  split --> a1 --> y1 --> b1 --> a2 --> y2 --> b2 --> a3 --> merge
+  style a1 fill:#eef0ff,stroke:#4f46e5
+  style a2 fill:#eef0ff,stroke:#4f46e5
+  style a3 fill:#eef0ff,stroke:#4f46e5
+  style b1 fill:#e7f7ec,stroke:#16a34a
+  style b2 fill:#e7f7ec,stroke:#16a34a
+  style y1 fill:#fdf3e3,stroke:#d97706
+  style y2 fill:#fdf3e3,stroke:#d97706
+    </pre>
+    <div class="dg-caption">
+      Helper classes: <code>TboCudaGraphRunnerPlugin</code>, <code>TboDPAttentionPreparer</code>,
+      <code>TboForwardBatchPreparer</code>, <code>MaybeTboDeepEPDispatcher</code>; per-child
+      attention metadata comes from <code>TboAttnBackend.children</code>
+      (<code>layers/attention/tbo_backend.py</code>).
+      <b>Single-Batch Overlap</b> (<code>--enable-single-batch-overlap</code>,
+      <code>single_batch_overlap.py</code>) overlaps <em>within</em> one batch on two CUDA
+      streams instead: <code>SboFlags.enable_combine_down_gemm_two_stream_overlap()</code> starts
+      the DeepEP combine send on an alternate stream while the experts' down-GEMM is still
+      running, synchronized by a per-expert block-count <code>signal</code> tensor and
+      <code>wait_event</code> (<code>CombineOverlapArgs</code> / <code>DownGemmOverlapArgs</code>,
+      built in <code>compute_overlap_args</code>); dispatch/combine can also hide the
+      shared-experts GEMM (backend-gated: flashinfer-cutedsl or deep_gemm).
+    </div>
+  </div>
+
+  <h2><span class="sec-num">9.9</span>Flags &amp; notable facts</h2>
+
+  <table class="tbl">
+    <tr><th>Flag (<code>server_args.py:1996+</code>)</th><th>Meaning</th></tr>
+    <tr><td><code>--speculative-algorithm</code></td><td>"Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH, DSPARK. Or any name registered via <code>SpeculativeAlgorithm.register</code>." NEXTN normalizes to EAGLE (Gemma4 drafts: → FROZEN_KV_MTP).</td></tr>
+    <tr><td><code>--speculative-draft-model-path</code> / <code>-revision</code> / <code>--speculative-draft-load-format</code> / <code>-quantization</code></td><td>Draft checkpoint; DeepSeek MTP needs none (embedded weights).</td></tr>
+    <tr><td><code>--speculative-num-steps</code></td><td>Draft loop depth (auto: 5 Llama / 3 DeepSeek-family). Costs <code>num_steps − 1</code> draft forwards per iteration.</td></tr>
+    <tr><td><code>--speculative-eagle-topk</code></td><td>Branching per step (auto 4 / 1). topk=1 ⇒ chain fast path; several features (rejection sampling, GDN replay verify) require it.</td></tr>
+    <tr><td><code>--speculative-num-draft-tokens</code></td><td>Verify-tree size <em>including</em> the bonus root (auto 8 / 4).</td></tr>
+    <tr><td><code>--speculative-accept-threshold-single</code> / <code>-acc</code></td><td>Threshold-acceptance knobs fed to <code>tree_speculative_sampling_target_only</code> (both default 1.0 = lossless).</td></tr>
+    <tr><td><code>--speculative-use-rejection-sampling</code></td><td>True rejection sampling with recorded <code>draft_probs</code>; topk=1, EAGLE/EAGLE3 only, incompatible with the threshold knobs.</td></tr>
+    <tr><td><code>--speculative-token-map</code></td><td>Hot-token (reduced draft vocab) table; EAGLE3 checkpoints ship their own.</td></tr>
+    <tr><td><code>--speculative-attention-mode {prefill,decode}</code></td><td>Attention-backend flavor for target-verify + draft-extend.</td></tr>
+    <tr><td><code>--speculative-adaptive</code> (+ <code>-config</code>)</td><td>Runtime step switching via <code>AdaptiveController</code>; steps may drop to 0 = plain decode at high batch size.</td></tr>
+    <tr><td><code>--enable-multi-layer-eagle</code></td><td><code>MultiLayerEagleWorkerV2</code> — per-step draft runner list.</td></tr>
+    <tr><td><code>--speculative-ngram-*</code></td><td>NGRAM tuning (bfs breadth, match type BFS/PROB, trie depth, capacity, external corpus path/budget).</td></tr>
+    <tr><td><code>--speculative-dflash-block-size</code>, <code>--speculative-dspark-block-size</code></td><td>DFlash/DSpark block drafting; DSpark adds ragged verify (SPS/STS tables, graph-tier alignment).</td></tr>
+    <tr><td><code>--decoupled-spec-role</code> / <code>-rank</code> / <code>-bind-endpoint</code> / <code>-connect-endpoints</code></td><td>Decoupled drafter/verifier engines over ZMQ (<code>decoupled_spec_io.py</code>: <code>DraftSync</code>, <code>VerifyCommit</code>, …).</td></tr>
+    <tr><td><code>--dllm-algorithm</code>, <code>--dllm-algorithm-config</code>, <code>--dllm-fdfo</code></td><td>Diffusion-LM decoding (LowConfidence / JointThreshold; FDFO default on).</td></tr>
+    <tr><td><code>--enable-two-batch-overlap</code>, <code>--enable-single-batch-overlap</code>, <code>--tbo-token-distribution-threshold</code></td><td>TBO / SBO; threshold (default 0.48) triggers the two-chunk extend split.</td></tr>
+  </table>
+
+  <h3>Notable facts &amp; gotchas</h3>
+  <div class="card">
+    <ul>
+      <li><b>Draft cost is <code>num_steps − 1</code> forwards, not <code>num_steps</code>:</b>
+        the first frontier comes free from draft-extend logits (the <code>break</code> in
+        <code>eagle_worker_v2.py:597</code>).</li>
+      <li><b><code>accept_lens</code> includes the bonus; <code>num_correct_drafts</code> does
+        not.</b> Kernels count drafts only (frozen sgl_kernel kwarg
+        <code>accept_token_num</code>); <code>eagle_sample</code> returns
+        <code>num_correct_drafts + 1</code>; the scheduler recovers per-request correct drafts as
+        <code>accept_lens[i] − 1</code>.</li>
+      <li><b>Sampling verify broadcasts <code>predict / accept_index / num_correct_drafts</code>
+        from TP rank 0</b> to prevent cross-rank divergence from floating-point nondeterminism
+        (<code>eagle_utils.py:828</code>).</li>
+      <li><b>TARGET_VERIFY reuses the <em>decode</em> CUDA graph family</b> — it is "essentially a
+        fixed sequence length prefill/extend with full cuda graph support"
+        (<code>spec_info.py:226</code>), bucketed on <code>bs × num_draft_tokens</code>
+        tokens.</li>
+      <li><b>Grammar decoding overlaps with drafting</b> via a scheduler grammar barrier; the FSM
+        advances inside verify and any post-terminal accepted suffix is retro-truncated on the CPU
+        side.</li>
+      <li><b>Adaptive spec pre-captures a <code>SpecRuntimeState</code> per candidate step
+        count</b> and hot-swaps backends + graphs; steps=0 still runs draft-extend by default to
+        keep draft KV warm (<code>SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND</code> opts out).</li>
+      <li><b><code>page_size &gt; 1</code> with <code>topk &gt; 1</code></b> needs per-branch
+        page-aligned draft regions and duplication of the prefix tail page into each branch
+        (<code>duplicate_prefix_tail_to_draft_branches</code>,
+        <code>eagle_worker_common.py:58</code>).</li>
+      <li><b>dLLM FDFO speaks the spec-decoding scheduler contract</b>
+        (<code>accept_length_per_req_cpu</code> = block_size or 0), so batch-result plumbing is
+        shared between EAGLE and diffusion blocks.</li>
+      <li><b>TBO's split point is spec-aware</b> (<code>get_token_num_per_seq</code> returns
+        <code>spec_info.draft_token_num</code> for target-verify), so EAGLE verify batches split
+        evenly by request across the two micro-batches; DSpark adds per-request
+        <em>ragged</em> verify lengths (<code>RaggedVerifyMode</code> cap-accept / compact) with
+        its own <code>spec_block_accept_length</code> metric.</li>
+      <li><b>There is no V1 EAGLE worker.</b> EAGLE / EAGLE3 / STANDALONE / MTP always instantiate
+        the V2 worker; with overlap disabled the scheduler simply drives it synchronously
+        (<code>spec_info.py:278</code>).</li>
+    </ul>
+  </div>
+
+  <div id="pager"></div>
+  </div>
+</main>
+</div>
+
+<script>
+document.addEventListener("DOMContentLoaded", () => {
+
+  new Stepper("#st-eagle", {
+    title: "One EAGLE iteration: steps=3, topk=4, num_draft_tokens=8",
+    intro: "Committed so far: \"… The capital of France is\" + bonus token \"Paris\". Numbers on chips are joint (cumulative path) probabilities.",
+    autoMs: 3600,
+    reset(sc) {
+      clearState(sc, ".sc-box,.tok");
+      rmCls(sc, ".appear", "in");
+    },
+    steps: [
+      { cap: "Carried state from last iteration's draft-extend: <code>batch.spec_info</code> is an <code>EagleDraftInput</code> with <code>topk_p / topk_index (bs,4)</code> — the draft head's top-4 proposals — <code>hidden_states</code> of the last accepted token, and <code>bonus_tokens = [\"Paris\"]</code>, the target's +1 prediction that becomes this iteration's tree root.",
+        run(sc) { setCls(sc, "#eg-di", "hl", "pulse"); setCls(sc, "#eg-root", "cache", "pulse"); } },
+      { cap: "<code>prepare_for_draft</code> (<code>eagle_worker_common.py:212</code>) allocates <code>bs × topk × num_steps = 12</code> draft-KV slots per request (<code>assign_draft_cache_locs_contiguous</code>) and builds a ForwardBatch with <code>num_tokens_per_req = topk</code>.",
+        run(sc) { rmCls(sc, "#eg-di,#eg-root", "pulse"); setCls(sc, "#eg-prep", "hl"); } },
+      { cap: "Step i=0: <code>_select_top_k_tokens_first</code> flattens the 4 carried candidates into <code>input_ids</code> — no forward needed for these scores. Frontier: <code>\",\"</code> .55, <code>\".\"</code> .20, <code>\"is\"</code> .15, <code>\"and\"</code> .05. Parents recorded as <code>arange(-1, 4)</code> (−1 = root).",
+        run(sc) { rmCls(sc, "#eg-prep", "hl"); setCls(sc, "#eg-d1a,#eg-d1b,#eg-d1c,#eg-d1d", "in", "hl"); } },
+      { cap: "Draft forward #1 over the 4 frontier tokens (each step has its own backend: <code>draft_attn_backend.attn_backends[i]</code>). At i=1, <code>_select_top_k_tokens_later</code> forms 16 joint-probability candidates — <code>expand_scores = scores.unsqueeze(2) * topk_p.view(-1, topk, topk)</code> — and keeps the global top-4: <code>\"the\"</code> .55×.50=.275, <code>\"It\"</code> .20×.60=.12, <code>\"which\"</code> .55×.20=.11, <code>\"a\"</code> .55×.10=.055.",
+        run(sc) { rmCls(sc, "#eg-d1a,#eg-d1b,#eg-d1c,#eg-d1d", "hl"); setCls(sc, "#eg-fwd", "hl"); setCls(sc, "#eg-d2a,#eg-d2b,#eg-d2c,#eg-d2d", "in", "hl"); } },
+      { cap: "Draft forward #2, then at i=2 another top-4 selection (<code>\"capital\"</code> .275×.70≈.19 leads) — and the loop <code>break</code>s <i>before</i> a third forward (<code>eagle_worker_v2.py:597</code>). Total: 2 draft forwards for steps=3. Candidate pool now 4 + 16 + 16 = 36 scored nodes.",
+        run(sc) { rmCls(sc, "#eg-d2a,#eg-d2b,#eg-d2c,#eg-d2d", "hl"); setCls(sc, "#eg-fwd", "ok"); setCls(sc, "#eg-d3a,#eg-d3b,#eg-d3c,#eg-d3d", "in", "hl"); } },
+      { cap: "<code>organize_draft_results</code> takes <code>torch.topk(score_list, num_draft_token − 1 = 7)</code> over all 36, sorts indices, gathers the winners + <code>parent_list</code>. Picked: \",\" \".\" \"is\" \"the\" \"which\" \"It\" \"capital\". Losers (\"and\" .05, \"a\" .055, \"largest\", \"city\", \"'s\", …) are dropped.",
+        run(sc) { rmCls(sc, "#eg-d3a,#eg-d3b,#eg-d3c,#eg-d3d", "hl"); setCls(sc, "#eg-org", "hl");
+                  setCls(sc, "#eg-d1a,#eg-d1b,#eg-d1c,#eg-d2a,#eg-d2b,#eg-d2c,#eg-d3a", "hl");
+                  setCls(sc, "#eg-d1d,#eg-d2d,#eg-d3b,#eg-d3c,#eg-d3d", "dim"); } },
+      { cap: "<code>build_tree_kernel_efficient</code> prepends the bonus as root — <code>draft_tokens = cat((bonus_tokens.unsqueeze(1), draft_tokens), dim=1)</code> — so exactly 8 tokens verify per request, and emits <code>tree_mask</code>, <code>positions</code>, and the first-child/next-sibling arrays <code>retrieve_index / retrieve_next_token / retrieve_next_sibling</code>.",
+        run(sc) { rmCls(sc, "#eg-org", "hl"); setCls(sc, "#eg-tree", "hl"); setCls(sc, "#eg-root", "cache", "pulse"); } },
+      { cap: "<code>run_eagle_verify</code>: <code>eagle_prepare_for_verify</code> assigns 8 KV slots past <code>seq_lens</code> and flips <code>forward_mode = TARGET_VERIFY</code>; the target runs ONE extend-like forward over all 8 positions, the attention backend applying <code>custom_mask</code> so each node attends only to its root path. Fixed width ⇒ replays through the decode CUDA graph.",
+        run(sc) { rmCls(sc, "#eg-tree", "hl"); rmCls(sc, "#eg-root", "pulse"); setCls(sc, "#eg-vfy", "hl", "pulse");
+                  setCls(sc, "#eg-d1a,#eg-d1b,#eg-d1c,#eg-d2a,#eg-d2b,#eg-d2c,#eg-d3a", "hl"); } },
+      { cap: "<code>verify_tree_greedy</code> walks the tree. Target argmax at root \"Paris\" is \",\" → child matches, descend. At \",\" target says \"the\" → match. At \"the\" target says \"capital\" → match. \"capital\" is a leaf → stop. Rejected branches: \".\", \"is\", \"which\", \"It\".",
+        run(sc) { rmCls(sc, "#eg-vfy", "pulse"); setCls(sc, "#eg-vfy", "ok");
+                  rmCls(sc, "#eg-d1a,#eg-d1b,#eg-d1c,#eg-d2a,#eg-d2b,#eg-d2c,#eg-d3a", "hl");
+                  setCls(sc, "#eg-d1a,#eg-d2a,#eg-d3a", "ok");
+                  setCls(sc, "#eg-d1b,#eg-d1c,#eg-d2b,#eg-d2c", "bad"); } },
+      { cap: "Accept: <code>num_correct_drafts = 3</code>, and the target's prediction at \"capital\" — <code>\"of\"</code> — is the new <b>bonus token</b>, so <code>accept_lens = num_correct_drafts + 1 = 4</code>. Four tokens commit: <code>\",\" \"the\" \"capital\" \"of\"</code>. <code>_finalize_accept_tree_path</code> compacts the accepted path's KV to the front of the 8-slot block.",
+        run(sc) { setCls(sc, "#eg-c1,#eg-c2,#eg-c3", "in", "ok"); setCls(sc, "#eg-c4", "in", "cache", "pulse"); } },
+      { cap: "<code>DRAFT_EXTEND_V2</code>: the draft model has no KV for the tokens the <i>target</i> just accepted, so <code>_draft_extend_for_decode</code> feeds them (+ target hidden states) through the draft model; <code>select_index = arange(0, bs·8, 8) + accept_lens − 1</code> picks the last accepted row, whose logits become the next iteration's <code>topk_p / topk_index</code> — and \"of\" is the next tree root. Repeat.",
+        run(sc) { rmCls(sc, "#eg-c4", "pulse"); setCls(sc, "#eg-ext", "ok", "pulse"); setCls(sc, "#eg-di", "ok"); } },
+    ],
+  });
+
+  const DLLM_IDS = ["#dm-1","#dm-2","#dm-3","#dm-4","#dm-5","#dm-6","#dm-7","#dm-8"];
+  new Stepper("#st-dllm", {
+    title: "dLLM block denoising with LowConfidence (threshold 0.95)",
+    intro: "8 masked positions shown for readability — real blocks are 32 (LLaDA2MoeModelLM) or 4 (SDAR). Target output: \"Bon jour , tout le monde ! </s>\".",
+    autoMs: 3400,
+    reset(sc) {
+      clearState(sc, ".sc-box,.tok");
+      rmCls(sc, ".appear", "in");
+      for (const id of DLLM_IDS) { setText(sc, id, "[M]"); setCls(sc, id, "free"); }
+    },
+    steps: [
+      { cap: "A block of <code>block_size</code> <code>[MASK]</code> tokens (id from <code>DllmConfig</code>, e.g. 156895 for LLaDA2) is appended under <code>ForwardMode.DLLM_EXTEND</code>.",
+        run(sc) { setCls(sc, "#dl-ext", "hl"); } },
+      { cap: "Round 1 forward: logits for every position at once. Argmax confidences: Bon <b>.99</b>, jour .85, \",\" <b>.97</b>, tout .40, le .60, monde .30, \"!\" <b>.96</b>, &lt;/s&gt; <b>.98</b>. Four positions clear the 0.95 threshold.",
+        run(sc) { rmCls(sc, "#dl-ext", "hl"); setCls(sc, "#dl-fwd", "hl"); setCls(sc, "#dm-1,#dm-3,#dm-7,#dm-8", "hl"); } },
+      { cap: "<code>step()</code> unmasks them in place (<code>forward_batch.input_ids.copy_(...)</code> — tensor identity preserved for CUDA-graph safety). The rest stay masked.",
+        run(sc) { setCls(sc, "#dl-step", "hl");
+                  for (const [id, t] of [["#dm-1","Bon"],["#dm-3","“,”"],["#dm-7","“!”"],["#dm-8","</s>"]]) setText(sc, id, t);
+                  rmCls(sc, "#dm-1,#dm-3,#dm-7,#dm-8", "free"); rmCls(sc, "#dm-1,#dm-3,#dm-7,#dm-8", "hl");
+                  setCls(sc, "#dm-1,#dm-3,#dm-7,#dm-8", "ok"); } },
+      { cap: "Round 2: with real neighbors as context, confidence sharpens — jour <b>.99</b>, le <b>.96</b> pass; tout .80, monde .70 don't.",
+        run(sc) { setText(sc, "#dm-2", "jour"); setText(sc, "#dm-5", "le");
+                  rmCls(sc, "#dm-2,#dm-5", "free"); setCls(sc, "#dm-2,#dm-5", "ok"); } },
+      { cap: "Round 3: tout <b>.97</b> passes; monde reaches only .93 — but nothing else is masked… still below threshold, so it stays.",
+        run(sc) { setText(sc, "#dm-4", "tout"); rmCls(sc, "#dm-4", "free"); setCls(sc, "#dm-4", "ok"); setCls(sc, "#dm-6", "warn"); } },
+      { cap: "Round 4: monde peaks at .94 — no position clears 0.95, so the <b>fallback</b> fires: <code>LowConfidence</code> always unmasks at least the single most confident masked position (<code>top1_mask</code> branch in the snippet below).",
+        run(sc) { setText(sc, "#dm-6", "monde"); rmCls(sc, "#dm-6", "free"); rmCls(sc, "#dm-6", "warn"); setCls(sc, "#dm-6", "ok"); } },
+      { cap: "Block done after 4 rounds (bound: <code>max_steps = block_size + 1</code>). Under FDFO the whole block is emitted <i>now</i> — <code>accept_length_per_req_cpu = [8]</code> — while unfinished requests in the same batch carry <code>dllm_algo_state</code> into the next scheduler round.",
+        run(sc) { rmCls(sc, "#dl-fwd,#dl-step", "hl"); setCls(sc, "#dl-emit", "ok", "pulse");
+                  setCls(sc, "#dm-1,#dm-2,#dm-3,#dm-4,#dm-5,#dm-6,#dm-7,#dm-8", "ok"); } },
+    ],
+  });
+
+});
+</script>
+</body>
+</html>

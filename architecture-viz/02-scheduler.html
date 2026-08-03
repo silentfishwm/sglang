@@ -197,7 +197,7 @@ stateDiagram-v2
   CHUNKED --> CHUNKED : stash chunk KV, add_chunked_req()
   CHUNKED --> EXTEND : final chunk fits
   EXTEND --> DECODE : merge_batch() into running_batch
-  DECODE --> DECODE : prepare_for_decode()
+  DECODE --> DECODE : +1 token
   DECODE --> QUEUED : retract_decode() + reset_for_retract()
   DECODE --> FINISHED : update_finish_state() sets FINISH_*
   QUEUED --> FINISHED : abort / queue timeout

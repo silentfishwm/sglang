@@ -620,7 +620,7 @@ class HookType(Enum):
     <tr><td><code>lang/</code>, <code>cli/</code>, <code>launch_server.py</code>, <code>global_config.py</code></td><td>The frontend DSL (<code>sgl.function</code>, chained generation) and the <code>sglang serve</code> CLI.</td><td>11</td></tr>
     <tr><td><code>bench_serving.py</code>, <code>bench_offline_throughput.py</code>, <code>bench_one_batch.py</code>, <code>bench_one_batch_server.py</code>, <code>benchmark/</code>, <code>eval/</code>, <code>test/</code></td><td>Benchmark and evaluation harness — the standard tools for measuring any change.</td><td>11</td></tr>
     <tr><td><code>multimodal_gen/</code></td><td>"SGLang Diffusion": separate image/video generation framework (Wan, FLUX, Qwen-Image).</td><td>12 (§12.6)</td></tr>
-    <tr><td><code>kernels/</code>, <code>compile_deep_gemm.py</code>, <code>check_env.py</code>, <code>profiler.py</code>, <code>kernel_api_logging.py</code>, <code>utils.py</code>, <code>version.py</code></td><td>JIT kernels + operational tooling (environment doctor, remote profiler client, kernel-call logging).</td><td>06, 12</td></tr>
+    <tr><td><code>kernels/</code>, <code>compile_deep_gemm.py</code>, <code>check_env.py</code>, <code>profiler.py</code>, <code>kernel_api_logging.py</code>, <code>utils.py</code>, <code>version.py</code></td><td>JIT kernels + operational tooling (environment doctor, remote profiler client, kernel-call logging). Plus two internal import shims, <code>_mps_stub.py</code> and <code>_triton_stub.py</code>.</td><td>06, 12</td></tr>
   </table>
 
   <div class="callout note"><span class="co-title">Outside <code>python/</code></span>
