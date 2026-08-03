@@ -163,7 +163,7 @@ A: Rome
     s += "Q: " + question + "\n"
     s += "A:" + sgl.gen("answer", stop="\n", temperature=0)
 
-# --- from __main__ (line 55) ---
+# --- setup from __main__ (line 55); run call from single() at line 24 ---
 runtime = sgl.Runtime(model_path="meta-llama/Llama-2-7b-chat-hf")
 sgl.set_default_backend(runtime)
 state = few_shot_qa.run(question="What is the capital of the United States?")
