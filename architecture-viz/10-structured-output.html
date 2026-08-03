@@ -1,0 +1,746 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10 · Sampling, Grammar &amp; Function Calling — SGLang Internals</title>
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/mermaid.min.js"></script>
+<script src="assets/viz.js"></script>
+</head>
+<body>
+<div class="layout">
+<main>
+  <div class="page-hero"><div class="content">
+    <span class="phase-badge">Phase V · Advanced Inference</span>
+    <h1>10 · Controlling the Output: Sampling, Constrained Decoding &amp; Tool Calls</h1>
+    <p class="lede">
+      A language model gives you a probability distribution over ~150k tokens, once per step.
+      Everything an inference server does to <em>shape</em> that distribution — temperature,
+      penalties, JSON-schema grammars, tool-call formats — happens in a few hundred microseconds
+      between the last matmul and the sampling kernel. This chapter follows the logits from
+      <code>SamplingParams</code> through penalties and grammar bitmasks to the sampler, then up
+      through the OpenAI-compatible layer where tool calls and reasoning tags are parsed back out.
+    </p>
+  </div></div>
+
+  <div class="content">
+
+  <h2><span class="sec-num">10.1</span>The sampling pipeline, end to end</h2>
+  <p>
+    Every request carries a <code>SamplingParams</code> — a
+    <code>msgspec.Struct, kw_only=True, array_like=True</code>
+    (<code>python/sglang/srt/sampling/sampling_params.py:45</code>), not a pydantic model:
+    it is serialized over ZMQ for every request, so it uses the fastest struct library available.
+    The key fields and their defaults:
+  </p>
+
+  <table class="tbl">
+    <tr><th>Field</th><th>Default</th><th>Notes</th></tr>
+    <tr><td><code>temperature</code></td><td><code>1.0</code></td><td><code>&lt; 1e-6</code> is rewritten to greedy: <code>temperature=1.0, top_k=1</code> in <code>__post_init__</code></td></tr>
+    <tr><td><code>top_p</code> / <code>min_p</code></td><td><code>1.0</code> / <code>0.0</code></td><td>verified in <code>(0,1]</code> / <code>[0,1]</code></td></tr>
+    <tr><td><code>top_k</code></td><td><code>TOP_K_ALL = 1 &lt;&lt; 30</code></td><td><code>-1</code> means whole vocabulary and is normalized to <code>TOP_K_ALL</code></td></tr>
+    <tr><td><code>frequency_penalty</code> / <code>presence_penalty</code></td><td><code>0.0</code></td><td>additive, range <code>[-2, 2]</code></td></tr>
+    <tr><td><code>repetition_penalty</code></td><td><code>1.0</code></td><td><b>multiplicative</b>, range <code>(0, 2]</code></td></tr>
+    <tr><td><code>min_new_tokens</code></td><td><code>0</code></td><td>bans EOS/stop tokens until the length is reached</td></tr>
+    <tr><td><code>json_schema</code> / <code>regex</code> / <code>ebnf</code> / <code>structural_tag</code></td><td><code>None</code></td><td>mutually exclusive — at most one may be set</td></tr>
+    <tr><td><code>logit_bias</code></td><td><code>None</code></td><td>dict <code>{token_id: bias}</code>, keys checked against vocab size</td></tr>
+    <tr><td><code>sampling_seed</code> / <code>custom_params</code></td><td><code>None</code></td><td>seed only used under deterministic inference; <code>custom_params</code> feeds custom logit processors and thinking budgets</td></tr>
+  </table>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/sampling/sampling_params.py:201" data-desc="verify(): the four grammar constraints are mutually exclusive">
+<pre>
+        grammars = [
+            self.json_schema,
+            self.regex,
+            self.ebnf,
+            self.structural_tag,
+        ]  # since mutually exclusive, only one can be set
+        if sum(x is not None for x in grammars) &gt; 1:
+            raise ValueError(
+                "Only one of json_schema, regex, ebnf, or structural_tag can be set."
+            )
+</pre>
+  </div>
+
+  <p>
+    Per-request params are useless to a GPU; the scheduler batches them.
+    <code>SamplingBatchInfo.from_schedule_batch</code>
+    (<code>python/sglang/srt/sampling/sampling_batch_info.py:86</code>) builds pinned-memory
+    tensors — <code>temperatures (B,1)</code>, <code>top_ps</code>, <code>top_ks (int32)</code>,
+    <code>min_ps</code> — plus fast-path flags (<code>is_all_greedy</code> = all
+    <code>top_k &lt;= 1</code>, <code>need_top_p_sampling</code>, <code>need_top_k_sampling</code>,
+    <code>need_min_p_sampling</code>), a dense <code>(B, V)</code> <code>logit_bias</code> tensor only
+    if any request set one, and custom logit processors deduped by their serialized string with a
+    boolean row mask each. As continuous batching adds and removes requests (chapter 02),
+    <code>merge_batch</code> / <code>filter_batch</code> concatenate / index the same tensors so
+    row <i>i</i> always matches request <i>i</i>.
+  </p>
+
+  <div class="callout note"><span class="co-title">Exactly four penalizers, lazily materialized</span>
+    <code>BatchedPenalizerOrchestrator</code> is always constructed with all four penalizer classes
+    from <code>python/sglang/srt/sampling/penaltylib/</code> — frequency, presence, repetition,
+    min_new_tokens — but each self-gates via <code>_is_required()</code> (e.g. any
+    <code>frequency_penalty != 0.0</code> in the batch), so an unpenalized batch pays only for the
+    checks. Frequency/presence are additive with <code>scatter_add_</code>-accumulated counts;
+    min_new_tokens adds <code>-inf</code> on stop tokens; repetition is the only multiplicative
+    one. For the overlap scheduler, <code>copy_for_forward()</code> snapshots penalties into
+    <code>acc_additive_penalties</code> / <code>acc_scaling_penalties</code> tensors and drops the
+    orchestrator, which only holds a weakref to the batch
+    (<code>sampling_batch_info.py:454</code>).
+  </div>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/sampling/penaltylib/repetition_penalty.py:9" data-desc="Repetition penalty is multiplicative and sign-aware (torch.compiled)">
+<pre>
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+def apply_scaling_penalties(logits, scaling_penalties):
+    logits[:] = torch.where(
+        logits &lt; 0,
+        logits * scaling_penalties,
+        logits / scaling_penalties,
+    )
+</pre>
+  </div>
+
+  <p>The exact application order lives in one function:</p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/sampling/sampling_batch_info.py:284" data-desc="apply_logits_bias(): penalties → grammar mask → logit_bias (comments trimmed)">
+<pre>
+    def apply_logits_bias(self, logits: torch.Tensor):
+        if self.acc_additive_penalties is not None:
+            logits.add_(self.acc_additive_penalties)
+
+        if self.acc_scaling_penalties is not None:
+            apply_scaling_penalties(logits, self.acc_scaling_penalties)
+
+        if self.penalizer_orchestrator and self.penalizer_orchestrator.is_required:
+            self.penalizer_orchestrator.apply(logits)
+
+        if self.grammar_mask is not None:
+            self.grammar_mask.apply(logits)
+
+        if self.logit_bias is not None:
+            logits.add_(self.logit_bias)
+</pre>
+  </div>
+
+  <div class="diagram">
+    <div class="dg-title">Logits post-processing pipeline (one decode step)</div>
+    <pre class="mermaid">
+flowchart LR
+  sp["SamplingParams<br/><i>sampling_params.py</i><br/>per-request msgspec.Struct"] --> sbi["SamplingBatchInfo<br/><i>sampling_batch_info.py</i><br/>batched tensors, merged/filtered<br/>with continuous batching"]
+  sbi --> pen["Penalties<br/>frequency + presence (additive)<br/>repetition (multiplicative)<br/>min_new_tokens (-inf on stops)"]
+  pen --> gm["Grammar bitmask<br/>grammar_mask.apply(logits)<br/>banned tokens → -inf"]
+  gm --> lb["logit_bias<br/>logits.add_(logit_bias)"]
+  lb --> clp["Custom logit processors<br/>+ NaN sanitize<br/><i>layers/sampler.py</i>"]
+  clp --> dec{"is_all_greedy?"}
+  dec -->|"yes"| am["torch.argmax"]
+  dec -->|"no"| tp["divide by temperature →<br/>top-k · top-p · min-p sampling"]
+  style pen fill:#fdf3e3,stroke:#d97706
+  style gm fill:#f5ecfe,stroke:#9333ea
+  style clp fill:#eef0ff,stroke:#4f46e5
+    </pre>
+    <div class="dg-caption">
+      Steps 1–3 run in <code>SamplingBatchInfo.apply_logits_bias</code>, called from
+      <code>ModelRunner._preprocess_logits</code>; custom logit processors and the final pick run
+      in <code>Sampler.forward</code> (<code>python/sglang/srt/layers/sampler.py:97</code>).
+      The non-greedy path uses flashinfer-style
+      <code>top_k_top_p_sampling_from_probs</code> kernels with a pure-torch fallback. When
+      grammars are active, sampled ids are all-reduced across TP so every rank advances the same
+      FSM state.
+    </div>
+  </div>
+
+  <h2><span class="sec-num">10.2</span>Constrained decoding: backends &amp; the GrammarManager</h2>
+  <p>
+    Constrained decoding exists because "please answer in JSON" is a suggestion, while a grammar
+    bitmask is a proof: at each step the matcher computes which tokens can extend a valid parse and
+    every other logit becomes <code>-inf</code>. SGLang ships three backends under
+    <code>python/sglang/srt/constrained/</code>, selected by <code>--grammar-backend</code>:
+  </p>
+
+  <table class="tbl">
+    <tr><th>Backend</th><th>File</th><th>Supports</th><th>Notes</th></tr>
+    <tr><td><code>xgrammar</code> <b>(default)</b></td><td><code>xgrammar_backend.py</code></td>
+      <td>json · regex · ebnf · structural_tag</td>
+      <td>Only backend with <code>is_support_token_filter=True</code> — required for
+        <code>--enable-strict-thinking</code>. Pinned-CPU int32 bitmask, Triton/HIP apply kernels.</td></tr>
+    <tr><td><code>outlines</code></td><td><code>outlines_backend.py</code></td>
+      <td>json · regex</td>
+      <td>JSON is converted to a regex via <code>build_regex_from_schema</code>; ebnf/structural_tag
+        dispatch to <code>_not_supported</code>. Boolean mask + <code>masked_fill_(-inf)</code>.</td></tr>
+    <tr><td><code>llguidance</code></td><td><code>llguidance_backend.py</code></td>
+      <td>json · regex · ebnf · structural_tag</td>
+      <td><code>LLMatcher</code>/<code>LLExecutor</code>; native batched bitmask fill including
+        speculative draft chains (<code>GrammarDraftRow</code>).</td></tr>
+    <tr><td><code>none</code></td><td>—</td><td>—</td><td>Grammar requests are aborted with an error.
+      Custom backends can be added via <code>register_grammar_backend</code>.</td></tr>
+  </table>
+
+  <p>
+    If <code>--reasoning-parser</code> is set and the model has <code>think_end_ids</code>, the chosen
+    backend is wrapped in a <code>ReasonerGrammarBackend</code>
+    (<code>constrained/reasoner_grammar_backend.py</code>): the inner grammar stays dormant while the
+    model is inside <code>&lt;think&gt;…&lt;/think&gt;</code>, and a thinking budget
+    (<code>custom_params["thinking_budget"]</code> or <code>SGLANG_MAX_THINK_TOKENS</code>) can force
+    the think section closed. So "JSON output from a reasoning model" works without constraining the
+    chain of thought.
+  </p>
+
+  <p>
+    Compilation is expensive (a big JSON schema can take seconds), so the scheduler-side
+    <code>GrammarManager</code> (<code>python/sglang/srt/constrained/grammar_manager.py</code>)
+    never compiles inline. It builds a cache key
+    <code>("json" | "regex" | "ebnf" | "structural_tag", key_string)</code>
+    (<code>grammar_manager.py:144</code>) and asks the backend:
+  </p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/constrained/base_grammar_backend.py:244" data-desc="Cache hit returns a fresh matcher sharing the compiled ctx; miss compiles on a ThreadPoolExecutor">
+<pre>
+    def get_cached_or_future_value(
+        self, key: Tuple[str, str], require_reasoning: bool
+    ) -> Tuple[BaseGrammarObject | Future[BaseGrammarObject], bool]:
+        value = self.cache.get(key)
+        if value:
+            copied_value = value.copy()
+            copied_value.maybe_init_reasoning(require_reasoning)
+            return copied_value, True
+        value = self.executor.submit(self._init_value_dispatch, key, require_reasoning)
+        return value, False
+</pre>
+  </div>
+
+  <div class="diagram">
+    <div class="dg-title">Grammar compile, cache &amp; distributed consensus</div>
+    <pre class="mermaid">
+flowchart TB
+  req["Req with json_schema"] --> gmgr["GrammarManager.process_req_with_grammar<br/><i>grammar_manager.py:131</i>"]
+  gmgr --> key["key = ('json', schema_string)"]
+  key --> cache{"cache hit?"}
+  cache -->|"yes"| copyv["value.copy()<br/>fresh GrammarMatcher,<br/>shared compiled ctx"]
+  cache -->|"no"| exec["ThreadPoolExecutor.submit<br/>_init_value_dispatch →<br/>compile_json_schema"]
+  exec --> gq["req parks in grammar_queue"]
+  gq --> poll["get_ready_grammar_requests()<br/>poll futures every scheduler loop"]
+  poll --> cons["TP consensus: all_gather_object<br/>ready = intersection · failed = union<br/>PP0 forwards decision to later PP ranks"]
+  cons --> ready["req.grammar = future.result()<br/>cache set with grammar.copy()"]
+  cons --> fail["timeout or compile error →<br/>InvalidGrammarObject cached<br/>request aborted"]
+  copyv --> run["request enters waiting_queue"]
+  ready --> run
+  style exec fill:#fdf3e3,stroke:#d97706
+  style cons fill:#eef0ff,stroke:#4f46e5
+  style fail fill:#fdecea,stroke:#dc2626
+    </pre>
+    <div class="dg-caption">
+      Polling is bounded by <code>SGLANG_GRAMMAR_POLL_INTERVAL</code> (0.005s) and
+      <code>SGLANG_GRAMMAR_MAX_POLL_ITERATIONS</code> (10000)
+      (<code>grammar_manager.py:184-311</code>). The intersection/union rule guarantees no TP rank
+      ever fills a mask from a grammar another rank hasn't finished compiling. Failures are cached
+      as <code>InvalidGrammarObject</code>, so a repeated bad schema fails instantly with the
+      original compiler error.
+    </div>
+  </div>
+
+  <h3>Worked example: constrained JSON generation, step by step</h3>
+  <p>
+    A request asks for JSON matching
+    <code>{"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer"}},"required":["name","age"]}</code>
+    — i.e. <code>{"name": &lt;string&gt;, "age": &lt;int&gt;}</code>. Watch the whole machine work,
+    from compile to termination. The token chips are candidate next tokens; green = allowed by the
+    mask, red = banned.
+  </p>
+
+  <div class="stepper" id="st-json">
+    <div class="st-scene">
+      <div class="sc-row" style="gap:12px; flex-wrap:wrap">
+        <div class="sc-box" id="js-req">Req<small>json_schema: name+age</small></div>
+        <div class="sc-box" id="js-cache">Grammar cache<small>key = ("json", schema)</small></div>
+        <div class="sc-box" id="js-exec">ThreadPoolExecutor<small>compile_json_schema</small></div>
+        <div class="sc-box" id="js-queue">grammar_queue<small>request parked</small></div>
+      </div>
+      <div class="sc-row" style="gap:12px; margin-top:16px; flex-wrap:wrap">
+        <div class="sc-box" id="js-fsm" style="min-width:240px">GrammarMatcher (FSM)<small id="js-state">not compiled yet</small></div>
+        <div class="sc-box" id="js-out" style="min-width:280px">output so far<small id="js-text">(empty)</small></div>
+      </div>
+      <div class="sc-row" style="gap:8px; margin-top:16px; flex-wrap:wrap">
+        <span style="align-self:center; font-size:12px; color:#888">candidates:</span>
+        <span class="tok" id="jt-brace">{</span>
+        <span class="tok" id="jt-name">"name"</span>
+        <span class="tok" id="jt-colon">:</span>
+        <span class="tok" id="jt-quote">"</span>
+        <span class="tok" id="jt-alice">Alice</span>
+        <span class="tok" id="jt-comma">,</span>
+        <span class="tok" id="jt-age">"age"</span>
+        <span class="tok" id="jt-30">30</span>
+        <span class="tok" id="jt-close">}</span>
+        <span class="tok" id="jt-hello">hello</span>
+        <span class="tok" id="jt-def">def</span>
+      </div>
+    </div>
+  </div>
+
+  <h2><span class="sec-num">10.3</span>Where the masking actually happens</h2>
+  <p>
+    The grammar lives in the <em>scheduler</em> process, but logits live on the GPU in the model
+    runner (they are the same OS process — see chapter 01 — but different subsystems). The split
+    is: <b>mask fill + apply happen in the forward path; FSM advance happens when results are
+    processed</b>. Three functions carry the whole mechanism:
+  </p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/sampling/sampling_batch_info.py:240" data-desc="1) Fill one bitmask row per live grammar (comments trimmed)">
+<pre>
+    def update_regex_vocab_mask(self):
+        if not self.grammars:
+            self.grammar_mask = None
+            return
+
+        first_grammar = next(grammar for grammar in self.grammars if grammar)
+
+        vocab_mask = first_grammar.allocate_vocab_mask(
+            vocab_size=self.vocab_size,
+            batch_size=len(self.temperatures),
+            device=self.device,
+        )
+        entries = [
+            GrammarRow(row=row, grammar=grammar)
+            for row, grammar in enumerate(self.grammars)
+            if grammar and not grammar.finished and not grammar.is_terminated()
+        ]
+        first_grammar.fill_vocab_mask_batched(entries, vocab_mask)
+
+        vocab_mask = first_grammar.move_vocab_mask(vocab_mask, self.device)
+        self.grammar_mask = GrammarMask(first_grammar, vocab_mask)
+</pre>
+  </div>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/model_executor/model_runner.py:1567" data-desc="2) Apply inside ModelRunner.sample — and free the mask immediately (comment abridged)">
+<pre>
+    def _preprocess_logits(
+        self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo
+    ):
+        # NOTE: In overlap mode, the function update_regex_vocab_mask (in sample)
+        #       was executed after we processed last batch's results.
+
+        # Calculate logits bias and apply it to next_token_logits.
+        sampling_info.update_regex_vocab_mask()
+        sampling_info.apply_logits_bias(logits_output.next_token_logits)
+
+        # Release the vocab_mask GPU tensor immediately after it has been applied
+        sampling_info.grammar_mask = None
+</pre>
+  </div>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/managers/scheduler_components/batch_result_processor.py:701" data-desc="3) Advance the FSM over committed tokens; spec-decode runs are truncated at termination (docstring trimmed)">
+<pre>
+    def _accept_grammar_tokens(
+        self, req: Req, tokens: Union[int, List[int]]
+    ) -> List[int]:
+        if isinstance(tokens, int):
+            tokens = [tokens]
+        retained = []
+        try:
+            for token_id in tokens:
+                req.grammar.accept_token(token_id)
+                retained.append(token_id)
+                if req.grammar.is_terminated():
+                    break
+        except ValueError as e:
+            logger.error(
+                f"Grammar accept_token failed for req {req.rid} with token "
+                f"{tokens}: {e}"
+            )
+            req.to_finish = FINISH_ABORT()
+        return retained
+</pre>
+  </div>
+
+  <p>
+    Speculative decoding (chapter 09) complicates step 3: a verified run of <i>k</i> draft tokens
+    is accepted in one go, and rejected drafts are undone with
+    <code>grammar.rollback(k)</code> — every <code>GrammarMatcher</code> is created with
+    <code>max_rollback_tokens=MAX_ROLLBACK_TOKENS=200</code>
+    (<code>xgrammar_backend.py:57</code>). Tokens past grammar termination are dropped from the
+    retained run so they are never committed to KV nor emitted.
+  </p>
+
+  <div class="callout warn"><span class="co-title">Docs/paper drift: jump-forward decoding is vestigial here</span>
+    The SGLang paper's "compressed FSM" / jump-forward decoding (emitting multi-token constants like
+    <code>{"name":</code> in one step) survives only as an orphaned API in this repo:
+    <code>try_jump_forward</code> / <code>jump_forward_str_state</code> /
+    <code>jump_and_retokenize</code> exist on every grammar object
+    (<code>base_grammar_backend.py</code>, implemented in the xgrammar and outlines backends), but a
+    repo-wide search finds <b>no caller outside <code>constrained/</code></b>; the scheduler never
+    invokes them, and <code>OutlinesGrammarBackend._compile_regex</code> hard-codes
+    <code>jump_forward_map = None</code> (<code>outlines_backend.py:157</code>).
+    <code>outlines_jump_forward.py</code> is retained but dead. The approach was superseded by
+    xgrammar's fast batched bitmask fill.
+  </div>
+
+  <h2><span class="sec-num">10.4</span>The OpenAI-compatible API layer</h2>
+  <p>
+    Everything above runs deep in the engine. What users see is
+    <code>python/sglang/srt/entrypoints/openai/</code>: one serving class per endpoint family, all
+    extending <code>OpenAIServingBase</code> (<code>serving_base.py</code>) with the same skeleton —
+    <code>handle_request → _validate_request → _convert_to_internal_request</code> (build a
+    <code>GenerateReqInput</code>) → streaming or non-streaming handler talking to
+    <code>TokenizerManager.generate_request</code>. The roster: <code>serving_chat.py</code>,
+    <code>serving_completions.py</code>, <code>serving_embedding.py</code>,
+    <code>serving_classify.py</code>, <code>serving_score.py</code>, <code>serving_rerank.py</code>,
+    <code>serving_responses.py</code> (a full Responses API port with background mode,
+    <code>previous_response_id</code> chaining and MCP tool execution via
+    <code>tool_server.py</code>), <code>serving_tokenize.py</code>, and
+    <code>serving_transcription.py</code> (plus a <code>realtime/</code> ASR stack).
+  </p>
+
+  <div class="diagram">
+    <div class="dg-title">One chat completion through the serving layer</div>
+    <pre class="mermaid">
+flowchart LR
+  c([Client]) --> route["POST /v1/chat/completions<br/><i>http_server.py:1700</i>"]
+  route --> h["OpenAIServingChat.handle_request"]
+  h --> v["_validate_request"]
+  v --> conv["_convert_to_internal_request<br/>chat template → input_ids<br/>tools → structural_tag / json_schema<br/>response_format → json_schema"]
+  conv --> tm["TokenizerManager<br/>.generate_request"]
+  tm --> gen["engine generates<br/>(chapters 01-04)"]
+  gen --> post["per-chunk: ReasoningParser →<br/>FunctionCallParser → SSE encode"]
+  post --> c
+  style conv fill:#eef0ff,stroke:#4f46e5
+  style post fill:#f5ecfe,stroke:#9333ea
+    </pre>
+    <div class="dg-caption">
+      Streaming responses pre-pull the first chunk before returning the
+      <code>StreamingResponse</code>, so a bad request still gets HTTP 400 instead of an SSE error
+      frame (<code>serving_chat.py:1426</code>). The SSE hot path encodes chunks with msgspec, not
+      pydantic (<code>sse_utils.py</code>). <code>response_format</code> mapping:
+      <code>json_schema</code> → <code>sampling_params["json_schema"]</code>,
+      <code>json_object</code> → <code>'{"type": "object"}'</code>, <code>structural_tag</code>
+      passed through as a JSON string (<code>protocol.py:1036-1051</code>).
+    </div>
+  </div>
+
+  <table class="tbl">
+    <tr><th>Endpoint (http_server.py line)</th><th>Handler</th></tr>
+    <tr><td><code>/generate</code> (:867), <code>/encode</code> (:920), <code>/classify</code> (:932)</td><td>native SGLang API — raw <code>GenerateReqInput</code> / <code>EmbeddingReqInput</code></td></tr>
+    <tr><td><code>/v1/completions</code> (:1692), <code>/v1/chat/completions</code> (:1700)</td><td><code>serving_completions</code>, <code>serving_chat</code></td></tr>
+    <tr><td><code>/v1/embeddings</code> (:1710), <code>/v1/classify</code> (:1722)</td><td><code>serving_embedding</code>, <code>serving_classify</code></td></tr>
+    <tr><td><code>/v1/tokenize</code> (:1734), <code>/v1/detokenize</code> (:1752)</td><td><code>serving_tokenize</code></td></tr>
+    <tr><td><code>/v1/audio/transcriptions</code> (:1770)</td><td><code>serving_transcription</code></td></tr>
+    <tr><td><code>/v1/models</code> (:1821), <code>/v1/score</code> (:1878), <code>/v1/rerank</code> (:1921)</td><td>model listing, <code>serving_score</code>, <code>serving_rerank</code></td></tr>
+    <tr><td><code>/v1/responses</code> + <code>GET /v1/responses/{id}</code> + <code>/{id}/cancel</code> (:1886-1913)</td><td><code>serving_responses</code> — background mode via <code>response_store</code> + <code>background_tasks</code></td></tr>
+    <tr><td><code>/api/chat</code>, <code>/api/generate</code>, <code>/api/tags</code>, <code>/api/show</code> (:1951-1971)</td><td>Ollama-compatible routes (paths env-overridable)</td></tr>
+    <tr><td><code>/v1/messages</code> + <code>/v1/messages/count_tokens</code> (:1980-1990)</td><td>Anthropic-compatible API (<code>entrypoints/anthropic/</code>)</td></tr>
+    <tr><td><code>/vertex_generate</code> (:2018), <code>/invocations</code> (:2007)</td><td>Vertex AI / SageMaker adapters</td></tr>
+    <tr><td><code>/parse_function_call</code> (:1598), <code>/separate_reasoning</code> (:1626)</td><td>run the tool-call / reasoning parsers standalone over provided text</td></tr>
+  </table>
+
+  <div class="callout fact"><span class="co-title">No Batch or Files API</span>
+    <code>protocol.py</code> still defines <code>FileRequest</code>/<code>BatchRequest</code> pydantic
+    models, but nothing registers <code>/v1/batches</code> or <code>/v1/files</code> routes — the
+    OpenAI Batch/Files APIs are <em>not</em> served by this HTTP server.
+  </div>
+
+  <h2><span class="sec-num">10.5</span>Function calling: detectors &amp; the streaming state machine</h2>
+  <p>
+    Tool calling has two halves: <b>constraining the output</b> (so the model emits its native
+    tool-call syntax) and <b>parsing it back</b> into OpenAI <code>tool_calls</code> deltas. Both are
+    owned by <code>FunctionCallParser</code>
+    (<code>python/sglang/srt/function_call/function_call_parser.py:54</code>), which wraps one of
+    <b>33 registered detectors</b> in <code>ToolCallParserEnum</code>: <code>deepseekv3</code>,
+    <code>deepseekv31</code>, <code>deepseekv32</code>, <code>deepseekv4</code>,
+    <code>qwen</code>/<code>qwen25</code> (→ <code>Qwen25Detector</code>), <code>qwen3_coder</code>,
+    <code>glm</code>/<code>glm45</code>/<code>glm47</code>, <code>kimi_k2</code>/<code>kimi_k3</code>,
+    <code>llama3</code> (→ <code>Llama32Detector</code>), <code>mistral</code>, <code>gpt-oss</code>,
+    <code>hermes</code>, <code>pythonic</code>, <code>minimax-m2</code>/<code>-m3</code>,
+    <code>step3</code>/<code>step3p5</code>, <code>hunyuan</code>, <code>gemma4</code>,
+    <code>inkling</code>, and more — all extending <code>BaseFormatDetector</code>.
+  </p>
+  <p>
+    At request time, <code>get_structure_constraint(tool_choice, parallel_tool_calls,
+    thinking_mode)</code> (<code>function_call_parser.py:230</code>) picks a decoding constraint by
+    priority: <b>(1)</b> a model-native xgrammar structural tag from the detector
+    (<code>get_auto_tool_call_structural_tag</code> / <code>get_structural_tag</code>), <b>(2)</b> the
+    legacy structural-tag format — begin/end/trigger per tool, schema attached only when strict —
+    and <b>(3)</b> for <code>tool_choice="required"</code> or a named tool on detectors without
+    structural-tag support, a plain <b>JSON-array <code>json_schema</code> constraint</b> whose
+    output is parsed by <code>JsonArrayParser</code> (<code>json_array_parser.py:8</code>) instead of
+    the native detector. The streaming side makes the same choice per stream index by probing
+    <code>detector.supports_structural_tag()</code> /
+    <code>parses_required_natively()</code> (<code>serving_chat.py:2324-2354</code>). Strictness
+    escalates globally via <code>SGLANG_TOOL_STRICT_LEVEL</code>.
+  </p>
+  <p>
+    Streaming parse is a little state machine in
+    <code>BaseFormatDetector.parse_streaming_increment</code>
+    (<code>base_format_detector.py:125</code>): accumulate chunks in <code>self._buffer</code>; if the
+    buffer can't even be a partial <code>bot_token</code>, flush it as normal text; otherwise parse
+    incrementally with <code>partial_json_parser</code>. The name is streamed <em>first</em>, as its
+    own delta:
+  </p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/function_call/base_format_detector.py:244" data-desc="Streaming state machine, Case 1: the tool name is emitted before any arguments">
+<pre>
+            # Case 1: Handle tool name streaming
+            # This happens when we encounter a tool but haven't sent its name yet
+            if not self.current_tool_name_sent:
+                function_name = current_tool_call.get("name")
+
+                if function_name and function_name in self._tool_indices:
+                    # If this is a new tool (current_tool_id was -1), initialize it
+                    if self.current_tool_id == -1:
+                        self.current_tool_id = 0
+                        self.streamed_args_for_tool.append("")
+                    # If this is a subsequent tool, ensure streamed_args_for_tool is large enough
+                    elif self.current_tool_id &gt;= len(self.streamed_args_for_tool):
+                        while len(self.streamed_args_for_tool) &lt;= self.current_tool_id:
+                            self.streamed_args_for_tool.append("")
+
+                    # Send the tool name with empty parameters
+                    res = StreamingParseResult(
+                        calls=[
+                            ToolCallItem(
+                                tool_index=self.current_tool_id,
+                                name=function_name,
+                                parameters="",
+                            )
+                        ],
+                    )
+                    self.current_tool_name_sent = True
+</pre>
+  </div>
+
+  <p>
+    Arguments then stream as <em>diffs</em>: each parse re-serializes the partial arguments, computes
+    the common prefix with the previous parse (<code>_find_common_prefix</code>), and emits only what
+    hasn't been sent (tracked per tool in <code>streamed_args_for_tool</code>). When
+    <code>_is_complete_json</code> confirms the object is done, the remainder is flushed,
+    <code>current_tool_id</code> advances, and end-of-stream reconciliation
+    (<code>_check_for_unstreamed_tool_args</code>) flushes any tail if the stream dies mid-JSON.
+  </p>
+
+  <h3>Worked example: a Qwen tool call arriving in chunks</h3>
+  <p>
+    <code>Qwen25Detector</code> uses <code>bot_token = "&lt;tool_call&gt;\n"</code> and
+    <code>eot_token = "\n&lt;/tool_call&gt;"</code> (<code>qwen25_detector.py:38</code>). The model
+    calls <code>get_weather(city="Paris")</code>; the detokenizer delivers it in 7 chunks.
+  </p>
+
+  <div class="stepper" id="st-tool">
+    <div class="st-scene">
+      <div class="sc-row" style="gap:8px; flex-wrap:wrap">
+        <span style="align-self:center; font-size:12px; color:#888">chunks:</span>
+        <span class="tok" id="tc-c1">&lt;tool</span>
+        <span class="tok" id="tc-c2">_call&gt;\n{"na</span>
+        <span class="tok" id="tc-c3">me": "get_weather",</span>
+        <span class="tok" id="tc-c4">"arguments": {"city": "Par</span>
+        <span class="tok" id="tc-c5">is"</span>
+        <span class="tok" id="tc-c6">}}</span>
+        <span class="tok" id="tc-c7">\n&lt;/tool_call&gt;</span>
+      </div>
+      <div class="sc-row" style="gap:12px; margin-top:16px; flex-wrap:wrap">
+        <div class="sc-box" id="tc-buf" style="min-width:270px">detector._buffer<small id="tc-buftext">(empty)</small></div>
+        <div class="sc-box" id="tc-state" style="min-width:270px">state<small id="tc-statetext">current_tool_id = -1 · name_sent = false</small></div>
+      </div>
+      <div class="sc-row" style="gap:8px; margin-top:16px; flex-wrap:wrap">
+        <span style="align-self:center; font-size:12px; color:#888">SSE deltas:</span>
+        <span class="tok appear" id="tc-d1" style="width:auto; padding:4px 8px">tool_calls[0].name = "get_weather"</span>
+        <span class="tok appear" id="tc-d2" style="width:auto; padding:4px 8px">args += {"city": "Par</span>
+        <span class="tok appear" id="tc-d3" style="width:auto; padding:4px 8px">args += is"}</span>
+        <span class="tok appear" id="tc-d4" style="width:auto; padding:4px 8px">finish_reason = "tool_calls"</span>
+      </div>
+    </div>
+  </div>
+
+  <h2><span class="sec-num">10.6</span>Reasoning parser (the other parser)</h2>
+  <p>
+    Separate from function calling, <code>python/sglang/srt/parser/reasoning_parser.py</code> strips
+    think-tags for reasoning models. <code>ReasoningParser</code> holds a <code>DetectorMap</code> of
+    <b>25 model types</b> (<code>deepseek-r1</code>, <code>deepseek-v3</code>/<code>-v4</code>,
+    <code>qwen3</code>/<code>qwen3-thinking</code>, <code>glm45</code>, <code>gpt-oss</code>,
+    <code>kimi</code>/<code>kimi_k2</code>/<code>kimi_k3</code>, <code>mistral</code>,
+    <code>minimax</code> variants, <code>step3</code>/<code>step3p5</code>,
+    <code>nemotron_3</code>, <code>gemma4</code>, <code>inkling</code>,
+    <code>cohere_command4</code>, …), each knowing its <code>think_start_token</code> /
+    <code>think_end_token</code>. Models like DeepSeek-R1 and gpt-oss set
+    <code>force_reasoning=True</code>: output is treated as in-reasoning from token 0 because the
+    opening tag never appears. In streaming, each choice index gets its own parser and each delta is
+    split into <code>reasoning_content</code> vs <code>content</code> before the tool-call parser
+    runs. Its scheduler-side twin is the <code>ReasonerGrammarBackend</code> from §10.2 — one strips
+    tags in text, the other delays grammar enforcement until <code>&lt;/think&gt;</code>.
+  </p>
+
+  <h2><span class="sec-num">10.7</span>The gRPC path</h2>
+  <p>
+    For router deployments (chapter 08), SGLang workers can skip FastAPI entirely. The contract is
+    <code>proto/sglang/runtime/v1/sglang.proto</code>: <code>service SglangService</code> with
+    <b>native typed RPCs</b> (server-streaming <code>Generate</code> / <code>TextGenerate</code>,
+    <code>Embed</code>, <code>Classify</code>, <code>Tokenize</code>, <code>Detokenize</code>, health
+    / info / load / abort / flush / pause), <b>OpenAI JSON pass-through RPCs</b>
+    (<code>ChatComplete</code>, <code>Complete</code>, <code>OpenAIEmbed</code>,
+    <code>OpenAIClassify</code>, <code>Score</code>, <code>Rerank</code> — the raw request JSON rides
+    in an <code>OpenAIRequest</code> envelope, SSE-equivalent chunks come back), and <b>admin
+    RPCs</b> (profiling, <code>UpdateWeightsFromDisk</code>). The proto's
+    <code>SamplingParams</code> carries <code>json_schema</code>/<code>regex</code> but not
+    ebnf/structural_tag.
+  </p>
+
+  <div class="diagram">
+    <div class="dg-title">Two ways to bypass FastAPI</div>
+    <pre class="mermaid">
+flowchart LR
+  gcli([gRPC client]) --> svc["SglangService<br/><i>proto/sglang/runtime/v1/sglang.proto</i>"]
+  svc --> serv["smg-grpc-servicer<br/>(external pip package)<br/>wrapped by <i>entrypoints/grpc_server.py</i><br/>+ aiohttp sidecar: /metrics, profiling"]
+  gw["sgl-model-gateway<br/>(Rust router, repo root)"] -->|"PyO3, in-process"| rh["RuntimeHandle<br/><i>entrypoints/grpc_bridge.py:56</i><br/>submit_openai_chat / _complete /<br/>_embed / _classify / _score / _rerank"]
+  rh --> osrv["same OpenAIServing* classes"]
+  serv --> tm["TokenizerManager<br/>.generate_request"]
+  osrv --> tm
+  style rh fill:#eef0ff,stroke:#4f46e5
+  style serv fill:#e7f7ec,stroke:#16a34a
+    </pre>
+    <div class="dg-caption">
+      <code>python/sglang/srt/grpc/</code> is an empty package — the servicer itself lives in the
+      external <code>smg-grpc-servicer</code> package; <code>serve_grpc</code>
+      (<code>grpc_server.py:156</code>) just imports it and adds an HTTP sidecar on
+      <code>--smg-http-sidecar-port</code>. The PyO3 <code>RuntimeHandle</code> lets the Rust gateway
+      call <code>TokenizerManager</code> and the <code>OpenAIServing*</code> classes directly via a
+      tiny FastAPI-<code>Request</code> shim (<code>_GrpcRequest</code>), with backpressured
+      callback channels for streaming — all validation logic shared, zero HTTP.
+    </div>
+  </div>
+
+  <h2><span class="sec-num">10.8</span>Flags &amp; knobs</h2>
+  <table class="tbl">
+    <tr><th>Flag / env</th><th>Default</th><th>Effect</th></tr>
+    <tr><td><code>--grammar-backend</code></td><td><code>xgrammar</code> (filled by <code>_handle_grammar_backend</code>, <code>server_args.py:5919</code>)</td><td><code>xgrammar</code> · <code>outlines</code> · <code>llguidance</code> · <code>none</code>, plus custom names via <code>register_grammar_backend</code></td></tr>
+    <tr><td><code>--constrained-json-whitespace-pattern</code></td><td><code>None</code></td><td>outlines/llguidance only: regex for allowed syntactic whitespace in JSON output</td></tr>
+    <tr><td><code>--constrained-json-disable-any-whitespace</code></td><td><code>False</code></td><td>xgrammar/llguidance only: force compact JSON (no whitespace between tokens)</td></tr>
+    <tr><td><code>--tool-call-parser</code></td><td><code>None</code></td><td>detector key from §10.5, or <code>auto</code> to detect from the chat template</td></tr>
+    <tr><td><code>--reasoning-parser</code></td><td><code>None</code></td><td><code>DetectorMap</code> key from §10.6, or <code>auto</code>; also triggers the <code>ReasonerGrammarBackend</code> wrap</td></tr>
+    <tr><td><code>--enable-strict-thinking</code></td><td><code>False</code></td><td>token filtering during the think phase (blocks e.g. tool-call markers); requires a token-filter backend — only xgrammar qualifies</td></tr>
+    <tr><td><code>--tool-server</code></td><td><code>None</code></td><td><code>demo</code> or comma-separated MCP server URLs for the Responses API</td></tr>
+    <tr><td><code>--enable-custom-logit-processor</code></td><td><code>False</code></td><td>allow dill-serialized <code>CustomLogitProcessor</code>s in requests (off by default for security)</td></tr>
+    <tr><td><code>--sampling-defaults</code></td><td><code>model</code></td><td><code>model</code> reads <code>generation_config.json</code> defaults; <code>openai</code> uses temperature=1.0, top_p=1.0, …</td></tr>
+    <tr><td><code>SGLANG_GRAMMAR_POLL_INTERVAL</code> / <code>SGLANG_GRAMMAR_MAX_POLL_ITERATIONS</code></td><td><code>0.005</code> / <code>10000</code></td><td>grammar-queue polling budget; exceeding it poisons the cache with "Grammar preprocessing timed out"</td></tr>
+    <tr><td><code>SGLANG_TOOL_STRICT_LEVEL</code></td><td><code>OFF</code></td><td>escalate tool-call strictness (function-level, parameter-level schema enforcement)</td></tr>
+    <tr><td><code>SGLANG_MAX_THINK_TOKENS</code></td><td><code>-1</code></td><td>global thinking budget enforced by <code>ReasonerGrammarObject</code>; per-request override via <code>custom_params["thinking_budget"]</code></td></tr>
+  </table>
+
+  <h2><span class="sec-num">10.9</span>Notable facts &amp; gotchas</h2>
+  <div class="card">
+    <ul>
+      <li><b>Grammar compilation is consensus-synced:</b> compile futures run on a per-backend
+        <code>ThreadPoolExecutor</code>; under TP the ready set is the <i>intersection</i> across
+        ranks and the failed set the <i>union</i>, and PP0 pushes the decision down the pipeline —
+        no rank ever fills a mask from a grammar another rank hasn't compiled.</li>
+      <li><b>XGrammar bitmasks are pinned CPU memory</b> filled by the matcher, then moved H2D with
+        <code>non_blocking=True</code> — the comment in <code>_allocate_token_bitmask</code>
+        (<code>xgrammar_backend.py:60</code>) notes a pageable source would silently degrade to a
+        blocking copy. A <code>-1</code> row means "all allowed".</li>
+      <li><b>Failures are cached too:</b> an invalid schema compiles to an
+        <code>InvalidGrammarObject(error_message)</code> which is cached, so repeated bad schemas
+        fail instantly with the original compiler error.</li>
+      <li><b>The grammar mask is nulled right after applying</b>
+        (<code>model_runner.py:1582</code>) — under overlap scheduling the closure holding
+        <code>sampling_info</code> survives to the next iteration, and keeping the mask alive was a
+        steady VRAM leak.</li>
+      <li><b>A rejected token aborts the request:</b> <code>XGrammarGrammar.accept_token</code>
+        raises <code>ValueError</code> if the matcher rejects, and the scheduler converts that to
+        <code>FINISH_ABORT</code>. With a correct mask this "can't happen" — it guards
+        mask/FSM desync.</li>
+      <li><b>Custom logit processors travel as dill-hex inside JSON</b>
+        (<code>CustomLogitProcessor.to_str</code>), are deduped per batch by string hash, and are
+        gated behind <code>--enable-custom-logit-processor</code>.</li>
+      <li><b><code>tool_choice="required"</code> has two output regimes:</b> native structural-tag
+        output parsed by the model's detector, or a JSON-array constraint parsed by
+        <code>JsonArrayParser</code> — chosen per stream by probing
+        <code>supports_structural_tag()</code> / <code>parses_required_natively()</code>.</li>
+      <li><b>User grammar beats tools:</b> if a request sets its own
+        <code>json_schema</code>/<code>regex</code>/<code>ebnf</code>/<code>structural_tag</code> and
+        also has tools, the tool constraint is dropped with a warning
+        "Constrained decoding is not compatible with tool calls"
+        (<code>protocol.py:1061</code>).</li>
+      <li><b><code>finish_reason</code> is rewritten:</b> when tool calls were emitted, the final
+        chunk's <code>stop</code> becomes <code>tool_calls</code> in <code>serving_chat.py</code>.</li>
+      <li><b>The gRPC servicer is out-of-repo</b> (<code>smg-grpc-servicer</code>): in-repo remain
+        only the proto, the sidecar wrapper, and the PyO3 <code>RuntimeHandle</code> the Rust
+        gateway uses to reuse the exact same serving classes without HTTP.</li>
+    </ul>
+  </div>
+
+  <div id="pager"></div>
+  </div>
+</main>
+</div>
+
+<script>
+document.addEventListener("DOMContentLoaded", () => {
+
+  const JT_ALL = "#jt-brace,#jt-name,#jt-colon,#jt-quote,#jt-alice,#jt-comma,#jt-age,#jt-30,#jt-close,#jt-hello,#jt-def";
+
+  new Stepper("#st-json", {
+    title: 'Constrained JSON: {"name": string, "age": int}',
+    intro: "From cache miss to grammar termination — every named function exists at the cited location.",
+    autoMs: 3600,
+    reset(sc) {
+      clearState(sc, ".sc-box,.tok");
+      setText(sc, "#js-state", "not compiled yet");
+      setText(sc, "#js-text", "(empty)");
+    },
+    steps: [
+      { cap: "A request arrives with <code>sampling_params.json_schema</code> set. <code>SamplingParams.verify</code> already checked it is the <i>only</i> constraint (<code>sampling_params.py:201</code>). <code>GrammarManager.process_req_with_grammar</code> builds the cache key <code>(\"json\", schema_string)</code> (<code>grammar_manager.py:144</code>).",
+        run(sc) { setCls(sc, "#js-req", "hl", "pulse"); } },
+      { cap: "<b>Cache miss.</b> <code>get_cached_or_future_value</code> submits <code>_init_value_dispatch</code> → <code>GrammarCompiler.compile_json_schema</code> to a <code>ThreadPoolExecutor</code> and returns a <code>Future</code>. The request parks in <code>grammar_queue</code> — the scheduler keeps serving everyone else.",
+        run(sc) { rmCls(sc, "#js-req", "pulse"); setCls(sc, "#js-cache", "warn"); setCls(sc, "#js-exec", "hl", "pulse"); setCls(sc, "#js-queue", "hl"); } },
+      { cap: "Compilation finishes. Each scheduler loop, <code>get_ready_grammar_requests()</code> polls the futures; under TP the ready set is <b>intersected</b> across ranks (failed = union), so all ranks release the request together. <code>req.grammar = future.result()</code> and the cache is populated with a <code>.copy()</code> — the next identical schema is a hit.",
+        run(sc) { rmCls(sc, "#js-exec", "pulse"); setCls(sc, "#js-exec,#js-queue", "ok"); setCls(sc, "#js-cache", "cache"); setCls(sc, "#js-fsm", "hl"); setText(sc, "#js-state", "state: root — expect '{'"); } },
+      { cap: "<b>Decode step 1, mask fill:</b> <code>update_regex_vocab_mask</code> calls <code>allocate_vocab_mask</code> (pinned-CPU int32 bitmask, all <code>-1</code> = everything allowed), then <code>fill_vocab_mask_batched</code> → <code>matcher.fill_next_token_bitmask</code> for this row. Only <code>{</code> can start the object.",
+        run(sc) { setCls(sc, "#js-fsm", "hl"); setText(sc, "#js-state", "state: root — expect '{'"); setCls(sc, JT_ALL, "bad"); rmCls(sc, "#jt-brace", "bad"); setCls(sc, "#jt-brace", "ok"); } },
+      { cap: "The mask moves to GPU (<code>non_blocking=True</code>) and <code>apply_token_bitmask_inplace_triton</code> sets every banned logit to <code>-inf</code> inside <code>apply_logits_bias</code>. The sampler's argmax can only pick <code>{</code>.",
+        run(sc) { setCls(sc, JT_ALL, "bad"); rmCls(sc, "#jt-brace", "bad"); setCls(sc, "#jt-brace", "ok", "pulse"); setText(sc, "#js-text", "{"); } },
+      { cap: "When the batch result is processed, <code>_accept_grammar_tokens</code> calls <code>req.grammar.accept_token('{')</code> (<code>batch_result_processor.py:701</code>) — the FSM advances. Next fill: the schema requires <code>\"name\"</code> first, so only that key (and whitespace, unless compact mode) is allowed.",
+        run(sc) { setText(sc, "#js-state", 'state: in object — expect "name"'); setCls(sc, JT_ALL, "bad"); rmCls(sc, "#jt-name", "bad"); setCls(sc, "#jt-name", "ok", "pulse"); setCls(sc, "#jt-brace", "dim"); setText(sc, "#js-text", "{"); } },
+      { cap: "<code>\"name\"</code> then <code>:</code> are forced the same way — fill mask, apply, sample, accept. Now the FSM expects a string value: the opening quote is the only way forward.",
+        run(sc) { setText(sc, "#js-state", "state: after 'name': — expect string"); setCls(sc, JT_ALL, "bad"); rmCls(sc, "#jt-quote", "bad"); setCls(sc, "#jt-quote", "ok", "pulse"); setText(sc, "#js-text", '{"name":'); } },
+      { cap: "<b>Inside the string the grammar is permissive:</b> almost the whole vocabulary is legal (<code>Alice</code>, <code>hello</code>, even <code>30</code> — any text), plus <code>\"</code> to close. This is where the model actually gets to choose; it free-texts <code>Alice</code>.",
+        run(sc) { setText(sc, "#js-state", "state: inside string value"); setCls(sc, JT_ALL, "ok"); setCls(sc, "#jt-brace,#jt-colon,#jt-name,#jt-age", "dim"); setCls(sc, "#jt-alice", "pulse", "hl"); setText(sc, "#js-text", '{"name": "Alice'); } },
+      { cap: "The model closes the string with <code>\"</code>; the FSM snaps back to rigid structure: <code>,</code> is required, then the <code>\"age\"</code> key.",
+        run(sc) { setText(sc, "#js-state", 'state: expect , then "age"'); setCls(sc, JT_ALL, "bad"); rmCls(sc, "#jt-comma,#jt-age", "bad"); setCls(sc, "#jt-comma,#jt-age", "ok"); setText(sc, "#js-text", '{"name": "Alice",'); } },
+      { cap: "After <code>\"age\":</code> the value must be an integer — digit tokens like <code>30</code> pass, <code>Alice</code> and <code>hello</code> are banned again. The model samples <code>30</code>.",
+        run(sc) { setText(sc, "#js-state", "state: expect integer"); setCls(sc, JT_ALL, "bad"); rmCls(sc, "#jt-30", "bad"); setCls(sc, "#jt-30", "ok", "pulse"); setText(sc, "#js-text", '{"name": "Alice", "age": 30'); } },
+      { cap: "<code>}</code> completes the object → <code>matcher.is_terminated()</code>. <code>_accept_grammar_tokens</code> stops there (spec-decode tokens past termination are dropped), later fills skip this row (<code>sampling_batch_info.py:259</code>), and the request finishes with valid JSON — guaranteed.",
+        run(sc) { setText(sc, "#js-state", "state: TERMINATED ✓"); setCls(sc, JT_ALL, "dim"); setCls(sc, "#jt-close", "ok"); setCls(sc, "#js-fsm,#js-out", "ok", "pulse"); setText(sc, "#js-text", '{"name": "Alice", "age": 30}'); } },
+    ],
+  });
+
+  new Stepper("#st-tool", {
+    title: "Streaming a Qwen-style tool call: get_weather(city=\"Paris\")",
+    intro: "How parse_streaming_increment turns raw chunks into OpenAI tool_call deltas.",
+    autoMs: 3600,
+    reset(sc) {
+      clearState(sc, ".sc-box,.tok");
+      rmCls(sc, ".appear", "in");
+      setText(sc, "#tc-buftext", "(empty)");
+      setText(sc, "#tc-statetext", "current_tool_id = -1 · name_sent = false");
+    },
+    steps: [
+      { cap: "Chunk <code>&lt;tool</code> arrives. <code>has_tool_call()</code> is false — but <code>_ends_with_partial_token</code> sees it could be the start of <code>bot_token = \"&lt;tool_call&gt;\\n\"</code>, so it is <b>buffered, not shown to the user</b> (<code>base_format_detector.py:157</code>). Nothing is emitted.",
+        run(sc) { setCls(sc, "#tc-c1", "hl"); setCls(sc, "#tc-buf", "warn"); setText(sc, "#tc-buftext", "<tool"); } },
+      { cap: "Chunk 2 completes the <code>bot_token</code> and starts JSON. <code>_partial_json_loads</code> runs with <code>Allow.ALL &amp; ~Allow.STR</code> — partial <i>strings</i> are disallowed before the name is sent, so a half-written name like <code>\"na</code> never leaks. Still nothing emitted.",
+        run(sc) { setCls(sc, "#tc-c1", "dim"); setCls(sc, "#tc-c2", "hl"); setCls(sc, "#tc-buf", "warn"); setText(sc, "#tc-buftext", '<tool_call>\\n{"na'); } },
+      { cap: "Chunk 3 completes the name. It validates against <code>_tool_indices</code> (unknown tools reset the parser), then <b>Case 1</b> fires: <code>ToolCallItem(tool_index=0, name=\"get_weather\", parameters=\"\")</code> — the name is streamed <i>first</i>, before any argument bytes. <code>current_tool_id=0</code>, <code>name_sent=true</code>.",
+        run(sc) { setCls(sc, "#tc-c2", "dim"); setCls(sc, "#tc-c3", "hl"); setCls(sc, "#tc-state", "hl"); setText(sc, "#tc-statetext", "current_tool_id = 0 · name_sent = true"); setCls(sc, "#tc-d1", "in", "ok", "pulse"); } },
+      { cap: "Chunk 4 brings partial arguments. Now <code>Allow.ALL</code> permits partial strings. The parser records <code>{\"city\": \"Par\"}</code> into <code>prev_tool_call_arr[0]</code> — but there is no <i>previous</i> parse to diff against yet, so nothing streams this round.",
+        run(sc) { setCls(sc, "#tc-c3", "dim"); setCls(sc, "#tc-c4", "hl"); setCls(sc, "#tc-buf", "warn"); setText(sc, "#tc-buftext", '…"arguments": {"city": "Par'); } },
+      { cap: "Chunk 5 extends the string. Diff time: <code>_find_common_prefix(prev_args_json, cur_args_json)</code> minus what was already sent (<code>streamed_args_for_tool[0]</code>) → the fragment <code>{\"city\": \"Par</code> goes out as an <b>argument delta</b>.",
+        run(sc) { setCls(sc, "#tc-c4", "dim"); setCls(sc, "#tc-c5", "hl"); setCls(sc, "#tc-d2", "in", "ok", "pulse"); } },
+      { cap: "Chunk 6 closes both braces — <code>_is_complete_json</code> is true. The remainder <code>is\"}</code> is flushed in one delta, the consumed text is cut from <code>_buffer</code>, and the state machine advances: <code>current_tool_id=1</code>, <code>name_sent=false</code>, ready for a parallel second call.",
+        run(sc) { setCls(sc, "#tc-c5", "dim"); setCls(sc, "#tc-c6", "hl"); setCls(sc, "#tc-d3", "in", "ok", "pulse"); setText(sc, "#tc-statetext", "current_tool_id = 1 · name_sent = false"); setText(sc, "#tc-buftext", "(consumed)"); } },
+      { cap: "Chunk 7 is the closing tag. <code>Qwen25Detector.parse_streaming_increment</code> keeps a <code>_normal_text_buffer</code> exactly to swallow <code>&lt;/tool_call&gt;</code> even when it arrives split across chunks (<code>qwen25_detector.py:75</code>) — the user never sees the markup.",
+        run(sc) { setCls(sc, "#tc-c6", "dim"); setCls(sc, "#tc-c7", "hl", "bad"); } },
+      { cap: "Stream ends. <code>_check_for_unstreamed_tool_args</code> would flush any argument tail if the model had died mid-JSON; <code>serving_chat.py</code> rewrites the final chunk's <code>finish_reason</code> from <code>stop</code> to <code>tool_calls</code>.",
+        run(sc) { setCls(sc, "#tc-c7", "dim"); setCls(sc, "#tc-d4", "in", "ok", "pulse"); setCls(sc, "#tc-state", "ok"); } },
+    ],
+  });
+
+});
+</script>
+</body>
+</html>

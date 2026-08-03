@@ -462,7 +462,9 @@ def _pad_to_bucket(raw_size: int, buckets: Sequence[int]) -> int:
         <span class="tok" id="cg-b1">1</span><span class="tok" id="cg-b2">2</span><span class="tok" id="cg-b4">4</span><span class="tok" id="cg-b8">8</span><span class="tok" id="cg-b12">12</span><span class="tok" id="cg-b16">16</span><span class="tok" id="cg-b24">24</span><span class="tok" id="cg-bmore">…</span>
       </div>
       <div class="sc-row" style="margin-top:12px">
-        <div class="sc-box" style="min-width:150px">static buffers<small>input_ids · seq_lens ·<br/>out_cache_loc lanes</small></div>
+        <div class="sc-box ghost">static buffers — input_ids · seq_lens · out_cache_loc, one lane per request slot</div>
+      </div>
+      <div class="sc-row">
         <div class="sc-box" id="cg-l0">req 0<small>id 8341 · len 91</small></div>
         <div class="sc-box" id="cg-l1">req 1<small>id 311 · len 17</small></div>
         <div class="sc-box" id="cg-l2">req 2<small>id 1131 · len 203</small></div>

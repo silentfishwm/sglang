@@ -1,0 +1,757 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12 · Observability, Config &amp; Everything Else — SGLang Internals</title>
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/mermaid.min.js"></script>
+<script src="assets/viz.js"></script>
+</head>
+<body>
+<div class="layout">
+<main>
+  <div class="page-hero"><div class="content">
+    <span class="phase-badge">Phase VI · Interfaces &amp; Operations</span>
+    <h1>12 · Running It: Observability, Configuration &amp; the Complete Map</h1>
+    <p class="lede">
+      Everything you need to <em>operate</em> SGLang: the ~120 Prometheus metrics and how they
+      escape three different processes, OpenTelemetry tracing, the configuration pipeline from
+      CLI flag to sealed config bag, the management HTTP surface, the watchdogs and corruption
+      detectors that keep a production server honest — and, to close the guide, a complete map
+      of every directory in the repo with a pointer to the chapter that covers it.
+    </p>
+  </div></div>
+
+  <div class="content">
+
+  <h2><span class="sec-num">12.1</span>The metrics system: 120 series across three processes</h2>
+  <p>
+    Recall from chapter 01 that an SGLang server is several OS processes: the main process
+    (HTTP + <code>TokenizerManager</code>), one scheduler subprocess per GPU rank, and a
+    detokenizer. Metrics are recorded <em>where the knowledge lives</em> — queue depths and KV
+    usage in the scheduler process, request latencies in the main process — and merged at scrape
+    time using <b>prometheus multiprocess mode</b>: every process writes its counters into mmap
+    shard files under <code>PROMETHEUS_MULTIPROC_DIR</code>, and the <code>/metrics</code> route
+    in the main process aggregates all shards with a <code>MultiProcessCollector</code>.
+  </p>
+
+  <div class="diagram">
+    <div class="dg-title">WHERE METRICS ARE RECORDED — AND HOW THEY ESCAPE</div>
+    <pre class="mermaid">
+flowchart LR
+  subgraph sched ["Scheduler subprocess (per GPU rank)"]
+    rep["SchedulerMetricsReporter<br/><i>scheduler_components/metrics_reporter.py</i>"]
+    smc["SchedulerMetricsCollector<br/>queue depths, token_usage,<br/>spec decode, PD disagg, MFU"]
+    fpm["_FpmPublisherThread<br/><i>observability/forward_pass_metrics.py</i>"]
+    rep --> smc
+    rep --> fpm
+  end
+  subgraph main ["Main process"]
+    tmc["TokenizerMetricsCollector<br/>TTFT / ITL / e2e histograms"]
+    api["FastAPI mount /metrics<br/>MultiProcessCollector"]
+  end
+  dir[("PROMETHEUS_MULTIPROC_DIR<br/>mmap shards, one set per PID")]
+  smc -- "prometheus_client<br/>multiprocess writes" --> dir
+  tmc --> dir
+  dir --> api
+  prom["Prometheus server"] -- "GET /metrics scrape" --> api
+  fpm -- "ZMQ PUB, msgspec,<br/>FPM_VERSION = 1" --> dyn["Dynamo planner<br/>(any ZMQ SUB)"]
+  trc["OTel spans<br/><i>observability/trace.py</i>"] -- "OTLP gRPC or HTTP" --> col["OTLP collector"]
+  style sched fill:#e7f7ec,stroke:#16a34a
+  style main fill:#eef0ff,stroke:#4f46e5
+  style dir fill:#fdf3e3,stroke:#d97706
+    </pre>
+    <div class="dg-caption">
+      Three parallel escape routes: Prometheus multiprocess shards (pull, aggregated),
+      a per-iteration ZMQ PUB stream (push, real-time, built for Dynamo), and OTLP span export.
+      Not shown for space: <code>StorageMetricsCollector</code> (HiCache),
+      <code>RadixCacheMetricsCollector</code>, <code>ExpertDispatchCollector</code>, and
+      <code>EncoderMetricsCollector</code> — all in the same
+      <code>observability/metrics_collector.py</code> (2,209 lines) and all following the same
+      shard-file path.
+    </div>
+  </div>
+
+  <p>
+    Six collector families live in <code>python/sglang/srt/observability/metrics_collector.py</code>,
+    together exporting on the order of 120 <code>sglang:*</code> series:
+  </p>
+  <table class="tbl">
+    <tr><th>Collector (line)</th><th>Created by</th><th>Representative metrics</th></tr>
+    <tr><td><code>SchedulerMetricsCollector</code> (238)</td><td>scheduler's <code>metrics_reporter.py</code></td>
+      <td><code>num_running_reqs</code>, <code>num_queue_reqs</code>, <code>gen_throughput</code>,
+      <code>cache_hit_rate</code>, <code>token_usage</code> triples per pool,
+      <code>kv_available/evictable/used_tokens</code>, <code>spec_accept_length/rate</code>,
+      PD-disagg queues + <code>kv_transfer_speed_gb_s</code>, grammar compile/timeout counters,
+      MFU accounting (<code>estimated_flops_per_gpu_total</code>, <code>forward_execution_seconds_total</code>),
+      <code>queue_time_seconds</code>, <code>per_stage_req_latency_seconds</code></td></tr>
+    <tr><td><code>TokenizerMetricsCollector</code> (1427)</td><td><code>TokenizerManager.__init__</code></td>
+      <td><code>time_to_first_token_seconds</code>, <code>inter_token_latency_seconds</code>,
+      <code>e2e_request_latency_seconds</code>, <code>prompt/generation_tokens_total</code>,
+      <code>cached_tokens_total</code>, <code>num_aborted_requests_total</code></td></tr>
+    <tr><td><code>StorageMetricsCollector</code> (1752)</td><td>HiCache controller</td>
+      <td>prefetch/backup counters and bandwidth for hierarchical cache storage</td></tr>
+    <tr><td><code>ExpertDispatchCollector</code> (1850)</td><td>EPLB</td>
+      <td><code>eplb_gpu_physical_count</code></td></tr>
+    <tr><td><code>RadixCacheMetricsCollector</code> (1865)</td><td>radix cache</td>
+      <td>eviction / load-back durations and token totals</td></tr>
+    <tr><td><code>EncoderMetricsCollector</code> (1966)</td><td>disaggregated multimodal encoder</td>
+      <td>encoder queueing and transfer stats</td></tr>
+  </table>
+
+  <div class="callout warn"><span class="co-title">Import order is a hard constraint</span>
+    <code>PROMETHEUS_MULTIPROC_DIR</code> must be set <em>before any</em>
+    <code>prometheus_client</code> import — which is why
+    <code>set_prometheus_multiproc_dir()</code> (<code>utils/common.py:2342</code>) runs early in
+    every process, and why six different files defer
+    <code>import prometheus_client</code> into function/<code>__init__</code> bodies with the
+    identical comment. Even the gRPC server sets it before spawning schedulers
+    (<code>entrypoints/grpc_server.py:176</code>).
+  </div>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/utils/common.py:2360"
+       data-desc="How /metrics aggregates every process's shards (verbatim)">
+<pre>
+def add_prometheus_middleware(app):
+    # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
+    from prometheus_client import CollectorRegistry, make_asgi_app, multiprocess
+
+    registry = CollectorRegistry()
+    multiprocess.MultiProcessCollector(registry)
+    metrics_route = Mount("/metrics", make_asgi_app(registry=registry))
+
+    # Workaround for 307 Redirect for /metrics
+    metrics_route.path_regex = re.compile("^/metrics(?P&lt;path>.*)$")
+    app.routes.append(metrics_route)
+</pre>
+  </div>
+
+  <p>
+    The scheduler side publishes a <code>SchedulerStats</code> snapshot every logging interval.
+    Its field comments are the best documentation of SGLang's memory-pool metrics semantics:
+  </p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/observability/metrics_collector.py:64"
+       data-desc="SchedulerStats — pool-usage semantics (middle fields trimmed)">
+<pre>
+@dataclass
+class SchedulerStats:
+    # Basics
+    num_running_reqs: QueueCount = field(default_factory=QueueCount)
+    num_queue_reqs: QueueCount = field(default_factory=QueueCount)
+
+    # Memory pool usage ratios (0.0–1.0).
+    # Each pool tracks: used = total - available - evictable, usage = used / total.
+    #
+    # token_usage:      max(full, swa, mamba) — the bottleneck across all pools.
+    #                   FIXME: misleadingly named "token_usage"; rename requires API deprecation.
+    # full_token_usage: full-attention KV cache pool usage (always active).
+    # swa_token_usage:  sliding-window attention KV cache pool usage (hybrid SWA models only, e.g. Gemma2).
+    # mamba_usage:      Mamba SSM state pool usage (hybrid SSM models only, e.g. Jamba).
+    token_usage: float = 0.0
+    full_token_usage: float = 0.0
+
+    # Absolute token counts for the full-attention KV cache pool.
+    # Invariant: kv_available_tokens + kv_evictable_tokens + kv_used_tokens &lt;= max_total_num_tokens
+    kv_available_tokens: int = 0
+    kv_evictable_tokens: int = 0
+    kv_used_tokens: int = 0
+</pre>
+  </div>
+
+  <h3>Beyond Prometheus: tracing and push telemetry</h3>
+  <ul>
+    <li><b>OpenTelemetry tracing</b> (<code>observability/trace.py</code>): enabled with
+      <code>--enable-trace --otlp-traces-endpoint ...</code>. It propagates incoming
+      <code>traceparent</code>/<code>tracestate</code> headers
+      (<code>TRACE_HEADERS</code>, trace.py:39) across all processes, so one request's spans in
+      the tokenizer, scheduler, and detokenizer stitch into a single distributed trace.
+      <code>--trace-modules</code> filters which subsystems emit spans
+      (<code>global_trace_modules</code>), and the trace level is runtime-adjustable via the
+      <code>/set_trace_level</code> endpoint. <code>mooncake_trace.py</code> adds KV-transfer
+      stages (e.g. <code>MOONCAKE_SEND</code>) for PD disaggregation (chapter 08).</li>
+    <li><b>Per-iteration ZMQ telemetry</b> (<code>observability/forward_pass_metrics.py</code>):
+      with <code>--enable-forward-pass-metrics</code> the scheduler PUBs one msgspec-serialized
+      <code>ForwardPassMetrics</code> per forward pass over localhost ZMQ. The docstring names the
+      consumer explicitly: Dynamo's planner subscribes for polling-free real-time scheduler
+      telemetry. The schema is versioned (<code>FPM_VERSION = 1</code>) and running stats use a
+      <code>WelfordAccumulator</code> (numerically stable online variance).</li>
+    <li><b>Per-request records</b>: <code>observability/req_time_stats.py</code> timestamps every
+      stage of a request's life; <code>request_metrics_exporter.py</code> can JSON-export
+      per-request perf records (always stripping <code>image_data</code>/<code>video_data</code>/
+      <code>audio_data</code>/<code>input_embeds</code>); <code>utils/request_logger.py</code> +
+      the <code>/configure_logging</code> endpoint control runtime request logging and dumping.</li>
+  </ul>
+
+  <table class="tbl">
+    <tr><th>Flag / env var</th><th>What it controls</th></tr>
+    <tr><td><code>--enable-metrics</code></td><td>Creates the collectors and mounts <code>/metrics</code> (<code>http_server.py:284</code>).</td></tr>
+    <tr><td><code>--stat-loggers</code></td><td>Dependency-inject alternative collector classes per role (<code>scheduler</code>/<code>tokenizer</code>/<code>storage</code>/<code>radix_cache</code>/<code>expert_dispatch</code>) — how Ray Serve LLM embeds SGLang metrics (<code>observability/ray_wrappers.py</code>).</td></tr>
+    <tr><td><code>--enable-trace</code>, <code>--otlp-traces-endpoint</code>, <code>--trace-modules</code></td><td>OTel span export and module filtering.</td></tr>
+    <tr><td><code>--enable-forward-pass-metrics</code></td><td>Per-iteration ZMQ PUB stream (endpoint in <code>server_args.forward_pass_metrics_ipc_name</code>).</td></tr>
+    <tr><td><code>--kv-canary {none,log,raise}</code> (+ <code>--kv-canary-real-data</code>, <code>--kv-canary-sweep-interval</code>)</td><td>KV-corruption detector, §12.5.</td></tr>
+    <tr><td><code>--soft-watchdog-timeout</code></td><td>Log-only stall watchdog; the hard one uses <code>get_device().watchdog_timeout</code> (<code>scheduler.py:1178–1187</code>).</td></tr>
+    <tr><td><code>SGLANG_HEALTH_CHECK_TIMEOUT</code></td><td>Heartbeat deadline for the health probe, default 20 s (<code>http_server.py:192</code>).</td></tr>
+    <tr><td><code>SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION</code></td><td>Default <code>True</code>; set false to make <code>/health</code> a static 200 while <code>/health_generate</code> keeps the probe (<code>environ.py:978</code>).</td></tr>
+    <tr><td><code>PROMETHEUS_MULTIPROC_DIR</code></td><td>Shard directory; auto-created tempdir if unset (<code>utils/common.py:2342</code>).</td></tr>
+  </table>
+
+  <h2><span class="sec-num">12.2</span>Follow one metric end to end — animated</h2>
+  <p>
+    Concrete example: a request <code>rid=cmpl-7f3a</code> arrives on a busy server at
+    <b>10:00:00.000</b>, waits <b>0.42 s</b> in the waiting queue, and produces its first token
+    at <b>+0.61 s</b>. Two histograms record this — in two <em>different processes</em> — and one
+    scrape merges them.
+  </p>
+
+  <div class="stepper" id="st-metric">
+    <div class="st-scene">
+      <div class="sc-row" style="gap:12px">
+        <div class="sc-box" id="mt-req">Req cmpl-7f3a<small>arrives 10:00:00.000</small></div>
+        <div class="sc-box" id="mt-queue">waiting_queue<small>Scheduler subprocess</small></div>
+        <div class="sc-box" id="mt-rts">ReqTimeStats<small>observability/req_time_stats.py</small></div>
+        <div class="sc-box" id="mt-hist">sglang:queue_time_seconds<small>SchedulerMetricsCollector</small></div>
+      </div>
+      <div class="sc-row" style="gap:12px; margin-top:16px">
+        <div class="sc-box" id="mt-tok">TokenizerManager<small>main process</small></div>
+        <div class="sc-box" id="mt-ttft">sglang:time_to_first_token_seconds<small>TokenizerMetricsCollector</small></div>
+        <div class="sc-box" id="mt-shard" style="border-style:dashed">PROMETHEUS_MULTIPROC_DIR<small>mmap shards per PID</small></div>
+      </div>
+      <div class="sc-row" style="gap:12px; margin-top:16px">
+        <div class="sc-box appear" id="mt-scrape">GET /metrics<small>MultiProcessCollector merge</small></div>
+        <div class="sc-box appear" id="mt-dash">Dashboard<small>histogram_quantile(0.9, …)</small></div>
+      </div>
+    </div>
+  </div>
+
+  <h2><span class="sec-num">12.3</span>Configuration: from CLI flag to sealed config bag</h2>
+  <p>
+    SGLang's configuration story has three tiers. First, <b><code>ServerArgs</code></b>
+    (<code>python/sglang/srt/server_args.py</code>, 9,392 lines) — a single dataclass holding
+    every CLI flag. Each field is annotated <code>A[type, help, NS("namespace")]</code>; the
+    <code>NS()</code> metadata assigns it to a runtime-context namespace, and
+    <code>arg_groups/arg_utils.py</code> auto-derives the entire argparse CLI from these
+    annotations. Second, <b><code>ModelConfig</code></b> is derived from it. Third, the resolved
+    values are <em>published</em> into the process-global <b><code>RuntimeContext</code></b> as
+    sealed, read-only namespace bags that business code actually reads.
+  </p>
+
+  <div class="diagram">
+    <div class="dg-title">CONFIG FLOW: CLI → SERVERARGS → RUNTIMECONTEXT TIERS</div>
+    <pre class="mermaid">
+flowchart TB
+  cli["CLI argv"] --> merger
+  yaml["--config file.yaml"] --> merger["ConfigArgumentMerger<br/><i>server_args_config_parser.py</i><br/>precedence: CLI &gt; config &gt; defaults"]
+  merger --> sa["ServerArgs dataclass · 9,392 lines<br/>fields annotated A[type, help, NS(namespace)]"]
+  sa --> post["__post_init__ resolution<br/>+ arg_groups/ per-feature hooks<br/>+ MODEL_OVERRIDES declarations"]
+  post --> frozen["effectively frozen instance<br/>(bare assignment raises)"]
+  frozen --> mc["ModelConfig.from_server_args<br/><i>configs/model_config.py:529</i><br/>_derive_context_length"]
+  frozen --> pub["publish(server_args, role=...)<br/><i>runtime_context.py:1271</i>"]
+  pub --> bags["sealed config bags<br/>get_model() get_schedule() get_exec()<br/>get_observability() ... — read-only"]
+  pub --> seed["pristine seed<br/>get_server_args() — debug/dumps only"]
+  bags --> code["business code"]
+  env["envs.SGLANG_*<br/><i>environ.py</i> typed registry"] -.-> post
+  style pub fill:#eef0ff,stroke:#4f46e5
+  style bags fill:#e7f7ec,stroke:#16a34a
+    </pre>
+    <div class="dg-caption">
+      <code>ConfigArgumentMerger.merge_config_with_args()</code> splices YAML keys into the arg
+      list so CLI always wins. <code>ModelConfig._derive_context_length</code>
+      (<code>configs/model_config.py:760</code>) computes context length from the HF config and
+      loudly warns if a user-supplied <code>--context-length</code> exceeds it ("may lead to
+      incorrect model outputs or CUDA errors"). <code>publish()</code> records the process role
+      (<code>tokenizer</code>/<code>scheduler</code>/<code>dp_controller</code>/…) and is
+      last-publish-wins; draft workers deliberately never publish.
+    </div>
+  </div>
+
+  <p>
+    The <code>RuntimeContext</code> singleton (<code>runtime_context.py</code>, reached via
+    <code>get_context()</code>) organizes all process-static state into tiers, per the
+    repo's <code>sglang-runtime-context</code> design:
+  </p>
+  <ul>
+    <li><b>Config bags</b> — <code>get_model()</code>, <code>get_schedule()</code>,
+      <code>get_exec()</code>, <code>get_memory()</code>, <code>get_spec()</code>,
+      <code>get_serving()</code>, <code>get_observability()</code>, <code>get_disagg()</code>,
+      <code>get_lora()</code>, <code>get_mm()</code>, <code>get_device()</code>. Bag leaves are
+      real instance attributes so they trace cleanly under torch.compile. Sealed: the only
+      post-publish write path is <code>get_context().override(source, **fields)</code>, which
+      logs provenance.</li>
+    <li><b>Pristine seed</b> — <code>get_server_args()</code> returns the published
+      <code>ServerArgs</code> verbatim, kept for debugging and dumps; business code must not
+      branch on it.</li>
+    <li><b>Runtime flags</b> — <code>get_flags()</code>: typed groups
+      (<code>capture</code>/<code>moe</code>/<code>dp</code>) for derived-at-init state.</li>
+    <li><b>Resources</b> — <code>get_stream(name)</code> (named CUDA side-stream leases like
+      <code>"alt"</code>, <code>"offload"</code>), <code>get_buffer(name, factory)</code>.</li>
+    <li><b>Per-forward flags</b> — <code>get_forward()</code>: contextvar-backed with
+      transactional <code>scoped(**kw)</code>.</li>
+    <li><b>Parallel</b> — <code>get_parallel()</code>: live topology properties that win over
+      config-bag leaves once torch.distributed is initialized.</li>
+  </ul>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/runtime_context.py:616"
+       data-desc="Config bags are sealed — every stray write fails loudly">
+<pre>
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError(
+            f"config namespace {self._path!r} is read-only; write via "
+            "get_context().override(source, ...) or the scoped .override(**kw)"
+        )
+</pre>
+  </div>
+
+  <div class="callout note"><span class="co-title">CI-enforced discipline</span>
+    Four "ratchet" tests freeze legacy global-state patterns: no new bare
+    <code>server_args.x = ...</code> assignments, <code>ServerArgs.override</code> call sites can
+    only shrink, the legacy <code>get_global_server_args</code> accessor is frozen, and
+    module-level <code>global</code> statements are pinned by name. A two-way coverage test keeps
+    <code>NS()</code> annotations and namespace bags in sync. Model-specific config tweaks are
+    <em>declared</em>, never assigned: <code>MODEL_OVERRIDES["Arch"] = {...}</code> /
+    <code>@register_model_override("Arch")</code> in <code>arg_groups/overrides.py</code>.
+  </div>
+
+  <h3>environ.py: the typed env-var registry</h3>
+  <p>
+    <code>python/sglang/srt/environ.py</code> is deliberately <b>stdlib-only</b> (it loads before
+    torch). One <code>Envs</code> class (line 239) holds typed descriptors —
+    <code>EnvBool</code>/<code>EnvInt</code>/<code>EnvFloat</code>/<code>EnvStr</code>/
+    <code>EnvTuple</code>/<code>EnvJSON</code>, plus <code>*WithAlias</code> variants for
+    deprecated names — and the singleton is <code>envs = Envs()</code>. Legacy
+    <code>SGL_*</code> keys are rewritten to <code>SGLANG_*</code> at import time with a
+    <code>DeprecationWarning</code> (<code>_convert_SGL_to_SGLANG()</code>, line 1322). Tests use
+    the context-manager <code>envs.SGLANG_X.override(value)</code>, which restores prior state
+    exactly.
+  </p>
+
+  <div class="callout warn"><span class="co-title">`if envs.SGLANG_X:` raises — by design</span>
+    Reading a flag without <code>.get()</code> is a hard error, not a silent truthy-object bug:
+  </div>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/environ.py:94"
+       data-desc="EnvField.__bool__ — truthiness is forbidden">
+<pre>
+    def __bool__(self):
+        raise RuntimeError(
+            "Please use `envs.YOUR_FLAG.get()` instead of `envs.YOUR_FLAG`"
+        )
+</pre>
+  </div>
+
+  <h2><span class="sec-num">12.4</span>The HTTP management surface</h2>
+  <p>
+    Beyond the inference routes (chapter 11), <code>entrypoints/http_server.py</code> (2,768
+    lines) exposes roughly 60 management endpoints. The 25 most important, grouped:
+  </p>
+
+  <table class="tbl">
+    <tr><th>Group</th><th>Endpoint</th><th>What it does</th></tr>
+    <tr><td rowspan="4">Health &amp; info</td>
+      <td><code>/health</code>, <code>/health_generate</code></td>
+      <td>One handler (line 645). Submits a 1-token probe with rid prefix <code>HEALTH_CHECK</code>; passes if the detokenizer heartbeat (<code>last_receive_tstamp</code>) advances within <code>SGLANG_HEALTH_CHECK_TIMEOUT</code> (20 s) — the probe itself need not finish. 503 during startup/shutdown or when unhealthy.</td></tr>
+    <tr><td><code>/get_server_info</code> → <code>/server_info</code></td><td>Full resolved <code>ServerArgs</code> dict + <code>scheduler_info</code> + per-DP internal states + version (old names kept as deprecated aliases, likewise <code>/model_info</code>, <code>/weight_version</code>).</td></tr>
+    <tr><td><code>/get_load</code> → <code>/v1/loads</code></td><td>Queue/token load per DP replica, consumed by routers.</td></tr>
+    <tr><td><code>/metrics</code></td><td>Prometheus scrape target (only with <code>--enable-metrics</code>).</td></tr>
+    <tr><td rowspan="3">Cache &amp; memory</td>
+      <td><code>/flush_cache</code></td><td>Drop the radix cache (e.g. after weights change).</td></tr>
+    <tr><td><code>/release_memory_occupation</code>, <code>/resume_memory_occupation</code></td><td>RL memory handoff — free/restore weights + KV so a co-located trainer can use the GPU (<code>torch_memory_saver_adapter</code>).</td></tr>
+    <tr><td><code>/freeze_gc</code>, <code>/slow_down</code></td><td>GC freeze after warmup; artificial slowdown for testing.</td></tr>
+    <tr><td rowspan="4">Weights (8-endpoint family)</td>
+      <td><code>/update_weights_from_disk</code></td><td>Reload weights in place from a checkpoint path.</td></tr>
+    <tr><td><code>/update_weights_from_tensor</code>, <code>/update_weights_from_distributed</code>, <code>/update_weights_from_ipc</code></td><td>RL weight injection: serialized tensors, a torch.distributed group (<code>/init_weights_update_group</code> / <code>/destroy_weights_update_group</code>), or CUDA-IPC handles.</td></tr>
+    <tr><td><code>/init_weights_send_group_for_remote_instance</code>, <code>/send_weights_to_remote_instance</code></td><td>Instance-to-instance weight cloning for fast scale-out.</td></tr>
+    <tr><td><code>/get_weights_by_name</code>, <code>/weights_checker</code>, <code>/update_weight_version</code></td><td>Inspect a parameter, integrity-check weights, bump the served version tag.</td></tr>
+    <tr><td>LoRA</td><td><code>/load_lora_adapter</code>, <code>/unload_lora_adapter</code></td><td>Hot add/remove adapters (+ <code>/load_lora_adapter_from_tensors</code>).</td></tr>
+    <tr><td rowspan="2">Sessions &amp; control</td>
+      <td><code>/open_session</code>, <code>/close_session</code></td><td>Server-side multi-turn state: a <code>SessionReqNode</code> tree in the scheduler (<code>session/session_controller.py</code>).</td></tr>
+    <tr><td><code>/abort_request</code>, <code>/pause_generation</code>, <code>/continue_generation</code></td><td>Kill one request; pause/resume the whole engine (used around weight updates).</td></tr>
+    <tr><td>HiCache</td><td><code>/hicache/storage-backend</code> (GET/PUT/DELETE, + <code>/clear</code>)</td><td>REST-style runtime management of the hierarchical cache storage backend (chapter 08).</td></tr>
+    <tr><td rowspan="3">Observability &amp; debug</td>
+      <td><code>/start_profile</code>, <code>/stop_profile</code></td><td>Torch profiler capture on a live server, orchestrated by the scheduler's <code>profiler_manager</code>.</td></tr>
+    <tr><td><code>/configure_logging</code>, <code>/set_trace_level</code></td><td>Runtime log level, request logging/dumping (CLI client: <code>python -m sglang.srt.managers.configure_logging</code>); OTel level.</td></tr>
+    <tr><td><code>/start|stop|dump_expert_distribution_record</code>, <code>/dumper/{method}</code></td><td>MoE expert-routing stats (chapter 07); HTTP-controllable tensor dumper (registered only when enabled, line 848).</td></tr>
+    <tr><td>Utility</td><td><code>/tokenize</code>, <code>/detokenize</code>, <code>/parse_function_call</code>, <code>/separate_reasoning</code></td><td>Standalone access to the tokenizer and to the chapter-10 parsers.</td></tr>
+  </table>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/entrypoints/http_server.py:645"
+       data-desc="/health and /health_generate share one handler (trimmed after the fast paths)">
+<pre>
+@app.get("/health")
+@app.get("/health_generate")
+async def health_generate(request: Request) -> Response:
+    """
+    Check the health of the inference server by sending a special request to generate one token.
+
+    If the server is running something, this request will be ignored, so it creates zero overhead.
+    If the server is not running anything, this request will be run, so we know whether the server is healthy.
+    """
+
+    if _global_state.tokenizer_manager.gracefully_exit:
+        logger.info("Health check request received during shutdown. Returning 503.")
+        return Response(status_code=503)
+
+    if _global_state.tokenizer_manager.server_status == ServerStatus.Starting:
+        return Response(status_code=503)
+
+    if (
+        not envs.SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION.get()
+        and request.url.path == "/health"
+    ):
+        return Response(status_code=200)
+</pre>
+  </div>
+
+  <h2><span class="sec-num">12.5</span>Reliability machinery: watchdogs, canaries, crash dumps</h2>
+
+  <div class="diagram">
+    <div class="dg-title">TWO WATCHDOG DIRECTIONS + THE KV CANARY</div>
+    <pre class="mermaid">
+flowchart TB
+  loop["Scheduler event loop<br/>feeds heartbeat counter"] --> wd["WatchdogRaw daemon thread<br/><i>utils/watchdog.py</i>"]
+  wd -- "counter stalls &gt; timeout" --> spy["pyspy_dump_schedulers()<br/>stack dump of every scheduler proc"]
+  spy --> sq1["hard: SIGQUIT → parent process<br/>soft: log only"]
+  child["Scheduler child dies without<br/>Python cleanup (NCCL std::terminate)"] --> sw["SubprocessWatchdog in parent<br/>polls child liveness"]
+  sw --> sq2["SIGQUIT → self<br/>(no zombie server)"]
+  kvw["Every KV-cache write"] --> can["kv_canary kernels<br/>HEAD/TAIL check per forward<br/>+ every-N-step radix sweep"]
+  can -- "mode=log" --> ring["violation ring logged<br/>(production observability)"]
+  can -- "mode=raise" --> err["RuntimeError after<br/>next D2H pump"]
+  style sq1 fill:#fdecec,stroke:#dc2626
+  style sq2 fill:#fdecec,stroke:#dc2626
+  style can fill:#f5ecfe,stroke:#9333ea
+    </pre>
+    <div class="dg-caption">
+      Stall detection and death detection point in opposite directions: a stuck scheduler loop
+      SIGQUITs the <em>parent</em>; a dead child makes the parent SIGQUIT <em>itself</em>
+      (<code>SubprocessWatchdog</code>, added for NCCL C++ terminations that skip Python cleanup —
+      issue #18421). Both dump py-spy stacks first so the hang site is preserved.
+    </div>
+  </div>
+
+  <div class="card">
+    <ul>
+      <li><b>Hard + soft watchdogs.</b> The scheduler installs a hard watchdog with the
+        device-specific timeout (<code>scheduler.py:1187</code>) and, optionally, a log-only soft
+        one (<code>--soft-watchdog-timeout</code>, <code>scheduler.py:1179</code>).
+        <code>Watchdog.create()</code> returns a no-op when unconfigured, and
+        <code>Watchdog.disable()</code> is a context manager for legitimately long operations
+        (you saw the detokenizer use it in chapter 01).</li>
+      <li><b>kv_canary</b> (<code>python/sglang/srt/kv_canary/</code>): production-grade
+        KV-corruption detection. <code>install_canary()</code> patches the KV pool so every KV
+        write also writes a canary record (expected token id/position, optional partial hash of
+        the first 16 bytes of real KV via <code>RealKvHashMode.PARTIAL</code>). Verification
+        kernels check HEAD/TAIL slots each forward, plus an optional every-N-step sweep of all
+        radix-tree-held slots. <code>CanaryMode</code>: <code>log</code> is designed to run in
+        production; <code>raise</code> turns violations into a <code>RuntimeError</code>. A
+        <code>perturb/</code> package deliberately injects corruption to self-test the detector,
+        and a <code>token_oracle/</code> predicts expected input tokens. Gotcha: EAGLE draft
+        pools get <code>kv_token_id_vs_position_offset = 1</code> because their rotated
+        <code>input_ids</code> store K/V for position p+1 (<code>kv_canary/api.py</code>).</li>
+      <li><b>Crash dumps &amp; CUDA coredumps.</b> <code>debug_utils/cuda_coredump.py</code>
+        enables CUDA coredumps via <code>SGLANG_CUDA_COREDUMP</code>;
+        <code>SGLANG_TEST_STUCK_*</code> knobs exist purely to test stuck detection.</li>
+      <li><b>SchedulerInputBlocker</b> (<code>managers/scheduler_input_blocker.py</code>):
+        queues incoming requests while weights update, releasing them via a
+        <code>PollBasedBarrier</code> once all ranks unblock.</li>
+    </ul>
+  </div>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/utils/watchdog.py:149"
+       data-desc="The hard watchdog kill path: dump info, py-spy everyone, then SIGQUIT the parent">
+<pre>
+        if self.dump_info is not None and (info_msg := self.dump_info()):
+            logger.error(f"{self.debug_name} debug info:\n{info_msg}")
+
+        pyspy_dump_schedulers()
+        logger.error(
+            f"{self.debug_name} watchdog timeout "
+            f"({self.watchdog_timeout=}, {self.soft=})"
+        )
+        print(file=sys.stderr, flush=True)
+        print(file=sys.stdout, flush=True)
+
+        if not self.soft:
+            # Wait for some time so that the parent process can print the error.
+            time.sleep(5)
+            self.parent_process.send_signal(signal.SIGQUIT)
+</pre>
+  </div>
+
+  <h2><span class="sec-num">12.6</span>Support subsystems: the long tail</h2>
+  <p>Each of these is a self-contained subsystem that didn't warrant its own chapter — one crisp
+     paragraph each, all under <code>python/sglang/srt/</code> unless noted.</p>
+
+  <p><b><code>state_capturer/</code> — routed-experts replay for RL.</b> Captures per-layer
+    top-k routing decisions during forward into a preallocated
+    <code>(max_batch, num_layers, topk)</code> int32 GPU ring buffer with a pinned host mirror.
+    <code>RoutedExpertsCapturer</code> (<code>routed_experts.py:24</code>) records which experts
+    each token was routed to and returns them in <code>meta_info["routed_experts"]</code>;
+    <code>indexer_topk.py</code> does the same for DSA indexer top-k. Consumers: RL/distillation
+    pipelines that need expert-routing replay.</p>
+
+  <p><b><code>plugins/</code> — an AOP hook registry.</b> Plugins discovered via Python entry
+    points register hooks against dotted paths
+    (e.g. <code>"sglang.srt.managers.scheduler.Scheduler.schedule"</code>);
+    <code>apply_hooks()</code> runs once before the engine serves, and <code>HookSource</code>
+    records which plugin/distribution registered each hook for accountable logging.</p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/plugins/hook_registry.py:60"
+       data-desc="The four hook types">
+<pre>
+class HookType(Enum):
+    """Types of hooks that can be applied to functions or classes."""
+
+    BEFORE = "before"  # Execute before original; can modify args
+    AFTER = "after"  # Execute after original; can modify return value
+    AROUND = "around"  # Wrap original; full control over execution
+    REPLACE = "replace"  # Replace the original function or class entirely
+</pre>
+  </div>
+
+  <p><b><code>weight_cache/</code> — the Weight Cache Daemon.</b> A persistent per-GPU process
+    that "holds post-quantized, TP-sharded model weights in GPU memory and serves them via CUDA
+    IPC handles … over a Unix socket to requesting engine processes"
+    (<code>daemon.py:1–9</code>). One daemon per TP rank; it validates
+    <code>CacheConfig</code> compatibility before serving. Result: engine restarts skip the whole
+    disk → shard → quantize pipeline and become near-instant.</p>
+
+  <p><b><code>checkpoint_engine/</code> — start dummy, become real.</b> Integration with the
+    <code>checkpoint-engine</code> RL weight-update flow: the server starts with
+    <code>--load-format dummy --checkpoint-engine-wait-weights-before-ready</code>, then
+    <code>python -m sglang.srt.checkpoint_engine.update</code> broadcasts real weights in before
+    the server reports ready.</p>
+
+  <p><b><code>session/</code> — server-side multi-turn state.</b> <code>/open_session</code>
+    creates a <code>Session</code> holding a tree of <code>SessionReqNode</code>s in the
+    scheduler; each turn is a node and branching from an earlier turn is supported. Requests
+    carry <code>session_params</code> to append to a node, reusing accumulated tokens instead of
+    resending history. <code>streaming_session.py</code>'s <code>StreamingSession</code>
+    implements <code>BasePrefixCache</code> so held sessions pin their KV — surfaced in the
+    <code>num_streaming_sessions</code> / <code>streaming_session_held_tokens</code> metrics.</p>
+
+  <p><b><code>debug_utils/</code> — dump, compare, truncate, simulate.</b> The tensor
+    <code>dumper.py</code> is an HTTP-controllable dump server (exposed as
+    <code>/dumper/{method}</code>); <code>dump_comparator.py</code> /
+    <code>text_comparator.py</code> diff dumps between runs (the standard "which layer diverged
+    first" workflow); plus <code>cuda_coredump.py</code>, <code>model_truncator.py</code>, a
+    <code>schedule_simulator/</code>, and a <code>source_patcher/</code>.</p>
+
+  <p><b><code>sglang/kernel_api_logging.py</code> (top level)</b> — logs every kernel API call
+    for debugging CUDA crashes: the last logged call before a crash localizes the failing kernel.
+    <b><code>sglang/profiler.py</code></b> — client-side helper that drives
+    <code>/start_profile</code> / <code>/stop_profile</code> against a running server.
+    <b><code>sglang/check_env.py</code></b> — environment doctor: prints versions, GPU topology,
+    and NCCL/driver info for bug reports.</p>
+
+  <p><b><code>sglang/multimodal_gen/</code> — "SGLang Diffusion".</b> A separate image/video
+    <em>generation</em> framework (Wan, FLUX, Qwen-Image and friends) sharing the repo but not
+    the autoregressive engine covered in chapters 01–11. The <code>sglang serve</code> CLI
+    auto-detects diffusion models and routes them here (chapter 01's entry-point diagram).
+    Don't confuse it with <code>srt/multimodal/</code>, which is multimodal <em>understanding</em>
+    (VLM input processors, chapter 05).</p>
+
+  <p><b><code>batch_invariant_ops/</code></b> — batch-size-invariant torch op replacements for
+    deterministic inference: identical results regardless of how requests get batched
+    (see chapter 06). <b><code>dllm/</code></b> — diffusion-LLM decoding support (pluggable
+    decode algorithms like <code>low_confidence.py</code>, scheduler/req mixins); the
+    text-diffusion sibling of the speculative techniques in chapter 09.</p>
+
+  <h2><span class="sec-num">12.7</span>The master map: every directory, one line, one chapter</h2>
+  <p>
+    The coverage guarantee for this site. Below is <em>every</em> entry of
+    <code>python/sglang/srt/</code> — 41 packages plus 5 top-level modules, verified against
+    <code>ls</code> on 2026-08-03 — followed by the top-level module groups of
+    <code>python/sglang/</code>.
+  </p>
+
+  <table class="tbl">
+    <tr><th><code>srt/</code> entry</th><th>Role</th><th>Chapter</th></tr>
+    <tr><td><code>arg_groups/</code></td><td>ServerArgs machinery: auto-derives argparse from dataclass annotations (<code>arg_utils.py</code>), model-override declaration registry (<code>overrides.py</code>), per-feature resolution hooks.</td><td>12</td></tr>
+    <tr><td><code>batch_invariant_ops/</code></td><td>Batch-size-invariant op replacements for deterministic inference.</td><td>06, 12</td></tr>
+    <tr><td><code>batch_overlap/</code></td><td>Two-batch overlap (TBO) / single-batch overlap: interleave micro-batches to hide communication.</td><td>09</td></tr>
+    <tr><td><code>checkpoint_engine/</code></td><td>Start with dummy weights, broadcast real ones in before ready (RL flow).</td><td>12</td></tr>
+    <tr><td><code>compilation/</code></td><td>torch.compile / piecewise CUDA-graph compilation backend.</td><td>06</td></tr>
+    <tr><td><code>configs/</code></td><td><code>ModelConfig</code>, <code>LoadConfig</code>, <code>DeviceConfig</code> + ~50 per-model HF-config shims.</td><td>12 (§12.3), 04</td></tr>
+    <tr><td><code>connector/</code></td><td>Pluggable remote storage (Redis/S3/Azure/remote-instance) for weights and KV.</td><td>08</td></tr>
+    <tr><td><code>constants.py</code></td><td>Tiny shared constants: <code>GPU_MEMORY_TYPE_*</code>, <code>HEALTH_CHECK_RID_PREFIX</code>, <code>GIB_BYTES</code>.</td><td>12</td></tr>
+    <tr><td><code>constrained/</code></td><td>Grammar-constrained decoding: xgrammar/llguidance/outlines backends, jump-forward.</td><td>10</td></tr>
+    <tr><td><code>debug_utils/</code></td><td>Tensor dumper/comparators, CUDA coredumps, model truncator, schedule simulator.</td><td>12 (§12.6)</td></tr>
+    <tr><td><code>disaggregation/</code></td><td>PD disaggregation: bootstrap/transfer queues, mooncake/nixl/ascend KV transfer.</td><td>08</td></tr>
+    <tr><td><code>distributed/</code></td><td>Process-group topology: TP/PP/EP groups, device communicators, custom all-reduce.</td><td>07</td></tr>
+    <tr><td><code>dllm/</code></td><td>Diffusion-LLM decoding algorithms and scheduler mixins.</td><td>09, 12</td></tr>
+    <tr><td><code>elastic_ep/</code></td><td>Elastic expert parallelism: resize EP world at runtime with expert backup/restore.</td><td>07</td></tr>
+    <tr><td><code>entrypoints/</code></td><td>HTTP server, in-process <code>Engine</code>, gRPC server, OpenAI/Anthropic layers.</td><td>01, 11</td></tr>
+    <tr><td><code>environ.py</code></td><td>Typed env-var registry (<code>envs.SGLANG_*</code>).</td><td>12 (§12.3)</td></tr>
+    <tr><td><code>eplb/</code></td><td>Expert-parallel load balancing: distribution recorder, rebalancing algorithms.</td><td>07</td></tr>
+    <tr><td><code>function_call/</code></td><td>Tool-call parsers, one detector per model family.</td><td>10</td></tr>
+    <tr><td><code>grpc/</code></td><td>Placeholder package; the real gRPC server is <code>entrypoints/grpc_server.py</code> + <code>/proto</code>.</td><td>11</td></tr>
+    <tr><td><code>hardware_backend/</code></td><td>Per-vendor glue: cpu/gpu/mlx/musa/npu/xpu.</td><td>06</td></tr>
+    <tr><td><code>kv_canary/</code></td><td>Runtime KV-corruption detector with self-test perturbation.</td><td>12 (§12.5)</td></tr>
+    <tr><td><code>layers/</code></td><td>All NN layers: attention backends, MoE, quantization, sampler, logits processor.</td><td>05</td></tr>
+    <tr><td><code>lora/</code></td><td>LoRA serving: adapter manager, punica-style backends, slot pool.</td><td>05</td></tr>
+    <tr><td><code>managers/</code></td><td>The process managers: tokenizer/scheduler/detokenizer, DP controller, IO structs.</td><td>01, 02</td></tr>
+    <tr><td><code>mem_cache/</code></td><td>KV pools, allocators, radix cache, HiCache, KV events.</td><td>03, 08</td></tr>
+    <tr><td><code>model_executor/</code></td><td><code>ModelRunner</code> (frozen core file), forward batch info, CUDA-graph runners.</td><td>04</td></tr>
+    <tr><td><code>model_loader/</code></td><td>Weight loading, remote-instance loader, weight validation.</td><td>04</td></tr>
+    <tr><td><code>models/</code></td><td>~200 model implementations.</td><td>05</td></tr>
+    <tr><td><code>multimodal/</code></td><td>Multimodal <em>understanding</em> processors (per-model), video sampling, vision utils.</td><td>05</td></tr>
+    <tr><td><code>multiplex/</code></td><td>PD multiplexing on one GPU: SM partitioning into prefill/decode stream groups.</td><td>08</td></tr>
+    <tr><td><code>observability/</code></td><td>Metrics collectors, OTel tracing, forward-pass ZMQ telemetry, request logging.</td><td>12 (§12.1)</td></tr>
+    <tr><td><code>parser/</code></td><td>Chat templates/conversation, harmony &amp; reasoning parsers, code completion.</td><td>10, 11</td></tr>
+    <tr><td><code>platforms/</code></td><td>Platform abstraction + out-of-tree platform plugin interface.</td><td>06</td></tr>
+    <tr><td><code>plugins/</code></td><td>AOP hook registry (BEFORE/AFTER/AROUND/REPLACE).</td><td>12 (§12.6)</td></tr>
+    <tr><td><code>ray/</code></td><td>Ray deployment: <code>RayEngine</code>, scheduler actor, Ray DP controller.</td><td>11</td></tr>
+    <tr><td><code>runtime_context.py</code></td><td>Process-global config bags, flags, resources, per-forward state.</td><td>12 (§12.3)</td></tr>
+    <tr><td><code>sampling/</code></td><td>Sampling params + batched sampling metadata (penalties, custom logit processors).</td><td>10</td></tr>
+    <tr><td><code>server_args.py</code></td><td>The 9,392-line <code>ServerArgs</code> dataclass — every CLI flag.</td><td>12 (§12.3)</td></tr>
+    <tr><td><code>server_args_config_parser.py</code></td><td>YAML <code>--config</code> merging (CLI &gt; config &gt; defaults).</td><td>12 (§12.3)</td></tr>
+    <tr><td><code>session/</code></td><td>Session trees + KV-pinning streaming sessions.</td><td>12 (§12.6), 01</td></tr>
+    <tr><td><code>speculative/</code></td><td>Speculative decoding: EAGLE, dflash, dspark, ngram…</td><td>09</td></tr>
+    <tr><td><code>state_capturer/</code></td><td>Per-forward routed-experts / indexer top-k capture for RL replay.</td><td>12 (§12.6)</td></tr>
+    <tr><td><code>tokenizer/</code></td><td>Single file: tiktoken tokenizer wrapper for models shipping tiktoken vocabularies.</td><td>01</td></tr>
+    <tr><td><code>utils/</code></td><td>Real infrastructure grab-bag: watchdogs, py-spy dumps, prometheus setup, <code>MultiprocessingSerializer</code> (CUDA-IPC tensor shipping), memory-saver adapter, offloader, profiling utils, invariant checks.</td><td>12</td></tr>
+    <tr><td><code>weight_cache/</code></td><td>Weight Cache Daemon: post-quantized shards via CUDA IPC for instant restarts.</td><td>12 (§12.6)</td></tr>
+    <tr><td><code>weight_sync/</code></td><td>RL weight-sync helpers: flattened tensor buckets, trainer→engine update utils.</td><td>12</td></tr>
+  </table>
+
+  <table class="tbl">
+    <tr><th>Top-level module group (<code>python/sglang/</code>)</th><th>Role</th><th>Chapter</th></tr>
+    <tr><td><code>lang/</code>, <code>cli/</code>, <code>launch_server.py</code>, <code>global_config.py</code></td><td>The frontend DSL (<code>sgl.function</code>, chained generation) and the <code>sglang serve</code> CLI.</td><td>11</td></tr>
+    <tr><td><code>bench_serving.py</code>, <code>bench_offline_throughput.py</code>, <code>bench_one_batch.py</code>, <code>bench_one_batch_server.py</code>, <code>benchmark/</code>, <code>eval/</code>, <code>test/</code></td><td>Benchmark and evaluation harness — the standard tools for measuring any change.</td><td>11</td></tr>
+    <tr><td><code>multimodal_gen/</code></td><td>"SGLang Diffusion": separate image/video generation framework (Wan, FLUX, Qwen-Image).</td><td>12 (§12.6)</td></tr>
+    <tr><td><code>kernels/</code>, <code>compile_deep_gemm.py</code>, <code>check_env.py</code>, <code>profiler.py</code>, <code>kernel_api_logging.py</code>, <code>utils.py</code>, <code>version.py</code></td><td>JIT kernels + operational tooling (environment doctor, remote profiler client, kernel-call logging).</td><td>06, 12</td></tr>
+  </table>
+
+  <div class="callout note"><span class="co-title">Outside <code>python/</code></span>
+    The repo also contains <code>sgl-kernel/</code> (AOT CUDA/C++ kernels, chapter 06),
+    <code>rust/</code> and <code>sgl-model-gateway/</code> (the Rust router/gateway, chapter 08),
+    <code>proto/</code> (the gRPC <code>SglangService</code> definition, chapter 11),
+    <code>3rdparty/</code>, <code>test/</code>, and <code>docs_new/</code>.
+  </div>
+
+  <h2><span class="sec-num">12.8</span>Debugging a production incident — the tools as a story</h2>
+  <p>
+    A synthetic but realistic incident that chains together everything from §12.1–§12.6:
+    at 03:12 UTC your load balancer marks an 8×GPU replica unhealthy.
+  </p>
+
+  <div class="stepper" id="st-incident">
+    <div class="st-scene">
+      <div class="sc-row" style="gap:12px">
+        <div class="sc-box" id="in-health">GET /health<small>1-token probe, 20 s heartbeat window</small></div>
+        <div class="sc-box" id="in-metrics">GET /metrics<small>queue depth, token_usage, throughput</small></div>
+        <div class="sc-box" id="in-wd">Hard watchdog<small>utils/watchdog.py</small></div>
+      </div>
+      <div class="sc-row" style="gap:12px; margin-top:16px">
+        <div class="sc-box" id="in-pyspy">py-spy dumps<small>all scheduler procs</small></div>
+        <div class="sc-box" id="in-sigquit">SIGQUIT → parent<small>clean teardown + logs</small></div>
+        <div class="sc-box" id="in-canary">--kv-canary log<small>violation ring</small></div>
+      </div>
+      <div class="sc-row" style="gap:12px; margin-top:16px">
+        <div class="sc-box" id="in-dumper">/dumper + comparator<small>debug_utils/</small></div>
+        <div class="sc-box appear" id="in-fixed">Root cause filed<small>replica back in rotation</small></div>
+      </div>
+    </div>
+  </div>
+
+  <h2><span class="sec-num">12.9</span>Notable facts &amp; gotchas</h2>
+  <div class="card">
+    <ul>
+      <li><b>The health probe measures the heartbeat, not the probe.</b> <code>/health</code>
+        passes as soon as <code>last_receive_tstamp</code> advances — <em>any</em> detokenizer
+        output within 20 s counts, so a busy-but-alive server never pays for health checks
+        (the probe request is simply never scheduled).</li>
+      <li><b>Prometheus import order is a hard constraint</b>: six files defer
+        <code>import prometheus_client</code> with the identical comment because
+        <code>PROMETHEUS_MULTIPROC_DIR</code> must be set first.</li>
+      <li><b><code>sglang:token_usage</code> is a max, not a sum</b> — the bottleneck across
+        full/SWA/mamba pools; the code itself carries a FIXME that the name is misleading but
+        renaming needs an API deprecation.</li>
+      <li><b>Two watchdog directions:</b> loop stall → SIGQUIT the <em>parent</em>; dead child
+        without Python cleanup → SIGQUIT <em>self</em> (<code>SubprocessWatchdog</code>, issue
+        #18421). Both run <code>pyspy_dump_schedulers()</code> first.</li>
+      <li><b>The scheduler pushes per-iteration metrics over ZMQ PUB for Dynamo</b>
+        (<code>FPM_VERSION = 1</code>) — a push channel entirely parallel to Prometheus.</li>
+      <li><b>DP-cooperation metrics deliberately omit <code>num_decode_ranks</code></b> to avoid
+        Prometheus label-cardinality explosion; derive it as
+        <code>world_size − num_prefill_ranks</code> (metrics_collector.py:173).</li>
+      <li><b><code>if envs.SGLANG_X:</code> raises by design</b> — the descriptor's
+        <code>__bool__</code> is a <code>RuntimeError</code>, forcing <code>.get()</code>.</li>
+      <li><b><code>managers/configure_logging.py</code> is not a manager</b> — it's a 70-line CLI
+        client that POSTs to the <code>/configure_logging</code> endpoint.</li>
+      <li><b>kv_canary ships its own saboteur:</b> the <code>perturb/</code> package injects
+        corruption on purpose so the detector can be validated end-to-end; it's incompatible with
+        piecewise-CUDA-graph prefill (asserted in <code>install_canary</code>).</li>
+      <li><b>Two "multimodal" trees:</b> <code>srt/multimodal/</code> = understanding (VLM
+        inputs); top-level <code>multimodal_gen/</code> = SGLang Diffusion, a separate
+        image/video generation stack.</li>
+    </ul>
+  </div>
+
+  <div id="pager"></div>
+  </div>
+</main>
+</div>
+
+<script>
+document.addEventListener("DOMContentLoaded", () => {
+
+  new Stepper("#st-metric", {
+    title: "One request, two histograms, one scrape",
+    intro: "Queue time is recorded in the scheduler subprocess; TTFT in the main process. Prometheus multiprocess mode merges them.",
+    autoMs: 3400,
+    reset(sc) {
+      clearState(sc, ".sc-box,.tok");
+      rmCls(sc, ".appear", "in");
+    },
+    steps: [
+      { cap: "10:00:00.000 — <code>cmpl-7f3a</code> lands in the scheduler's <code>waiting_queue</code>. <code>ReqTimeStats</code> stamps <code>wait_queue_entry_time</code> (<code>observability/req_time_stats.py</code>).",
+        run(sc) { setCls(sc, "#mt-req", "hl"); setCls(sc, "#mt-queue", "hl"); setCls(sc, "#mt-rts", "hl", "pulse"); } },
+      { cap: "10:00:00.420 — the request is admitted to a prefill batch. <code>set_forward_entry_time()</code> fires exactly once and calls <code>metrics_collector.observe_queue_time(0.42)</code> (<code>req_time_stats.py:749</code>).",
+        run(sc) { rmCls(sc, "#mt-rts", "pulse"); setCls(sc, "#mt-queue", "ok"); setCls(sc, "#mt-hist", "hl", "pulse"); } },
+      { cap: "The <code>sglang:queue_time_seconds</code> histogram increments bucket <code>le=0.5</code> — still entirely inside the <b>scheduler subprocess</b>. prometheus_client's multiprocess backend writes the increment into that PID's mmap shard under <code>PROMETHEUS_MULTIPROC_DIR</code>.",
+        run(sc) { rmCls(sc, "#mt-hist", "pulse"); setCls(sc, "#mt-hist", "ok"); setCls(sc, "#mt-shard", "hl"); } },
+      { cap: "10:00:00.610 — the first detokenized chunk reaches <code>TokenizerManager.collect_metrics()</code> in the <b>main process</b> (<code>tokenizer_manager.py:2723</code>). <code>state.ttft_observed</code> flips and <code>observe_time_to_first_token(0.61)</code> records TTFT.",
+        run(sc) { setCls(sc, "#mt-tok", "hl"); setCls(sc, "#mt-ttft", "hl", "pulse"); } },
+      { cap: "That histogram lives in a different collector (<code>TokenizerMetricsCollector</code>) and a different process — but its increments land in the <em>same</em> shard directory, under the main process's PID.",
+        run(sc) { rmCls(sc, "#mt-ttft", "pulse"); setCls(sc, "#mt-ttft", "ok"); setCls(sc, "#mt-shard", "ok", "pulse"); } },
+      { cap: "Prometheus scrapes <code>GET /metrics</code>. The mounted ASGI app's <code>MultiProcessCollector</code> (<code>utils/common.py:2360</code>) reads every PID's shards and merges series across processes at scrape time.",
+        run(sc) { rmCls(sc, "#mt-shard", "pulse"); setCls(sc, "#mt-scrape", "in", "hl"); } },
+      { cap: "The dashboard plots <code>histogram_quantile(0.9, rate(sglang:time_to_first_token_seconds_bucket[5m]))</code> — one PromQL query over data recorded by two different Python processes. Every subsequent decode step of <code>cmpl-7f3a</code> also feeds <code>sglang:inter_token_latency_seconds</code>.",
+        run(sc) { rmCls(sc, "#mt-scrape", "hl"); setCls(sc, "#mt-scrape", "ok"); setCls(sc, "#mt-dash", "in", "ok", "pulse"); setCls(sc, "#mt-req", "ok"); } },
+    ],
+  });
+
+  new Stepper("#st-incident", {
+    title: "03:12 UTC: replica marked unhealthy",
+    intro: "Chaining the operational tools: health probe → metrics → watchdog → py-spy → canary → dump comparator.",
+    autoMs: 3600,
+    reset(sc) {
+      clearState(sc, ".sc-box,.tok");
+      rmCls(sc, ".appear", "in");
+    },
+    steps: [
+      { cap: "The LB's <code>GET /health</code> starts returning 503: the 1-token probe was submitted, but <code>last_receive_tstamp</code> did not advance within <code>SGLANG_HEALTH_CHECK_TIMEOUT</code> = 20 s — <b>no detokenizer output at all</b>. The log shows <code>tic start time</code> vs <code>last_heartbeat time</code> (http_server.py:712).",
+        run(sc) { setCls(sc, "#in-health", "bad"); } },
+      { cap: "First reflex: <code>curl :30000/metrics</code>. <code>sglang:num_queue_reqs</code> = 412 and climbing, <code>sglang:gen_throughput</code> = 0, <code>sglang:token_usage</code> frozen at 0.87. Requests arrive but no forward passes complete — this is a <b>stall</b>, not overload.",
+        run(sc) { setCls(sc, "#in-metrics", "hl", "pulse"); } },
+      { cap: "60 s later the scheduler's hard watchdog trips: its heartbeat counter (fed each loop iteration) hasn't moved past <code>watchdog_timeout</code>.",
+        run(sc) { rmCls(sc, "#in-metrics", "pulse"); setCls(sc, "#in-metrics", "warn"); setCls(sc, "#in-wd", "hl", "pulse"); } },
+      { cap: "Before killing anything it calls <code>pyspy_dump_schedulers()</code> — a stack dump of <em>every</em> scheduler process. The dumps show ranks 0–6 blocked in an NCCL all-reduce and rank 7 inside a HiCache host transfer: a classic divergence hang (see the <code>debug-distributed-hang</code> playbook).",
+        run(sc) { rmCls(sc, "#in-wd", "pulse"); setCls(sc, "#in-pyspy", "hl", "ok"); } },
+      { cap: "Then <code>time.sleep(5)</code> (so the parent can flush logs) and <code>SIGQUIT</code> to the parent (watchdog.py:163). The replica dies loudly with stacks preserved instead of zombie-ing. Had a rank died in C++ instead, <code>SubprocessWatchdog</code> would have fired the other direction.",
+        run(sc) { setCls(sc, "#in-wd", "bad"); setCls(sc, "#in-sigquit", "hl", "pulse"); } },
+      { cap: "Postmortem thread #2: the incident review notes some responses were garbled <em>before</em> the hang. The replica is relaunched with <code>--kv-canary log</code> — every KV write now carries a canary record, verified HEAD/TAIL each forward plus a periodic radix-tree sweep, logging violations without ever raising in production.",
+        run(sc) { rmCls(sc, "#in-sigquit", "pulse"); setCls(sc, "#in-sigquit", "ok"); setCls(sc, "#in-canary", "hl", "pulse"); } },
+      { cap: "The violation ring pins corruption to specific pool slots right after HiCache load-backs. To confirm the layer, engineers replay the offending prompt with the <code>debug_utils</code> dumper enabled (<code>/dumper/{method}</code>) on a good and a bad build, then run <code>dump_comparator.py</code> to find the first diverging tensor.",
+        run(sc) { rmCls(sc, "#in-canary", "pulse"); setCls(sc, "#in-canary", "warn"); setCls(sc, "#in-dumper", "hl", "ok"); } },
+      { cap: "Root cause filed with py-spy stacks, canary slot IDs, and the tensor diff attached; the fix ships, <code>--kv-canary log</code> stays on as a tripwire, and the replica returns to rotation. Every tool in this story lives in this chapter's map.",
+        run(sc) { setCls(sc, "#in-fixed", "in", "ok", "pulse"); setCls(sc, "#in-health", "ok"); } },
+    ],
+  });
+
+});
+</script>
+</body>
+</html>

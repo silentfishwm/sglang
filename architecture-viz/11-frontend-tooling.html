@@ -1,0 +1,708 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>11 · APIs, Frontend DSL &amp; Benchmarks — SGLang Internals</title>
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/mermaid.min.js"></script>
+<script src="assets/viz.js"></script>
+</head>
+<body>
+<div class="layout">
+<main>
+  <div class="page-hero"><div class="content">
+    <span class="phase-badge">Phase VI · Interfaces &amp; Operations</span>
+    <h1>11 · The Front Door: Language DSL, CLI, Benchmarks &amp; Tests</h1>
+    <p class="lede">
+      Chapters 01–10 lived inside the server. This chapter covers everything that stands
+      <em>in front of</em> it: the original SGLang frontend language (the project's namesake),
+      the <code>sglang</code> CLI, the benchmarking &amp; eval toolchain that defines the numbers
+      everyone quotes (TTFT, TPOT, ITL), and the CI/test machinery that keeps 95 workflows honest.
+    </p>
+  </div></div>
+
+  <div class="content">
+
+  <h2><span class="sec-num">11.1</span>The original "SGLang": a language, not a server</h2>
+  <p>
+    The project name stands for <b>S</b>tructured <b>G</b>eneration <b>Lang</b>uage — before SGLang
+    was a famous inference engine, it was a Python-embedded DSL for programming multi-call LLM
+    workflows (the NeurIPS 2024 paper "SGLang: Efficient Execution of Structured Language Model
+    Programs" describes both halves: the frontend language and the RadixAttention runtime).
+    The language still ships in <code>python/sglang/lang/</code> and is worth understanding for two
+    reasons: it is the cleanest demonstration of <em>why</em> the server has features like radix
+    prefix caching and zero-token logprob scoring, and several root-level benchmarks
+    (<code>benchmark/gsm8k</code>, <code>benchmark/tree_of_thought_deep</code>, …) are written in it.
+  </p>
+  <p>
+    A program is an ordinary Python function decorated with <code>@sgl.function</code>
+    (<code>lang/api.py</code>), whose first argument <em>must literally be named</em> <code>s</code> —
+    enforced by <code>assert argspec.args[0] == "s", 'The first argument must be "s"'</code>
+    in <code>SglFunction.__init__</code> (<code>lang/ir.py:149</code>). The body builds a prompt by
+    <code>+=</code>-ing expressions onto <code>s</code>. Plain strings become
+    <code>SglConstantText</code>; the full IR vocabulary in <code>lang/ir.py</code> is:
+    <code>SglGen</code>, <code>SglSelect</code>, <code>SglConstantText</code>, <code>SglExprList</code>,
+    <code>SglArgument</code>, <code>SglImage</code>, <code>SglVideo</code>,
+    <code>SglRoleBegin</code>/<code>SglRoleEnd</code>, <code>SglVariable</code>,
+    <code>SglVarScopeBegin</code>/<code>SglVarScopeEnd</code>, <code>SglFork</code>,
+    <code>SglGetForkItem</code>, <code>SglConcateAndAppend</code>, <code>SglCommitLazy</code>,
+    and <code>SglSeparateReasoning</code>.
+  </p>
+
+  <div class="diagram">
+    <div class="dg-title">The DSL stack: program → interpreter → backend → server</div>
+    <pre class="mermaid">
+flowchart LR
+  prog["@sgl.function<br/>def few_shot_qa(s, question)"] --> sf["SglFunction<br/><i>lang/ir.py</i>"]
+  sf -- ".run(question=...)" --> rp["run_program()<br/><i>lang/interpreter.py</i>"]
+  rp --> se["StreamExecutor<br/>queue.Queue + worker thread"]
+  ir["IR nodes<br/>SglConstantText · SglGen · SglSelect<br/>SglRoleBegin/End · SglConcateAndAppend"] -- "s += expr submits" --> se
+  se --> disp["_execute() isinstance dispatch"]
+  disp --> rt["RuntimeEndpoint<br/>HTTP POST /generate"]
+  disp --> api["OpenAI · Anthropic · VertexAI<br/>LiteLLM · Crusoe"]
+  rt --> srv["SGLang SRT server<br/>(chapters 01-10)"]
+  api --> ext["external LLM APIs"]
+  style se fill:#eef0ff,stroke:#4f46e5
+  style rt fill:#e7f7ec,stroke:#16a34a
+  style srv fill:#e7f7ec,stroke:#16a34a
+    </pre>
+    <div class="dg-caption">
+      7 backend files live in <code>python/sglang/lang/backend/</code>:
+      <code>base_backend.py</code> (the <code>BaseBackend</code> ABC), <code>runtime_endpoint.py</code>
+      (<code>RuntimeEndpoint</code>, talks to an SRT server), plus <code>openai.py</code>,
+      <code>anthropic.py</code>, <code>vertexai.py</code>, <code>litellm.py</code>, <code>crusoe.py</code>.
+      Only <code>RuntimeEndpoint</code> sets <code>support_concate_and_append = True</code>
+      (<code>runtime_endpoint.py:35</code>).
+    </div>
+  </div>
+
+  <p>
+    The crucial design decision: <b>there is no compile step in the normal path</b>. Your Python
+    function executes eagerly, but every <code>s += expr</code>
+    (<code>ProgramState.__iadd__</code>) just <em>submits</em> the IR node to a
+    <code>StreamExecutor</code> — "a stream executor that executes SGL expressions in a background
+    thread" (its docstring, <code>interpreter.py:274</code>). Your code returns immediately;
+    generation streams asynchronously; and reading <code>state["answer"]</code> blocks on a
+    per-variable <code>threading.Event</code>. It's a futures system disguised as string concatenation:
+  </p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/lang/interpreter.py:342" data-desc="The whole execution model in 16 lines: lazy submit, queue sync, blocking variable reads">
+<pre>
+def submit(self, expr: SglExpr):
+    self._init_var_event(expr)
+
+    if self.use_thread:
+        self.queue.put(expr)
+    else:
+        self._execute(expr)
+
+def sync(self):
+    if self.use_thread:
+        self.queue.join()
+
+def get_var(self, name):
+    if name in self.variable_event:
+        self.variable_event[name].wait()
+    return self.variables[name]
+</pre>
+  </div>
+
+  <p>
+    The worker thread pops nodes and dispatches on type — a plain <code>isinstance</code> chain,
+    no visitor pattern, no bytecode:
+  </p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/lang/interpreter.py:467" data-desc="StreamExecutor._execute dispatch (later branches for image/video/variable scopes/concate trimmed)">
+<pre>
+if isinstance(other, SglConstantText):
+    self._execute_fill(other.value)
+elif isinstance(other, SglGen):
+    self._execute_gen(other)
+elif isinstance(other, SglSelect):
+    self._execute_select(other)
+elif isinstance(other, SglExprList):
+    for x in other.expr_list:
+        self._execute(x)
+elif isinstance(other, SglRoleBegin):
+    self._execute_role_begin(other)
+elif isinstance(other, SglRoleEnd):
+    self._execute_role_end(other)
+</pre>
+  </div>
+
+  <div class="callout note"><span class="co-title">Where the tracer fits</span>
+    A separate <code>lang/tracer.py</code> <em>can</em> build a static graph by running the function
+    against a tracing state — that's what the <code>SglFork</code>/<code>SglGetForkItem</code> IR nodes
+    exist for. Live execution never uses them (forking clones executors instead, §11.3). Tracing is
+    used by <code>cache_program</code> (<code>interpreter.py</code>): when
+    <code>run_batch</code> gets more than one argument set and
+    <code>global_config.enable_precache_with_tracing</code> is on, it extracts the constant prompt
+    prefix shared by the whole batch and pre-caches it on the server (only if longer than 64 chars).
+  </div>
+
+  <h2><span class="sec-num">11.2</span>Running a program, step by step</h2>
+  <p>
+    Two runnable programs, verbatim from <code>examples/frontend_language/</code>. The first is the
+    canonical few-shot QA hello-world; the second uses <code>fork</code> for parallelism — we'll
+    execute it in the stepper below.
+  </p>
+
+  <div class="snippet" data-lang="python" data-file="examples/frontend_language/quick_start/local_example_complete.py:9" data-desc="Hello world: decorator, gen, blocking read (setup lines from __main__ appended after the marker)">
+<pre>
+@sgl.function
+def few_shot_qa(s, question):
+    s += """The following are questions with answers.
+Q: What is the capital of France?
+A: Paris
+Q: What is the capital of Germany?
+A: Berlin
+Q: What is the capital of Italy?
+A: Rome
+"""
+    s += "Q: " + question + "\n"
+    s += "A:" + sgl.gen("answer", stop="\n", temperature=0)
+
+# --- from __main__ (line 55) ---
+runtime = sgl.Runtime(model_path="meta-llama/Llama-2-7b-chat-hf")
+sgl.set_default_backend(runtime)
+state = few_shot_qa.run(question="What is the capital of the United States?")
+</pre>
+  </div>
+
+  <div class="callout fact"><span class="co-title">Runtime vs Engine</span>
+    <code>sgl.Runtime</code> spawns a <em>full HTTP server subprocess</em> and polls
+    <code>/health_generate</code> until it's up — it is the frontend's way of getting a server
+    without a terminal (<code>runtime_endpoint.py:356</code>). It is explicitly distinct from
+    <code>sgl.Engine</code>, the in-process offline engine from chapter 01. Streaming reads work per
+    variable: <code>state.text_iter("answer")</code> yields chunks as
+    <code>stream_var_event</code> fires.
+  </div>
+
+  <div class="snippet" data-lang="python" data-file="examples/frontend_language/usage/readme_examples.py:25" data-desc="The paper's signature example: fork two branches, generate in parallel, join">
+<pre>
+@sgl.function
+def tip_suggestion(s):
+    s += (
+        "Here are two tips for staying healthy: "
+        "1. Balanced Diet. 2. Regular Exercise.\n\n"
+    )
+
+    forks = s.fork(2)
+    for i, f in enumerate(forks):
+        f += f"Now, expand tip {i+1} into a paragraph:\n"
+        f += sgl.gen(f"detailed_tip", max_tokens=256, stop="\n\n")
+
+    s += "Tip 1:" + forks[0]["detailed_tip"] + "\n"
+    s += "Tip 2:" + forks[1]["detailed_tip"] + "\n"
+    s += "In summary" + sgl.gen("summary")
+</pre>
+  </div>
+
+  <div class="stepper" id="st-dsl">
+    <div class="st-scene">
+      <div style="display:grid; grid-template-columns: repeat(3, minmax(230px, 1fr)); gap:12px; min-width:760px">
+        <div class="sc-box" id="d-py" style="text-align:center">User Python thread<small>tip_suggestion.run()</small></div>
+        <div class="sc-box" id="d-exec" style="text-align:center">Parent StreamExecutor<small>queue.Queue + worker thread</small></div>
+        <div class="sc-box" id="d-srv" style="text-align:center">SRT server<small>POST /generate</small></div>
+      </div>
+      <div class="sc-row" style="margin-top:14px; gap:8px; flex-wrap:wrap">
+        <div class="tok appear" id="d-q1" style="width:auto; height:auto; padding:4px 10px">SglConstantText("Here are two tips…")</div>
+        <div class="tok appear" id="d-q2" style="width:auto; height:auto; padding:4px 10px">fork(2) → SglCommitLazy + sync()</div>
+      </div>
+      <div style="display:grid; grid-template-columns: repeat(2, minmax(280px, 1fr)); gap:12px; margin-top:14px; min-width:600px">
+        <div class="sc-box appear" id="d-f0">Child StreamExecutor #0<small>copies variables · text_ · messages_ · fork_start_text_pos=76</small></div>
+        <div class="sc-box appear" id="d-f1">Child StreamExecutor #1<small>own queue + own worker thread</small></div>
+        <div class="tok appear" id="d-g0" style="width:auto; height:auto; padding:4px 10px">"expand tip 1" + SglGen("detailed_tip")</div>
+        <div class="tok appear" id="d-g1" style="width:auto; height:auto; padding:4px 10px">"expand tip 2" + SglGen("detailed_tip")</div>
+      </div>
+      <div class="sc-row" style="margin-top:14px; gap:12px; flex-wrap:wrap">
+        <div class="sc-box appear" id="d-join">forks[0]["detailed_tip"]<small>variable_event["detailed_tip"].wait()</small></div>
+        <div class="sc-box appear" id="d-sum">s += "In summary" + sgl.gen("summary")<small>queued on parent</small></div>
+        <div class="sc-box appear" id="d-read">state["summary"]<small>caller blocks until Event fires</small></div>
+      </div>
+    </div>
+  </div>
+
+  <h3>select(): classification without generating a single token</h3>
+  <p>
+    <code>sgl.gen(name, choices=["Paris", "London"])</code> doesn't sample at all — it is sugar for
+    <code>SglSelect</code> (<code>api.py:102</code>), and <code>RuntimeEndpoint.select</code>
+    (<code>runtime_endpoint.py:248</code>) implements it by <em>scoring</em> each choice as a prompt
+    continuation with <code>max_new_tokens=0</code> and <code>return_logprob=True</code>:
+  </p>
+
+  <div class="diagram">
+    <div class="dg-title">select() = up to three zero-token /generate calls</div>
+    <pre class="mermaid">
+sequenceDiagram
+  participant E as StreamExecutor
+  participant R as RuntimeEndpoint
+  participant S as SRT server
+  E->>R: select(s, choices=["Paris","London"], temperature=0)
+  R->>S: POST /generate — text=s.text_, max_new_tokens=0
+  S-->>R: meta_info.prompt_tokens = 42 (prefix now radix-cached)
+  Note over R: logprob_start_len = max(42-2, 0) = 40 — "For token healing"
+  R->>S: POST /generate — text=[s.text_+"Paris", s.text_+"London"]<br/>batched, max_new_tokens=0, return_logprob=true
+  S-->>R: input_token_logprobs per choice
+  Note over R: normalized = mean(input logprobs)<br/>subtract healed-token logprob if boundary token unchanged
+  opt choices_method.requires_unconditional_logprobs
+    R->>S: POST /generate — input_ids of the bare choices
+    S-->>R: unconditional_token_logprobs
+  end
+  R-->>E: ChoicesDecision(decision="Paris")
+    </pre>
+    <div class="dg-caption">
+      Verified flow from <code>runtime_endpoint.py:248-315</code>. Three scoring strategies live in
+      <code>lang/choices.py</code>: <code>TokenLengthNormalized</code> (default singleton
+      <code>token_length_normalized</code> — argmax of mean prompt logprob),
+      <code>GreedyTokenSelection</code>, and <code>UnconditionalLikelihoodNormalized</code>
+      (the only one that triggers the third request, normalizing away token-frequency bias).
+    </div>
+  </div>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/lang/backend/runtime_endpoint.py:257" data-desc="select(): cache the prefix, then score all choices in ONE batched zero-token request">
+<pre>
+# Cache common prefix
+data = {"text": s.text_, "sampling_params": {"max_new_tokens": 0}}
+obj = self._generate_http_request(s, data)
+prompt_len = obj["meta_info"]["prompt_tokens"]
+logprob_start_len = max(prompt_len - 2, 0)  # For token healing
+
+# Compute logprob
+data = {
+    "text": [s.text_ + c for c in choices],
+    "sampling_params": {
+        "max_new_tokens": 0,
+        "temperature": 0,
+    },
+    "return_logprob": True,
+    "return_text_in_logprobs": True,
+    "logprob_start_len": logprob_start_len,
+}
+obj = self._generate_http_request(s, data)
+</pre>
+  </div>
+
+  <div class="callout note"><span class="co-title">Why start two tokens early?</span>
+    Appending <code>"Paris"</code> to the prompt can merge with the prompt's last token during
+    retokenization ("token healing"). Starting logprobs at <code>prompt_len - 2</code> captures the
+    boundary token; afterwards the code checks whether <code>s.text_</code> still ends with that
+    token's text and, if so, arithmetically removes its logprob from the normalized mean
+    (<code>runtime_endpoint.py:283-292</code>) so unhealed choices aren't penalized.
+  </div>
+
+  <h2><span class="sec-num">11.3</span>fork/join and server-side KV reuse</h2>
+  <p>
+    <code>state.fork(2)</code> makes the parent executor <code>sync()</code>, then constructs two brand-new
+    <code>StreamExecutor</code>s — each with its own queue and worker thread — copying
+    <code>variables</code>, <code>text_</code>, <code>messages_</code>, and recording
+    <code>fork_start_text_pos = len(self.text_)</code> (<code>interpreter.py:370-402</code>). The returned
+    <code>ProgramStateGroup</code> broadcasts <code>+=</code> to every branch (a lambda receives the
+    branch index). <code>join()</code> has two modes (<code>interpreter.py:1052</code>):
+  </p>
+  <ul>
+    <li><b><code>"gather_variable"</code></b> (default) — sync each child, then copy variables the
+      children created back into the parent as lists.</li>
+    <li><b><code>"concate_and_append"</code></b> — the parent submits <code>SglConcateAndAppend</code>.
+      If <code>global_config.enable_parallel_encoding</code> is on <em>and</em> the backend advertises
+      <code>support_concate_and_append</code>, the interpreter asks the backend to merge the branches'
+      <b>KV caches server-side</b>: <code>RuntimeEndpoint.concatenate_and_append</code> posts
+      <code>{"src_rids": [...], "dst_rid": ...}</code> to <code>/concate_and_append_request</code>
+      (<code>runtime_endpoint.py:317-324</code>). Otherwise it falls back to plain text concatenation.</li>
+  </ul>
+
+  <div class="callout warn"><span class="co-title">Legacy endpoint alert</span>
+    <code>/concate_and_append_request</code> exists <em>only on the client side</em> in this repo —
+    no route in <code>python/sglang/srt/</code> implements it anymore, so the KV-merge join is a
+    legacy path from the paper era that would 404 against today's server. In practice you don't
+    miss it: because every forked branch shares the parent's prefix
+    (<code>fork_start_text_pos</code>), the <b>RadixAttention tree from chapter 03 deduplicates the
+    shared prefix KV automatically</b> when the branches' <code>/generate</code> calls land — fork/join
+    parallelism gets prefix reuse for free.
+  </div>
+
+  <h2><span class="sec-num">11.4</span>The CLI and the module map</h2>
+  <p>
+    The modern entry point is the <code>sglang</code> console script — declared as
+    <code>sglang = "sglang.cli.main:main"</code> in <code>python/pyproject.toml</code>
+    (a second script, <code>killall_sglang</code>, maps to <code>sglang.cli.killall:main</code>).
+    <code>cli/main.py</code> is a thin argparse dispatcher with three subcommands:
+  </p>
+
+  <table class="tbl">
+    <tr><th>Command</th><th>What it does</th><th>Where</th></tr>
+    <tr><td><code>sglang serve &lt;model&gt;</code></td>
+      <td>Launches a server. Auto-detects LLM vs diffusion from the model path
+        (override: <code>--model-type {auto,llm,diffusion}</code>); LLMs go through
+        <code>srt.entrypoints.http_server</code>, diffusion through <code>sglang.multimodal_gen</code>.
+        The positional model path is rewritten into <code>--model-path</code>
+        (<code>_normalize_positional_model_path</code>).</td>
+      <td><code>cli/serve.py</code></td></tr>
+    <tr><td><code>sglang generate</code></td>
+      <td>Offline inference for multimodal / diffusion models.</td>
+      <td><code>cli/generate.py</code></td></tr>
+    <tr><td><code>sglang version</code></td>
+      <td>Prints <code>__version__</code> + short git revision.</td>
+      <td><code>cli/main.py</code></td></tr>
+    <tr><td><code>killall_sglang</code></td>
+      <td>Process cleanup (orphaned schedulers hold GPU memory).</td>
+      <td><code>cli/killall.py</code></td></tr>
+    <tr><td><code>python -m sglang.launch_server</code></td>
+      <td>Legacy launcher, still works.</td>
+      <td><code>launch_server.py</code></td></tr>
+  </table>
+
+  <p>
+    The benchmark tools also moved: the real implementations live in the
+    <code>sglang.benchmark</code> package, and the famous old module paths
+    (<code>sglang.bench_serving</code>, <code>bench_one_batch</code>, <code>bench_one_batch_server</code>,
+    <code>bench_offline_throughput</code>) are ~22-line shims that re-export everything and emit a
+    <code>FutureWarning</code> telling you to run
+    <code>python -m sglang.benchmark.serving</code> instead.
+  </p>
+
+  <h2><span class="sec-num">11.5</span>Benchmarking: the tools and the metrics they define</h2>
+
+  <div class="diagram">
+    <div class="dg-title">Four bench tools, four altitudes</div>
+    <pre class="mermaid">
+flowchart TB
+  subgraph pkg ["python/sglang/benchmark/"]
+    sv["serving.py (2.7k lines)<br/>online load generator"]
+    obs["one_batch_server.py<br/>launches + drives a real server"]
+    ot["offline_throughput.py<br/>engine throughput"]
+    ob["one_batch.py<br/>single static batch latency"]
+  end
+  shim["sglang.bench_serving et al.<br/>FutureWarning shims"] -.-> pkg
+  ds["datasets/ — 12 names:<br/>sharegpt · random · random-ids · generated-shared-prefix<br/>custom · openai · image · mmmu · mooncake<br/>longbench_v2 · speed-bench · agentic-trace"] --> sv
+  sv -- "aiohttp, streaming,<br/>Poisson or trace replay" --> httpd["running HTTP server<br/>(any backend: sglang, vllm, trt, lmdeploy...)"]
+  obs -- "HTTP + /start_profile" --> httpd
+  ot --> eng["sgl.Engine (in-process)"]
+  ob -- "no server at all" --> mr["low-level ModelRunner APIs"]
+  style sv fill:#eef0ff,stroke:#4f46e5
+  style ob fill:#fdf3e3,stroke:#d97706
+    </pre>
+    <div class="dg-caption">
+      <code>serving.py</code> is adapted from vLLM's <code>benchmark_serving.py</code> (credited in its
+      header) and supports 10+ API flavors via <code>ASYNC_REQUEST_FUNCS</code>
+      (<code>sglang</code>, <code>sglang-oai</code>, <code>sglang-oai-chat</code>, <code>vllm</code>,
+      <code>trt</code>, <code>lmdeploy</code>, …). <code>one_batch.py</code>'s docstring:
+      "Benchmark the latency of running a single static batch without a server" — it reports
+      prefill latency/throughput and per-step decode latency, plus a <code>--correct</code> mode that
+      prints reference logits.
+    </div>
+  </div>
+
+  <p>
+    Load is generated as a <b>Poisson process</b>: exponential inter-arrival times with mean
+    <code>1/request_rate</code>. This matters — real traffic is bursty, and a fixed-interval load
+    generator would flatter the scheduler:
+  </p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/benchmark/serving.py:1070" data-desc="get_request(): Poisson arrivals (request_rate=inf means send everything at once)">
+<pre>
+if request_rate == float("inf"):
+    # If the request rate is infinity, then we don't need to wait.
+    continue
+
+# Sample the request interval from the exponential distribution.
+interval = np.random.exponential(1.0 / request_rate)
+# The next request will be sent after the interval.
+await asyncio.sleep(interval)
+</pre>
+  </div>
+
+  <p>The metric definitions, exactly as computed in <code>calculate_metrics</code>:</p>
+
+  <table class="tbl">
+    <tr><th>Metric</th><th>Definition (as computed)</th><th>What it tells you</th></tr>
+    <tr><td><b>TTFT</b></td><td>Time from sending the request to the first streamed chunk
+      (<code>output.ttft</code>).</td><td>Prefill latency + queueing. The "feels responsive" metric.</td></tr>
+    <tr><td><b>ITL</b></td><td>Gap between consecutive streamed chunks, recorded per chunk into
+      <code>RequestFuncOutput.itl</code>.</td><td>Decode jitter — stalls show up as ITL spikes
+      (e.g. when a prefill batch preempts decode, chapter 02).</td></tr>
+    <tr><td><b>TPOT</b></td><td><code>(latency − ttft) / (output_len − 1)</code>, per request,
+      only if <code>output_len &gt; 1</code>.</td><td>Average decode speed excluding the first token
+      — the steady-state tokens/sec reciprocal.</td></tr>
+    <tr><td><b>E2E latency</b></td><td><code>outputs[i].latency</code> — send to final chunk.</td>
+      <td>What the user actually waits for.</td></tr>
+    <tr><td><b>Throughputs</b></td><td>request / input-token / output-token throughput over the whole
+      run.</td><td>Cluster capacity planning.</td></tr>
+  </table>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/benchmark/serving.py:1120" data-desc="TPOT and the speculative-decoding-aware 'retokenized ITL' (each chunk gap divided by its token count)">
+<pre>
+if output_len > 1:
+    tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
+if use_retokenized_itl:
+    for k, itl in enumerate(outputs[i].itl):
+        num_tokens = len(
+            tokenizer.encode(
+                outputs[i].text_chunks[k], add_special_tokens=False
+            )
+        )
+        adjusted_itl = itl / num_tokens
+        retokenized_itls.extend([adjusted_itl] * num_tokens)
+else:
+    itls += outputs[i].itl
+</pre>
+  </div>
+
+  <div class="callout note"><span class="co-title">Why "retokenized" ITL?</span>
+    With speculative decoding (chapter 09) one streamed chunk can carry several accepted tokens, so
+    raw chunk gaps overstate per-token latency. When <code>accept_length &gt; 0</code> and the backend
+    is <code>sglang-oai[-chat]</code>, each gap is divided by the chunk's retokenized token count. Every
+    metric is reported as mean / median / std / p90 / p95 / p99.
+  </div>
+
+  <h3>Anatomy of one benchmarked request — animated</h3>
+  <div class="stepper" id="st-bench">
+    <div class="st-scene">
+      <div class="sc-row" style="gap:8px; flex-wrap:wrap">
+        <div class="sc-box" id="b-send">send<small>t = 0 ms</small></div>
+        <div class="sc-box" id="b-c1">chunk 1 · "The"<small>t = 120 ms</small></div>
+        <div class="sc-box" id="b-c2">chunk 2 · " capital"<small>+30 ms</small></div>
+        <div class="sc-box" id="b-c3">chunk 3 · " of"<small>+28 ms</small></div>
+        <div class="sc-box" id="b-c4">chunk 4 · " the"<small>+35 ms</small></div>
+        <div class="sc-box" id="b-more">… 28 more chunks …</div>
+        <div class="sc-box" id="b-fin">finish_reason="stop"<small>t = 1080 ms · 33 tokens</small></div>
+      </div>
+      <div class="sc-row" style="gap:10px; margin-top:16px; flex-wrap:wrap">
+        <div class="sc-box appear" id="b-ttft">TTFT = 120 ms<small>first chunk − send</small></div>
+        <div class="sc-box appear" id="b-itl">ITL = [30, 28, 35, …]<small>one entry per chunk gap</small></div>
+        <div class="sc-box appear" id="b-e2e">E2E = 1080 ms<small>outputs[i].latency</small></div>
+        <div class="sc-box appear" id="b-tpot">TPOT = (1080 − 120) / 32 = 30 ms<small>derived, not measured</small></div>
+      </div>
+      <div class="sc-row" style="gap:6px; margin-top:16px; flex-wrap:wrap">
+        <div class="sc-box appear" id="b-pois" style="border-style:dashed">Poisson arrivals · request_rate = 8/s → mean gap 125 ms</div>
+        <div class="tok appear" id="b-r1" style="width:auto; height:auto; padding:4px 8px">req 1 · t=0</div>
+        <div class="tok appear" id="b-r2" style="width:auto; height:auto; padding:4px 8px">req 2 · +60</div>
+        <div class="tok appear" id="b-r3" style="width:auto; height:auto; padding:4px 8px">req 3 · +210</div>
+        <div class="tok appear" id="b-r4" style="width:auto; height:auto; padding:4px 8px">req 4 · +90</div>
+        <div class="tok appear" id="b-r5" style="width:auto; height:auto; padding:4px 8px">req 5 · +400</div>
+        <div class="tok appear" id="b-r6" style="width:auto; height:auto; padding:4px 8px">req 6 · +30</div>
+      </div>
+    </div>
+  </div>
+
+  <p>
+    Around the core four tools: <code>python -m sglang.profiler</code> drives a running server's
+    <code>/start_profile</code>/<code>/stop_profile</code> for torch traces;
+    <code>sglang.check_env</code> dumps package/CUDA versions;
+    accuracy evals live in <code>sglang/test/run_eval.py</code> + <code>simple_eval_*</code>
+    (MMLU, GPQA, MATH, MGSM, HumanEval, AIME25, LongBench-v2, MMMU — OpenAI simple-evals style;
+    <code>python -m sglang.test.few_shot_gsm8k</code> is a deprecated shim over
+    <code>run_eval eval_name="gsm8k"</code>), plus <code>sglang/eval/</code>
+    (<code>llama3_eval.py</code>, <code>loogle_eval.py</code>). The repo-root <code>benchmark/</code>
+    directory holds 45 self-contained task benches — many written in the frontend DSL itself
+    (<code>gsm8k</code>, <code>tree_of_thought_deep</code>, <code>multi_turn_chat</code>,
+    <code>json_decode_regex</code>, <code>tip_suggestion</code>…) alongside infra benches
+    (<code>hicache</code>, <code>kernels</code>, <code>deepseek_v3</code>, <code>prefill_only</code>).
+  </p>
+
+  <h2><span class="sec-num">11.6</span>Test infrastructure: self-registering CI</h2>
+  <p>
+    Tests under <code>test/registered/</code> (66 category dirs: <code>core</code>, <code>unit</code>,
+    <code>models</code>, <code>8-gpu-models</code>, <code>spec</code>, <code>lora</code>, <code>moe</code>,
+    <code>hicache</code>, <code>disaggregation</code>, per-vendor <code>amd</code>/<code>npu</code>/<code>xpu</code>…)
+    are auto-discovered by <code>test/run_suite.py</code>. There is no central manifest: each test file
+    declares its own CI placement with module-level calls —
+    <code>register_cuda_ci(est_time=260, stage="base-b", runner_config="1-gpu-small")</code>
+    (verbatim from <code>test/registered/core/test_srt_endpoint.py:34</code>; a second line registers the
+    same file for AMD with <code>suite="stage-b-test-1-gpu-small-amd"</code>).
+    <code>sglang/test/ci/ci_register.py</code> defines <code>HWBackend</code>
+    (CPU/CUDA/AMD/NPU/XPU/MUSA/MLX) and the <code>CIRegistry</code> record; <code>run_suite.py</code>
+    maps suites named <code>{stage}-test-{runner_config}</code> and <b>bin-packs tests across parallel
+    jobs by their declared <code>est_time</code></b> (<code>--auto-partition-id/-size</code>).
+  </p>
+
+  <div class="diagram">
+    <div class="dg-title">CI pipeline: three sequential stages</div>
+    <pre class="mermaid">
+flowchart LR
+  pr["pull request"] --> a["Stage A · pre-flight<br/>~3 min"]
+  a --> b["Stage B · basic<br/>~30 min"]
+  b --> c["Stage C · advanced<br/>~30 min"]
+  k["kernel + multimodal-gen jobs"] -.->|"parallel with B"| b
+  extra["extra-a / extra-b suites<br/>gated by run-ci-extra label"] -.-> b
+  c --> merge(["merge"])
+  style a fill:#e7f7ec,stroke:#16a34a
+  style b fill:#eef0ff,stroke:#4f46e5
+  style c fill:#f5ecfe,stroke:#9333ea
+    </pre>
+    <div class="dg-caption">
+      From <code>test/README.md</code>: "The CI pipeline runs in three sequential stages:
+      <b>A</b> (pre-flight, ~3 min) → <b>B</b> (basic, ~30 min) → <b>C</b> (advanced, ~30 min)".
+      95 workflow files in <code>.github/workflows/</code>: <code>pr-test.yml</code> + reusable
+      <code>_pr-test-stage.yml</code>, vendor variants (<code>pr-test-amd.yml</code>,
+      <code>pr-test-npu.yml</code>, …), nightlies up to <code>nightly-72-gpu-gb200.yml</code>, release
+      automation, and bots (<code>ci-auto-bisect.yml</code>, <code>rerun-test.yml</code>). A dedicated
+      in-repo skill, <code>ci-workflow-guide</code>, documents stage gating and fast-fail rules.
+    </div>
+  </div>
+
+  <p>
+    Every test class extends <code>CustomTestCase</code>, which fixes a real <code>unittest</code>
+    footgun for GPU tests: if <code>setUpClass</code> raises (say, the server fixture fails to boot),
+    stock unittest never calls <code>tearDownClass</code> — leaking ports and GPU-holding processes
+    that poison every later test on the runner:
+  </p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/test/test_utils.py:2333" data-desc="CustomTestCase: __init_subclass__ wraps setUpClass so teardown always runs (wrapper body trimmed)">
+<pre>
+class CustomTestCase(unittest.TestCase):
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+
+        # Wrap the effective setUpClass so that tearDownClass is called
+        # even when setUpClass fails. Python's unittest skips tearDownClass
+        # if setUpClass raises, which can leak resources (ports, processes).
+        setup = cls.setUpClass
+        if getattr(setup, "_safe_setup_wrapped", False):
+            return
+</pre>
+  </div>
+
+  <div class="callout note"><span class="co-title">Failfast by default</span>
+    The suite runner executes each file as <code>python file.py -f</code>, so test files must end with
+    plain <code>unittest.main()</code> (or <code>pytest.main([__file__])</code>). The wrapper also calls
+    <code>_wait_for_gpu_idle_in_ci()</code> before setup, so a test never starts while the previous
+    one's server is still releasing VRAM. Suites per commit are enumerated in
+    <code>PER_COMMIT_SUITES</code> (<code>run_suite.py</code>) and nightlies in
+    <code>NIGHTLY_SUITES</code>. Non-CI experiments belong in <code>test/manual/</code>.
+  </div>
+
+  <h2><span class="sec-num">11.7</span>The rest of the repo: docs, examples, scripts</h2>
+
+  <div class="filetree">
+<b>docs_new/</b>                    <i># Mintlify site (docs.json config, .mdx pages, Node ≥ 20)</i>
+├── <b>docs/</b>                    <i># get-started · basic_usage · advanced_features · developer_guide</i>
+│                            <i>#   hardware-platforms · supported-models · references · sglang-diffusion</i>
+├── <b>cookbook/</b>                <i># per-model deployment recipes</i>
+│   ├── <b>autoregressive/</b>      <i># 26 vendor folders: DeepSeek, Qwen, Llama, GLM, Mistral, OpenAI…</i>
+│   └── <b>diffusion/ omni/ specbundle/ vla/ base/</b>
+└── <b>src/snippets/</b>            <i># config-driven cookbook engine: _deployment.jsx + _playground.jsx</i>
+<b>examples/</b>
+├── <b>frontend_language/</b>       <i># quick_start/ per-backend DSL demos · usage/ (json_decode, choices_logprob, …)</i>
+├── <b>runtime/</b>                 <i># engine usage, lora, multimodal, token_in_token_out, hidden_states</i>
+└── <b>monitoring/ profiler/ chat_template/ checkpoint_engine/ sagemaker/ usage/</b>
+<b>benchmark/</b>                   <i># 45 standalone task benches, many written in the DSL</i>
+<b>scripts/</b>                     <i># ci/, ci_monitor/, release/, code_sync/, wheel-index updaters, playground/</i>
+<b>experimental/</b>
+└── <b>sgl-router/</b>              <i># the ONLY thing in experimental/ (production gateway = sgl-model-gateway/)</i>
+  </div>
+
+  <div class="callout fact"><span class="co-title">Docs as a product surface</span>
+    Cookbook pages are config-driven MDX: a per-model config plus benchmark data feed the shared
+    <code>_deployment.jsx</code> / <code>_playground.jsx</code> engines. The repo even ships skills to
+    add, migrate, and review cookbook pages (<code>cookbook-migrate-model</code>,
+    <code>cookbook-review-pr</code>).
+  </div>
+
+  <h2><span class="sec-num">11.8</span>Notable facts &amp; gotchas</h2>
+  <div class="card">
+    <ul>
+      <li><b>The DSL is a futures system in disguise.</b> <code>s += expr</code> is a queue put;
+        <code>state["var"]</code> is <code>threading.Event.wait()</code>. No graph, no compiler —
+        <code>tracer.py</code> exists but is only used for batch prefix pre-caching and
+        <code>SglFunction.trace()</code>.</li>
+      <li><b><code>run_batch</code> defaults to <code>max(96, cpu_count()*16)</code> client threads</b>
+        (<code>interpreter.py:110</code>) — the frontend leans entirely on the server's continuous
+        batching for efficiency.</li>
+      <li><b><code>select()</code> never generates a token.</b> It's 2–3 <code>max_new_tokens=0</code>
+        logprob requests, batched over <code>prompt+choice</code>, with token-healing correction
+        starting at <code>prompt_len − 2</code>.</li>
+      <li><b><code>num_api_spec_tokens</code> is client-side speculation.</b>
+        <code>@sgl.function(num_api_spec_tokens=128)</code> makes the OpenAI backend over-generate once
+        and <code>_spec_gen</code> slice the text across later <code>gen()</code> calls — saving API
+        round-trips. Completely unrelated to chapter 09's server-side speculative decoding.</li>
+      <li><b><code>/concate_and_append_request</code> is client-only now</b> — the srt server no longer
+        implements it; radix caching (chapter 03) provides fork-prefix reuse instead.</li>
+      <li><b>TPOT is derived, ITL is measured.</b> <code>TPOT = (latency − ttft)/(output_len − 1)</code>;
+        ITL is per-chunk. With spec decoding, bench_serving divides chunk gaps by retokenized token
+        counts.</li>
+      <li><b><code>sglang.bench_serving</code> et al. are deprecation shims</b> over
+        <code>sglang.benchmark.*</code>, kept alive with <code>FutureWarning</code>s because the whole
+        ecosystem's muscle memory types them.</li>
+      <li><b>CI tests self-declare their cost:</b> <code>est_time</code> in
+        <code>register_cuda_ci(...)</code> feeds <code>run_suite.py</code>'s auto-partitioner, which
+        bin-packs files across parallel jobs to keep every job under ~30 minutes.</li>
+      <li><b><code>global_config.py</code> is marked for death</b> — its own header says
+        "FIXME: deprecate this file and move all usage to sglang.srt.environ or sglang.__init__.py";
+        it now only holds frontend-language knobs.</li>
+      <li><b><code>version.py</code> has a 4-level fallback:</b> setuptools-scm generated
+        <code>_version.py</code> → <code>importlib.metadata</code> → live
+        <code>setuptools_scm.get_version()</code> → <code>"0.0.0.dev0"</code>.</li>
+    </ul>
+  </div>
+
+  <div id="pager"></div>
+  </div>
+</main>
+</div>
+
+<script>
+document.addEventListener("DOMContentLoaded", () => {
+
+  new Stepper("#st-dsl", {
+    title: "Executing tip_suggestion(): lazy submission, fork, join",
+    intro: "Watch the queue, the worker threads, and the blocking reads.",
+    autoMs: 3400,
+    reset(sc) {
+      clearState(sc, ".sc-box,.tok");
+      rmCls(sc, ".appear", "in");
+    },
+    steps: [
+      { cap: "<code>tip_suggestion.run()</code> → <code>run_program()</code> creates one <code>StreamExecutor</code> (queue + background worker thread) wrapped in a <code>ProgramState</code>. Your Python body starts executing immediately.",
+        run(sc) { setCls(sc, "#d-py", "hl"); setCls(sc, "#d-exec", "hl", "pulse"); } },
+      { cap: "<code>s += \"Here are two tips…\"</code>: the string is wrapped as <code>SglConstantText</code> and put on the queue (<code>submit()</code>). Python does NOT wait — it's already at the next line.",
+        run(sc) { rmCls(sc, "#d-exec", "pulse"); setCls(sc, "#d-q1", "in", "hl"); } },
+      { cap: "The worker thread pops the node and dispatches via the <code>isinstance</code> chain → <code>_execute_fill</code> appends to <code>text_</code>. Producer and consumer run concurrently.",
+        run(sc) { rmCls(sc, "#d-q1", "hl"); setCls(sc, "#d-q1", "ok"); } },
+      { cap: "<code>s.fork(2)</code>: the parent submits <code>SglCommitLazy</code>, then <code>sync()</code>s (<code>queue.join()</code>) so the copied state is complete — the ONE place the frontend blocks without you asking.",
+        run(sc) { setCls(sc, "#d-q2", "in", "warn"); } },
+      { cap: "Two child <code>StreamExecutor</code>s are built, each copying <code>variables</code>, <code>text_</code>, <code>messages_</code> and recording <code>fork_start_text_pos</code> — each with its own queue and worker thread (<code>interpreter.py:370</code>).",
+        run(sc) { rmCls(sc, "#d-q2", "warn"); setCls(sc, "#d-q2", "ok"); setCls(sc, "#d-f0,#d-f1", "in", "hl"); } },
+      { cap: "The loop does <code>f += \"expand tip i…\" + sgl.gen(\"detailed_tip\")</code> on each branch. Two <code>SglGen</code> nodes are queued; two <code>POST /generate</code> calls fly in parallel. Server-side, both share the parent prompt's radix-cached prefix (chapter 03).",
+        run(sc) { setCls(sc, "#d-g0,#d-g1", "in", "hl"); setCls(sc, "#d-srv", "hl", "pulse"); } },
+      { cap: "<code>forks[0][\"detailed_tip\"]</code> is the join point: it calls <code>get_var</code>, which blocks on <code>variable_event[\"detailed_tip\"].wait()</code> until child #0's generation lands.",
+        run(sc) { rmCls(sc, "#d-srv", "pulse"); setCls(sc, "#d-g0,#d-g1", "ok"); setCls(sc, "#d-join", "in", "warn"); } },
+      { cap: "Both branch texts are concatenated back onto the parent as plain fills, then <code>sgl.gen(\"summary\")</code> is queued — the parent now continues from the merged context.",
+        run(sc) { rmCls(sc, "#d-join", "warn"); setCls(sc, "#d-join", "ok"); setCls(sc, "#d-f0,#d-f1", "ok"); setCls(sc, "#d-sum", "in", "hl"); } },
+      { cap: "The caller reads <code>state[\"summary\"]</code> → blocks on the Event until the final gen finishes. Total: 3 generate calls, 2 of them concurrent, zero explicit threading in user code.",
+        run(sc) { rmCls(sc, "#d-sum", "hl"); setCls(sc, "#d-sum", "ok"); setCls(sc, "#d-read", "in", "ok", "pulse"); setCls(sc, "#d-py", "ok"); } },
+    ],
+  });
+
+  new Stepper("#st-bench", {
+    title: "One streamed request under bench_serving — where each metric comes from",
+    intro: "Concrete numbers: 33 output tokens, first chunk at 120 ms, done at 1080 ms.",
+    autoMs: 3400,
+    reset(sc) {
+      clearState(sc, ".sc-box,.tok");
+      rmCls(sc, ".appear", "in");
+    },
+    steps: [
+      { cap: "<code>get_request</code> yields a dataset row (one of 12 dataset types — sharegpt, random, mmmu, mooncake…); the aiohttp client POSTs with <code>stream=true</code> and stamps <code>st = time.perf_counter()</code>.",
+        run(sc) { setCls(sc, "#b-send", "hl", "pulse"); } },
+      { cap: "First streamed chunk arrives at t = 120 ms → <code>ttft = timestamp − st</code>. This includes queueing + prefill (chapter 02).",
+        run(sc) { rmCls(sc, "#b-send", "pulse"); setCls(sc, "#b-c1", "hl"); setCls(sc, "#b-ttft", "in", "ok"); } },
+      { cap: "Every subsequent chunk appends its gap to <code>output.itl</code>: 30 ms, 28 ms, 35 ms… ITL is the <em>measured</em> per-chunk series — decode stalls appear here as spikes.",
+        run(sc) { rmCls(sc, "#b-c1", "hl"); setCls(sc, "#b-c2,#b-c3,#b-c4,#b-more", "hl"); setCls(sc, "#b-itl", "in", "ok"); } },
+      { cap: "The stream ends with <code>finish_reason=\"stop\"</code> at t = 1080 ms → <code>output.latency</code> = E2E latency.",
+        run(sc) { rmCls(sc, "#b-c2,#b-c3,#b-c4,#b-more", "hl"); setCls(sc, "#b-fin", "ok"); setCls(sc, "#b-e2e", "in", "ok"); } },
+      { cap: "TPOT is <em>derived</em> in <code>calculate_metrics</code>: <code>(latency − ttft) / (output_len − 1)</code> = (1080 − 120) / 32 = <b>30 ms</b>. Note it skips requests with <code>output_len ≤ 1</code>.",
+        run(sc) { setCls(sc, "#b-tpot", "in", "hl", "pulse"); } },
+      { cap: "Zoom out: the whole run sends requests with exponential gaps — <code>np.random.exponential(1.0 / request_rate)</code>. At 8 req/s the mean gap is 125 ms, but samples are bursty by design: 60, 210, 90, 400, 30…",
+        run(sc) { rmCls(sc, "#b-tpot", "pulse"); setCls(sc, "#b-pois", "in", "hl"); setCls(sc, "#b-r1,#b-r2,#b-r3,#b-r4,#b-r5,#b-r6", "in", "cache"); } },
+      { cap: "<code>--request-rate inf</code> skips the sleep entirely (send-all-at-once stress mode); <code>--max-concurrency</code> caps in-flight requests; the mooncake dataset instead replays real trace timestamps with <code>--slowdown-factor</code>.",
+        run(sc) { setCls(sc, "#b-r1,#b-r2,#b-r3,#b-r4,#b-r5,#b-r6", "ok"); setCls(sc, "#b-pois", "ok"); } },
+    ],
+  });
+
+});
+</script>
+</body>
+</html>

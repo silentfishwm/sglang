@@ -76,7 +76,7 @@
 flowchart TB
   caller["SGLang runtime code<br/><i>from sglang.kernels.ops.layernorm import rmsnorm</i>"]
   subgraph pkg ["python/sglang/kernels — unified namespace"]
-    ops["ops/&lt;group&gt;/<br/>public callable wrappers"]
+    ops["ops/&amp;lt;group&amp;gt;/<br/>public callable wrappers"]
     reg["spec.py + registry.py + selector.py<br/>KernelSpec inventory, lazy load()"]
     fop["fused_op.py<br/>BaseFusedOp priority auto-selection"]
   end
@@ -162,7 +162,7 @@ flowchart TD
   forced -- "no" --> walk["walk class priority, e.g. layernorm:<br/>AOT → JIT → AITER → TORCH_NPU → TORCH"]
   walk --> elig{"backend_eligible()?<br/>CapabilityRequirement vs live PlatformInfo<br/>+ optional per-call shape/dtype gates"}
   elig -- "no · try next" --> walk
-  elig -- "yes" --> run["getattr(self, 'forward_&lt;backend&gt;')(x, weight)"]
+  elig -- "yes" --> run["getattr(self, 'forward_' + backend)(x, weight)"]
   walk -- "nothing eligible" --> nat["forward_native fallback"]
   run --> tr["enable_fused_op_trace()?<br/>record op · backend · shapes"]
   nat --> tr

@@ -126,30 +126,39 @@ moe_tp_size = tensor_model_parallel_size // moe_ep_size // moe_dp_size
     <div class="dg-title">DP-attention sub-slicing: --tp-size 8 --dp-size 4 --enable-dp-attention</div>
     <pre class="mermaid">
 flowchart TB
-  subgraph tp ["One TP group = one torch.distributed world (8 ranks, one nccl_port)"]
+  subgraph dp0 ["attn DP 0"]
     direction LR
-    subgraph dp0 ["attn DP 0"]
-      r0["g0"] --- r1["g1"]
-    end
-    subgraph dp1 ["attn DP 1"]
-      r2["g2"] --- r3["g3"]
-    end
-    subgraph dp2 ["attn DP 2"]
-      r4["g4"] --- r5["g5"]
-    end
-    subgraph dp3 ["attn DP 3"]
-      r6["g6"] --- r7["g7"]
-    end
+    r0["g0"] --- r1["g1"]
+  end
+  subgraph dp1 ["attn DP 1"]
+    direction LR
+    r2["g2"] --- r3["g3"]
+  end
+  subgraph dp2 ["attn DP 2"]
+    direction LR
+    r4["g4"] --- r5["g5"]
+  end
+  subgraph dp3 ["attn DP 3"]
+    direction LR
+    r6["g6"] --- r7["g7"]
   end
   moe["MoE part: _MOE_EP = [g0..g7] = _TP<br/>(with --ep-size 8: group aliasing, no new communicator)"]
-  tp --> moe
-  style tp fill:#eef0ff,stroke:#4f46e5
+  r0 -.-> moe
+  r2 -.-> moe
+  r5 -.-> moe
+  r7 -.-> moe
+  style dp0 fill:#eef0ff,stroke:#4f46e5
+  style dp1 fill:#eef0ff,stroke:#4f46e5
+  style dp2 fill:#eef0ff,stroke:#4f46e5
+  style dp3 fill:#eef0ff,stroke:#4f46e5
   style moe fill:#fdf3e3,stroke:#d97706
     </pre>
     <div class="dg-caption">
-      <code>attn_tp_size = 8 // 1 // 4 = 2</code>: each DP rank shards attention weights over 2
-      GPUs (<code>_ATTN_TP</code> groups <code>[g0,g1] … [g6,g7]</code>) and keeps a private KV
-      cache. Rank layout is <code>(dp, cp, tp)</code> with tp fastest:
+      All 8 ranks form <b>one</b> TP group — one torch.distributed world, one
+      <code>nccl_port</code>. <code>attn_tp_size = 8 // 1 // 4 = 2</code>: each DP rank shards
+      attention weights over 2 GPUs (<code>_ATTN_TP</code> groups
+      <code>[g0,g1] … [g6,g7]</code>) and keeps a private KV cache. Rank layout is
+      <code>(dp, cp, tp)</code> with tp fastest:
       <code>tp_rank = (attn_dp_rank * attn_cp_size + attn_cp_rank) * attn_tp_size + attn_tp_rank</code>
       (<code>layers/dp_attention.py:327</code>, <code>compute_dp_attention_world_info</code>).
     </div>
