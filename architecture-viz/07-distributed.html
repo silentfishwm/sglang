@@ -1,0 +1,765 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · Parallelism: TP · PP · DP · EP — SGLang Internals</title>
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/mermaid.min.js"></script>
+<script src="assets/viz.js"></script>
+</head>
+<body>
+<div class="layout">
+<main>
+  <div class="page-hero"><div class="content">
+    <span class="phase-badge">Phase IV · Scaling Out</span>
+    <h1>07 · Distributed Execution: TP, PP, DP-Attention &amp; Expert Parallelism</h1>
+    <p class="lede">
+      One GPU is never enough. This chapter maps SGLang's four axes of parallelism — tensor,
+      pipeline, data, and expert — onto real process groups: how the torch.distributed world is
+      shaped, how <code>GroupCoordinator</code> picks an allreduce implementation per tensor, why
+      DeepSeek's MLA forced DP <em>inside</em> TP, how pipeline microbatches flow, and how EPLB
+      shuffles expert weights while the server keeps serving.
+    </p>
+  </div></div>
+
+  <div class="content">
+
+  <h2><span class="sec-num">7.1</span>The parallelism taxonomy &amp; the world-size math</h2>
+  <p>
+    The first thing to internalize: <strong>the torch.distributed world is exactly
+    <code>tp_size × pp_size</code></strong>. Nothing else. Data parallelism and expert parallelism
+    are not extra dimensions of the NCCL world — they are either <em>separate worlds</em> (plain DP)
+    or <em>sub-slices of the TP group</em> (DP-attention, EP). All group construction lives in
+    <code>python/sglang/srt/distributed/parallel_state.py</code> (adapted from vLLM, which adapted
+    it from Megatron-LM); <code>ModelRunner</code> enters through a single call,
+    <code>init_torch_distributed(...)</code> in
+    <code>python/sglang/srt/distributed/bootstrap.py</code>.
+  </p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/distributed/bootstrap.py:206" data-desc="The entire world/rank math (rank_offset is 0 unless this process is an elastic-EP scale joiner)">
+<pre>
+world_size = (
+    rank_offset + tp_size * pp_size if is_scale_joiner else tp_size * pp_size
+)
+rank = rank_offset + tp_size * pp_rank + tp_rank
+</pre>
+  </div>
+
+  <div class="callout fact"><span class="co-title">Enforced, not implied</span>
+    <code>initialize_model_parallel</code> raises
+    <code>RuntimeError("world_size (...) is not equal to tensor_model_parallel_size (...) x
+    pipeline_model_parallel_size (...)")</code> if the invariant is violated
+    (<code>python/sglang/srt/distributed/parallel_state.py:2251</code>).
+  </div>
+
+  <div class="diagram">
+    <div class="dg-title">The rank grid for --tp-size 8 --pp-size 2 (16 GPUs, 2 nodes)</div>
+    <pre class="mermaid">
+flowchart TB
+  subgraph stage0 ["PP stage 0 — TP group [g0..g7] (node 0)"]
+    direction LR
+    g0["g0<br/>tp0"] --- g1["g1<br/>tp1"] --- g2["g2<br/>tp2"] --- g3["g3<br/>tp3"] --- g4["g4<br/>tp4"] --- g5["g5<br/>tp5"] --- g6["g6<br/>tp6"] --- g7["g7<br/>tp7"]
+  end
+  subgraph stage1 ["PP stage 1 — TP group [g8..g15] (node 1)"]
+    direction LR
+    g8["g8<br/>tp0"] --- g9["g9<br/>tp1"] --- g10["g10<br/>tp2"] --- g11["g11<br/>tp3"] --- g12["g12<br/>tp4"] --- g13["g13<br/>tp5"] --- g14["g14<br/>tp6"] --- g15["g15<br/>tp7"]
+  end
+  g0 -.->|"PP group 0 = [g0, g8]"| g8
+  g3 -.->|"PP group 3 = [g3, g11]"| g11
+  g7 -.->|"PP group 7 = [g7, g15]"| g15
+  style stage0 fill:#eef0ff,stroke:#4f46e5
+  style stage1 fill:#e7f7ec,stroke:#16a34a
+    </pre>
+    <div class="dg-caption">
+      <code>rank = tp_size * pp_rank + tp_rank</code>, so TP groups are <b>contiguous</b> blocks
+      (group <i>i</i> = ranks <code>[i·tp, (i+1)·tp)</code>) and PP groups are <b>strided</b>
+      (group <i>i</i> = <code>range(i, world_size, world_size // pp)</code>) — the classic
+      Megatron layout, spelled out in the docstring of <code>initialize_model_parallel</code>
+      (<code>parallel_state.py</code>). The PP group is created with
+      <code>use_custom_allreduce=False</code> — "pipeline parallel does not need custom allreduce".
+    </div>
+  </div>
+
+  <p>Where do DP and EP fit, then? Three distinct mechanisms:</p>
+  <table class="tbl">
+    <tr><th>Mode</th><th>Flags</th><th>How the world is shaped</th></tr>
+    <tr><td><b>Plain DP</b></td><td><code>--dp-size N</code></td>
+      <td>N <em>independent</em> TP×PP worlds, each with its own <code>nccl_port</code> and its own
+      torch.distributed init. A <code>DataParallelController</code> subprocess load-balances
+      requests between them over ZMQ (see chapter 01). No NCCL traffic ever crosses replicas.</td></tr>
+    <tr><td><b>DP-attention</b></td><td><code>--dp-size N --enable-dp-attention</code></td>
+      <td>DP ranks live <em>inside</em> the one TP group — "Data parallelism reuses the tensor
+      parallelism group, so all dp ranks should use the same nccl port"
+      (<code>managers/data_parallel_controller.py:658</code>). The TP group is subdivided:
+      <code>attn_tp_size = tp // cp // dp</code>.</td></tr>
+    <tr><td><b>EP / MoE splits</b></td><td><code>--ep-size</code>, <code>--moe-dense-tp-size</code></td>
+      <td>Also sub-slices of TP: <code>moe_tp_size = tp // ep // moe_dp</code>. With the typical
+      <code>--tp 8 --ep 8</code>, <code>_MOE_EP is _TP</code> — the "EP" all-to-all literally runs
+      on the TP communicator.</td></tr>
+  </table>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/distributed/parallel_state.py:2342,2417" data-desc="Sub-group size derivation inside initialize_model_parallel (two regions joined)">
+<pre>
+attn_dp_size = attention_data_parallel_size
+attn_cp_size = attention_context_model_parallel_size
+attn_tp_size = tensor_model_parallel_size // attn_cp_size // attn_dp_size
+...
+moe_ep_size = expert_model_parallel_size
+moe_dp_size = moe_data_model_parallel_size
+moe_tp_size = tensor_model_parallel_size // moe_ep_size // moe_dp_size
+</pre>
+  </div>
+
+  <p>
+    The full hierarchy, from a comment in <code>data_parallel_controller.py</code>
+    ("Parallelism hierarchy (outermost to innermost)"):
+    attention side <code>Global(TP) → DP → ATTN_CP → ATTN_TP</code>; MoE side
+    <code>Global(TP) → MOE_DP → EP → MOE_TP</code>. The resulting global singletons in
+    <code>parallel_state.py</code> are <code>_WORLD, _TP, _PP, _DCP, _ATTN_TP, _ATTN_CP,
+    _MOE_DP, _MOE_EP, _MOE_TP</code>, plus <code>_PDMUX_PREFILL_TP_GROUP</code> (a full duplicate
+    of <code>_TP</code> used by PD multiplexing so prefill and decode streams get independent
+    communicators — see chapter 08).
+  </p>
+
+  <div class="diagram">
+    <div class="dg-title">DP-attention sub-slicing: --tp-size 8 --dp-size 4 --enable-dp-attention</div>
+    <pre class="mermaid">
+flowchart TB
+  subgraph tp ["One TP group = one torch.distributed world (8 ranks, one nccl_port)"]
+    direction LR
+    subgraph dp0 ["attn DP 0"]
+      r0["g0"] --- r1["g1"]
+    end
+    subgraph dp1 ["attn DP 1"]
+      r2["g2"] --- r3["g3"]
+    end
+    subgraph dp2 ["attn DP 2"]
+      r4["g4"] --- r5["g5"]
+    end
+    subgraph dp3 ["attn DP 3"]
+      r6["g6"] --- r7["g7"]
+    end
+  end
+  moe["MoE part: _MOE_EP = [g0..g7] = _TP<br/>(with --ep-size 8: group aliasing, no new communicator)"]
+  tp --> moe
+  style tp fill:#eef0ff,stroke:#4f46e5
+  style moe fill:#fdf3e3,stroke:#d97706
+    </pre>
+    <div class="dg-caption">
+      <code>attn_tp_size = 8 // 1 // 4 = 2</code>: each DP rank shards attention weights over 2
+      GPUs (<code>_ATTN_TP</code> groups <code>[g0,g1] … [g6,g7]</code>) and keeps a private KV
+      cache. Rank layout is <code>(dp, cp, tp)</code> with tp fastest:
+      <code>tp_rank = (attn_dp_rank * attn_cp_size + attn_cp_rank) * attn_tp_size + attn_tp_rank</code>
+      (<code>layers/dp_attention.py:327</code>, <code>compute_dp_attention_world_info</code>).
+    </div>
+  </div>
+
+  <table class="tbl">
+    <tr><th>Flag</th><th>Default</th><th>Effect</th></tr>
+    <tr><td><code>--tp-size</code> (<code>--tensor-parallel-size</code>)</td><td>1</td><td>Shards weight matrices; one scheduler process per rank (chapter 05 covers the layer math).</td></tr>
+    <tr><td><code>--pp-size</code> (<code>--pipeline-parallel-size</code>)</td><td>1</td><td>Splits layers into stages; activates <code>SchedulerPPMixin.event_loop_pp</code> (§7.4).</td></tr>
+    <tr><td><code>--pp-async-batch-depth</code></td><td>0</td><td>Extra in-flight microbatches beyond <code>pp_size</code>.</td></tr>
+    <tr><td><code>--dp-size</code> (<code>--data-parallel-size</code>)</td><td>1</td><td>Plain DP replicas, or DP-attention slices with the flag below.</td></tr>
+    <tr><td><code>--enable-dp-attention</code></td><td>off</td><td>Nest DP inside TP; requires <code>dp_size &gt; 1</code> and <code>tp_size % dp_size == 0</code>.</td></tr>
+    <tr><td><code>--ep-size</code> (<code>--expert-parallel-size</code>, <code>--ep</code>)</td><td>1</td><td>Shards MoE experts across ranks; all-to-all backend via <code>--moe-a2a-backend</code>.</td></tr>
+    <tr><td><code>--ep-num-redundant-experts</code></td><td>0</td><td>Extra physical expert slots so EPLB can replicate hot experts (§7.5).</td></tr>
+    <tr><td><code>--enable-eplb</code> / <code>--eplb-rebalance-num-iterations</code></td><td>off / 1000</td><td>Enable expert-location rebalancing every N forward passes.</td></tr>
+    <tr><td><code>--dcp-size</code> (<code>--decode-context-parallel-size</code>)</td><td>1</td><td>Splits the KV cache <em>within</em> a TP group during decode (<code>_DCP</code> group).</td></tr>
+    <tr><td><code>--moe-dense-tp-size</code></td><td>—</td><td>Separate TP degree for dense layers in MoE models.</td></tr>
+    <tr><td><code>--dist-init-addr --nnodes --node-rank</code></td><td>—</td><td>Multi-node rendezvous (§7.7).</td></tr>
+    <tr><td><code>--elastic-ep-backend</code></td><td>—</td><td>Mooncake fault-tolerant process groups for growing/shrinking the EP world at runtime.</td></tr>
+  </table>
+
+  <h2><span class="sec-num">7.2</span>GroupCoordinator: one group, many transports</h2>
+  <p>
+    Every process group is wrapped in a <code>GroupCoordinator</code>
+    (<code>parallel_state.py:221</code>): "PyTorch ProcessGroup wrapper for a group of processes…
+    It can route the communication to a specific implementation (e.g. switch allreduce
+    implementation based on the tensor size and cuda graph mode)." Each coordinator holds
+    <em>two</em> torch process groups — a <code>device_group</code> (NCCL/HCCL/mooncake) for tensor
+    traffic and a gloo <code>cpu_group</code> for CPU-side coordination — plus a menu of optional
+    fast-path communicators, each created only if its <code>use_*</code> hint is set and
+    <code>world_size &gt; 1</code>:
+  </p>
+  <ul>
+    <li><code>pynccl_comm</code> — <code>PyNcclCommunicator</code>, ctypes-loaded NCCL that works
+      inside CUDA graph capture and supports the NCCL symmetric-memory window
+      (<code>device_communicators/pynccl.py</code>).</li>
+    <li><code>ca_comm</code> — <code>CustomAllreduce</code>, one-shot/two-shot IPC allreduce for
+      small tensors (<code>custom_all_reduce.py</code>).</li>
+    <li><code>qr_comm</code> — <code>QuickAllReduce</code>, ROCm-only quantized allreduce
+      (FP/INT8/INT6/INT4 regimes), "designed as a complement to custom allreduce" for large
+      tensors.</li>
+    <li><code>pymscclpp_comm</code>, <code>torch_symm_mem_comm</code>
+      (<code>TorchSymmMemCommunicator</code>), and platform communicators
+      (<code>hpu/xpu/npu_communicator</code>).</li>
+    <li><code>mq_broadcaster</code> — <code>MessageQueue.create_from_process_group(cpu_group,
+      1 &lt;&lt; 22, 6)</code>, a shared-memory ring buffer (<code>shm_broadcast.py</code>) for
+      broadcasting Python objects to local TP ranks without touching NCCL.</li>
+  </ul>
+
+  <div class="diagram">
+    <div class="dg-title">GroupCoordinator.all_reduce dispatch ladder</div>
+    <pre class="mermaid">
+flowchart TD
+  in["all_reduce(input_)"] --> ws{"world_size == 1?"}
+  ws -->|yes| noop["return input_ (no-op)"]
+  ws -->|no| cpu{"input_.is_cpu?"}
+  cpu -->|yes| shm["sgl_kernel.shm_allreduce<br/>else gloo all_reduce"]
+  cpu -->|no| plat{"HPU / XPU / NPU<br/>communicator?"}
+  plat -->|yes| pc["platform all_reduce"]
+  plat -->|no| dyn{"Dynamo tracing?"}
+  dyn -->|yes| auto["outplace custom op, method='auto'<br/>(resolve at runtime — byte-size guards<br/>would recompile per shape)"]
+  dyn -->|no| symm{"NCCL symm-mem<br/>buffer?"}
+  symm -->|yes| pyn1["pynccl in-place allreduce"]
+  symm -->|no| resolve["_resolve_outplace_all_reduce_method<br/><i>parallel_state.py:868</i>"]
+  resolve -->|"should_custom_ar()"| ca["'ca' — CustomAllreduce"]
+  resolve -->|"should_quick_allreduce()"| qr["'qr' — QuickAllReduce (ROCm)"]
+  resolve -->|"should_mscclpp_allreduce()"| ms["'pymscclpp'"]
+  resolve -->|"should_torch_symm_mem_allreduce()"| ts["'torch_symm_mem'"]
+  resolve -->|"piecewise CUDA graph + pynccl"| pyn2["'pynccl' outplace"]
+  resolve -->|none| fallback["inplace_all_reduce op:<br/>pynccl if enabled, else<br/>torch.distributed.all_reduce"]
+  style in fill:#eef0ff,stroke:#4f46e5
+  style fallback fill:#fdf3e3,stroke:#d97706
+    </pre>
+    <div class="dg-caption">
+      Verified against <code>GroupCoordinator.all_reduce</code>
+      (<code>parallel_state.py:622</code>) and
+      <code>_resolve_outplace_all_reduce_method</code> (<code>:868</code>). Every branch is also
+      exported as a torch custom op (<code>inplace_all_reduce</code>,
+      <code>outplace_all_reduce</code>, <code>reg_all_gather_into_tensor</code>, …) so Dynamo and
+      piecewise CUDA graphs treat collectives as opaque split points (chapter 06).
+    </div>
+  </div>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/distributed/device_communicators/custom_all_reduce.py:260" data-desc="Custom allreduce eligibility — the CUDA branch (HIP branch trimmed)">
+<pre>
+def should_custom_ar(self, inp: torch.Tensor):
+    if self.disabled:
+        return False
+    inp_size = inp.numel() * inp.element_size()
+    # custom allreduce requires input byte size to be multiples of 16
+    if inp_size % 16 != 0:
+        return False
+    if not is_weak_contiguous(inp):
+        return False
+    # for 4 or more non NVLink-capable GPUs, custom allreduce provides
+    # little performance improvement over NCCL.
+    if not _is_hip:
+        if self.world_size == 2 or self.full_nvlink:
+            return inp_size &lt;= self.max_size
+        return False
+</pre>
+  </div>
+
+  <div class="callout note"><span class="co-title">The size caps</span>
+    <code>CustomAllreduce._MAX_CAR_SIZE = 8192 * 1024</code> (8 MiB) on CUDA,
+    <code>2 * 8192 * 1024</code> (16 MiB) on ROCm ("crossover is at 16MB buffer size for ROCm"),
+    <code>16 * 8196 * 1024</code> (~128 MiB) on MUSA; supported world sizes are
+    <code>[2, 4, 6, 8]</code> (<code>custom_all_reduce.py:41</code>). Above the cap, NCCL wins —
+    unless ROCm's <code>QuickAllReduce</code> takes over with its per-(dtype, world-size,
+    quant-regime) <em>minimum</em>-size table. P2P capability is verified empirically:
+    <code>gpu_p2p_access_check</code> spawns producer/consumer processes because "P2P capability
+    detection can be flaky on some platforms", caching results to a JSON file keyed by
+    <code>CUDA_VISIBLE_DEVICES</code> (<code>custom_all_reduce_utils.py</code>).
+  </div>
+
+  <h2><span class="sec-num">7.3</span>DP-attention: the DeepSeek MLA story</h2>
+  <p>
+    <strong>Why does DP live inside TP at all?</strong> DeepSeek-style MLA has a <em>single
+    latent KV head</em>. Under pure TP-8, attention weights shard fine but the KV cache cannot —
+    every one of the 8 GPUs stores an identical full copy. DP-attention
+    (<code>--enable-dp-attention</code>) fixes this: split the TP group into <code>dp_size</code>
+    attention replicas, give each replica <em>its own requests and its own KV cache</em> (no
+    duplication), and only merge tokens back into one global batch for the MoE/dense-MLP part,
+    which stays TP/EP across the full world. Replicas can even be in different phases —
+    one prefilling while another decodes or idles.
+  </p>
+  <p>
+    <code>LayerCommunicator</code>/<code>ScatterMode</code>
+    (<code>layers/communicator.py:197</code>) names the data layouts. With TP=4, DP=2 and
+    sequences a,b on DP0 and c,d on DP1: attention runs in <code>TP_ATTN_FULL</code>
+    (<code>[ab, ab, cd, cd]</code> across the four ranks), the MoE runs in <code>FULL</code>
+    (<code>[abcd, abcd, abcd, abcd]</code>). The transitions are
+    <code>dp_gather_partial</code> before the MLP and <code>dp_scatter</code> /
+    <code>dp_reduce_scatter_tensor</code> after (<code>layers/dp_attention.py:789,805,827</code>).
+  </p>
+
+  <div class="diagram">
+    <div class="dg-title">One transformer layer under DP-attention</div>
+    <pre class="mermaid">
+flowchart LR
+  attn["Attention on LOCAL tokens<br/>TP_ATTN_FULL layout<br/>private KV cache per DP rank"] --> g["dp_gather_partial<br/><i>layers/dp_attention.py:789</i>"]
+  g --> mode{"DpPaddingMode?"}
+  mode -->|MAX_LEN| ag["_dp_gather_via_all_gather<br/>all_gather_into_tensor into<br/>[dp_size × max_len, hidden]"]
+  mode -->|SUM_LEN| ar["_dp_gather_via_all_reduce<br/>memcpy_triton own slice into<br/>zeroed buffer + all_reduce (SUM)"]
+  ag --> buf["global buffer — FULL layout<br/>(pad rows: topk_ids = -1)"]
+  ar --> buf
+  buf --> moe["MoE / dense MLP<br/>TP or EP over the whole world"]
+  moe --> sc["dp_scatter (memcpy own slice)<br/>or dp_reduce_scatter_tensor"]
+  sc --> next["next layer's attention"]
+  style attn fill:#eef0ff,stroke:#4f46e5
+  style buf fill:#fdf3e3,stroke:#d97706
+  style moe fill:#e7f7ec,stroke:#16a34a
+    </pre>
+    <div class="dg-caption">
+      <code>DpPaddingMode</code> (<code>dp_attention.py:72</code>): <b>MAX_LEN</b> pads every rank
+      to <code>max(global_num_tokens)</code> and uses a pure all-gather (symmetric-memory
+      friendly, the CUDA-graph default); <b>SUM_LEN</b> allocates
+      <code>sum(global_num_tokens)</code> rows and does zero-fill + memcpy + all-reduce of
+      disjoint slices (preferred for prefill, where padding waste dominates). A gatherv path
+      (<code>SGLANG_DP_USE_GATHERV</code>, optional fp8 wire format) avoids both.
+      <code>mask_dp_pad_moe_topk_ids</code> sets pad rows' <code>topk_ids</code> to −1 so they are
+      never dispatched to experts.
+    </div>
+  </div>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/layers/dp_attention.py:111" data-desc="The decode-time padding-mode cost model (DpPaddingMode.get_dp_padding_mode)">
+<pre>
+# we choose the mode that minimizes the communication cost
+# prefer MAX_LEN when communication cost is equal to enable symmetric memory
+max_len = max(global_num_tokens)
+sum_len = sum(global_num_tokens)
+if sum_len * 2 >= max_len * dp_size:
+    return cls.MAX_LEN
+else:
+    return cls.SUM_LEN
+</pre>
+  </div>
+
+  <h3>Worked example: two DP ranks, one layer — animated</h3>
+  <div class="stepper" id="st-dpa">
+    <div class="st-scene">
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:18px; min-width:760px">
+        <div>
+          <div class="sc-box" id="dpa-r0" style="width:100%">DP rank 0 · attn_tp group [g0..g3]<small>req A: "The cat sat" → 3 tokens · private KV cache</small></div>
+          <div class="sc-row" style="margin-top:6px; justify-content:center">
+            <span class="tok" id="tA1">A1</span><span class="tok" id="tA2">A2</span><span class="tok" id="tA3">A3</span>
+          </div>
+        </div>
+        <div>
+          <div class="sc-box" id="dpa-r1" style="width:100%">DP rank 1 · attn_tp group [g4..g7]<small>req B: "Bonjour !" → 2 tokens · private KV cache</small></div>
+          <div class="sc-row" style="margin-top:6px; justify-content:center">
+            <span class="tok" id="tB1">B1</span><span class="tok" id="tB2">B2</span>
+          </div>
+        </div>
+      </div>
+      <div class="sc-row" style="margin-top:14px">
+        <div class="sc-box appear" id="dpa-mode" style="width:100%; text-align:center">DpPaddingMode<small id="dpa-mode-txt">global_num_tokens = [3, 2]</small></div>
+      </div>
+      <div class="sc-row" style="margin-top:10px">
+        <div class="sc-box appear" id="dpa-buf" style="width:100%; text-align:center">global buffer · [dp_size × max_len = 6, hidden] · FULL layout
+          <div class="sc-row" style="margin-top:6px; justify-content:center">
+            <span class="tok" id="gA1">A1</span><span class="tok" id="gA2">A2</span><span class="tok" id="gA3">A3</span>
+            <span class="tok" id="gB1">B1</span><span class="tok" id="gB2">B2</span><span class="tok" id="gPad">PAD</span>
+          </div>
+        </div>
+      </div>
+      <div class="sc-row" style="margin-top:10px">
+        <div class="sc-box appear" id="dpa-moe" style="width:100%; text-align:center">MoE / dense MLP<small>same 6 rows computed on every rank (TP/EP over the whole world)</small></div>
+      </div>
+    </div>
+  </div>
+
+  <h2><span class="sec-num">7.4</span>Pipeline parallelism: microbatches over two transports</h2>
+  <p>
+    With <code>--pp-size K</code> each scheduler runs
+    <code>SchedulerPPMixin.event_loop_pp</code>
+    (<code>python/sglang/srt/managers/scheduler_pp_mixin.py</code>) instead of the normal loop
+    from chapter 02. The design is unusual: instead of stage 0 broadcasting batch <em>plans</em>,
+    <strong>every stage receives the raw request objects and re-runs the same scheduling decisions
+    deterministically</strong>. Requests hop stage-to-stage as pickled Python objects over the
+    <em>gloo</em> world group (<code>point_to_point_pyobj</code>, sent only from
+    <code>attn_tp_rank == 0</code>); activations hop as <code>PPProxyTensors</code> over NCCL
+    (<code>pp_group.send_tensor_dict</code>).
+  </p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/managers/scheduler_pp_mixin.py:560,96" data-desc="Microbatch ring: pp_loop_size slots, round-robin (two regions joined)">
+<pre>
+self.pp_loop_size: int = self.ps.pp_size + get_parallel().pp_async_batch_depth
+...
+for mb_id in range(self.pp_loop_size):
+    self.running_batch = self.running_mbs[mb_id]
+    self.last_batch = self.last_mbs[mb_id]
+    next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
+    next_mb_id = (mb_id + 1) % self.pp_loop_size
+</pre>
+  </div>
+
+  <div class="diagram">
+    <div class="dg-title">One microbatch slot through a 2-stage pipeline</div>
+    <pre class="mermaid">
+sequenceDiagram
+  participant T as TokenizerManager (ZMQ)
+  participant S0 as Stage 0 scheduler<br/>(pp_rank 0)
+  participant S1 as Stage 1 scheduler<br/>(pp_rank 1)
+  T->>S0: recv_requests()
+  S0-)S1: raw request objects<br/>point_to_point_pyobj, gloo, ASYNC
+  Note over S0,S1: both stages now run the same<br/>get_next_batch_to_run() deterministically
+  S0->>S0: forward microbatch mb_id<br/>(layers of stage 0)
+  S0-)S1: PPProxyTensors {hidden_states, residual}<br/>send_tensor_dict(all_gather_group=attn_tp), NCCL, ASYNC
+  S1->>S1: recv_tensor_dict (SYNC) → forward → sample
+  S1-)S0: next token ids ("output" tensor dict)
+  Note over S0: while mb_id computes, process the result of<br/>microbatch (mb_id + pp_size) % pp_loop_size
+    </pre>
+    <div class="dg-caption">
+      "Async send but sync recv to avoid desynchronization": sends return immediately
+      (<code>_pp_send_pyobj_to_next_stage</code> / <code>_pp_send_dict_to_next_stage</code>,
+      <code>scheduler_pp_mixin.py:965,1029</code>), receives block. The proxy-tensor dict is
+      sharded across attn-TP ranks in flight (<code>all_gather_group</code> optimization) and
+      re-allgathered on arrival. A <code>__msg_type__</code> key demultiplexes "proxy" vs "output"
+      messages arriving on the same channel.
+    </div>
+  </div>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/models/llama.py:446" data-desc="What actually crosses the stage boundary — models return PPProxyTensors on non-last ranks">
+<pre>
+if not self.pp_group.is_last_rank:
+    return PPProxyTensors(
+        {
+            "hidden_states": hidden_states,
+            "residual": residual,
+        }
+    )
+</pre>
+  </div>
+
+  <div class="callout note"><span class="co-title">Why send `residual` too?</span>
+    <code>PPProxyTensors</code> (<code>model_executor/forward_batch_info.py:1656</code>) is just a
+    dict of tensors. SGLang fuses each layer's output layer-norm with the next layer's residual
+    add, so at a stage boundary the (hidden_states, residual) pair is still un-merged — both must
+    travel. A FIXME in <code>llama.py</code> notes the residual could be eliminated by not fusing
+    the norms at stage edges.
+  </div>
+
+  <h2><span class="sec-num">7.5</span>Expert parallelism &amp; EPLB: moving experts to the tokens</h2>
+  <p>
+    MoE all-to-all backends live in <code>python/sglang/srt/layers/moe/token_dispatcher/</code>
+    (<code>deepep.py</code>, <code>mooncake.py</code>, <code>pplx.py</code>, …; chapter 05 covers
+    the layer math). The distributed-systems part is <em>load balancing</em>: token routing is
+    learned, so some experts run hot and their EP ranks become stragglers. SGLang's answer is
+    <strong>EPLB</strong> (<code>python/sglang/srt/eplb/</code>) — observe, recompute placement,
+    migrate weights, all without stopping the server.
+  </p>
+  <ul>
+    <li><b>Observe:</b> every DeepEP dispatch calls
+      <code>get_global_expert_distribution_recorder().on_deepep_dispatch_normal(...)</code> /
+      <code>_low_latency(...)</code> (<code>layers/moe/token_dispatcher/deepep.py</code>) — the
+      <code>ExpertDistributionRecorder</code> keeps per-layer logical-expert counts in a circular
+      buffer.</li>
+    <li><b>Decide:</b> the scheduler calls <code>EPLBManager.on_forward_pass_end()</code> each
+      iteration; an internal generator yields for
+      <code>eplb_rebalance_num_iterations</code> (default 1000) passes, then runs
+      <code>rebalance()</code> (<code>eplb/eplb_manager.py:75,92</code>). If
+      <code>average_utilization_rate_over_window</code> already beats
+      <code>--eplb-min-rebalancing-utilization-threshold</code>, it skips.</li>
+    <li><b>Place:</b> <code>ExpertLocationMetadata.init_by_eplb(...)</code> recomputes
+      <code>physical_to_logical_map</code> <code>(layers, num_physical_experts)</code> and
+      <code>logical_to_all_physical_map</code> (<code>eplb/expert_location.py:59-61</code>) —
+      physical slots (including the <code>--ep-num-redundant-experts</code> extras) can hold
+      redundant copies of hot logical experts.</li>
+    <li><b>Migrate:</b> <code>ExpertLocationUpdater.update(...)</code> P2P-moves expert weights
+      between EP ranks <em>chunk by chunk</em>
+      (<code>--eplb-rebalance-layers-per-chunk</code>), yielding back to the scheduler between
+      chunks so serving continues.</li>
+  </ul>
+
+  <div class="diagram">
+    <div class="dg-title">The EPLB feedback loop</div>
+    <pre class="mermaid">
+flowchart LR
+  disp["DeepEP dispatch<br/><i>token_dispatcher/deepep.py</i>"] --> rec["ExpertDistributionRecorder<br/>on_deepep_dispatch_normal /<br/>_low_latency"]
+  rec --> mgr["EPLBManager.on_forward_pass_end()<br/>generator yields N = 1000 forwards"]
+  mgr --> reb["rebalance(): dump_record →<br/>skip if utilization ≥ threshold"]
+  reb --> meta["ExpertLocationMetadata.init_by_eplb<br/>new physical_to_logical_map"]
+  meta --> upd["ExpertLocationUpdater.update<br/>P2P weight moves, chunk-by-chunk"]
+  upd --> disp
+  style rec fill:#eef0ff,stroke:#4f46e5
+  style meta fill:#fdf3e3,stroke:#d97706
+  style upd fill:#e7f7ec,stroke:#16a34a
+    </pre>
+    <div class="dg-caption">
+      Verified: <code>eplb/eplb_manager.py</code> (the generator asserts
+      <code>eplb_rebalance_num_iterations ≥ expert_distribution_recorder_buffer_size</code> so the
+      circular buffer never contains stale data), <code>eplb/expert_location.py</code>,
+      <code>eplb/expert_location_updater.py</code>. <b>Elastic EP</b>
+      (<code>elastic_ep/elastic_ep.py</code>) extends this: new nodes register a "scale cohort"
+      via the global TCPStore, join through Mooncake fault-tolerant groups
+      (<code>recovered_rank / rank_offset / max_world_size</code> in group construction), missing
+      expert weights are restored from the DRAM <code>expert_backup_client</code> or disk, and a
+      post-scale rebalance broadcasts the new map from global rank 0.
+    </div>
+  </div>
+
+  <h3>Rebalancing a hot expert — animated</h3>
+  <div class="stepper" id="st-eplb">
+    <div class="st-scene">
+      <div style="display:grid; grid-template-columns:repeat(4, 1fr); gap:12px; min-width:760px">
+        <div>
+          <div class="sc-box" id="ep-r0" style="width:100%; text-align:center">EP rank 0</div>
+          <div class="sc-box" id="ep-s00" style="width:100%; margin-top:6px; text-align:center"><span id="ep-n00">E0</span><small id="ep-l00">load 8%</small></div>
+          <div class="sc-box" id="ep-s01" style="width:100%; margin-top:6px; text-align:center"><span id="ep-n01">E1</span><small id="ep-l01">load 9%</small></div>
+          <div class="sc-box" id="ep-s02" style="width:100%; margin-top:6px; text-align:center"><span id="ep-n02">E2</span><small id="ep-l02">load 8%</small></div>
+        </div>
+        <div>
+          <div class="sc-box" id="ep-r1" style="width:100%; text-align:center">EP rank 1</div>
+          <div class="sc-box" id="ep-s10" style="width:100%; margin-top:6px; text-align:center"><span id="ep-n10">E3</span><small id="ep-l10">load 8%</small></div>
+          <div class="sc-box" id="ep-s11" style="width:100%; margin-top:6px; text-align:center"><span id="ep-n11">E4</span><small id="ep-l11">load 9%</small></div>
+          <div class="sc-box" id="ep-s12" style="width:100%; margin-top:6px; text-align:center"><span id="ep-n12">E5</span><small id="ep-l12">load 8%</small></div>
+        </div>
+        <div>
+          <div class="sc-box" id="ep-r2" style="width:100%; text-align:center">EP rank 2</div>
+          <div class="sc-box" id="ep-s20" style="width:100%; margin-top:6px; text-align:center"><span id="ep-n20">E6</span><small id="ep-l20">load 9%</small></div>
+          <div class="sc-box" id="ep-s21" style="width:100%; margin-top:6px; text-align:center"><span id="ep-n21">E7</span><small id="ep-l21">load 8%</small></div>
+          <div class="sc-box" id="ep-s22" style="width:100%; margin-top:6px; text-align:center"><span id="ep-n22">E0′</span><small id="ep-l22">redundant copy</small></div>
+        </div>
+        <div>
+          <div class="sc-box" id="ep-r3" style="width:100%; text-align:center">EP rank 3</div>
+          <div class="sc-box" id="ep-s30" style="width:100%; margin-top:6px; text-align:center"><span id="ep-n30">E1′</span><small id="ep-l30">redundant copy</small></div>
+          <div class="sc-box" id="ep-s31" style="width:100%; margin-top:6px; text-align:center"><span id="ep-n31">E2′</span><small id="ep-l31">redundant copy</small></div>
+          <div class="sc-box" id="ep-s32" style="width:100%; margin-top:6px; text-align:center"><span id="ep-n32">E3′</span><small id="ep-l32">redundant copy</small></div>
+        </div>
+      </div>
+      <div class="sc-row" style="margin-top:12px">
+        <div class="sc-box appear" id="ep-mgr" style="width:100%; text-align:center">EPLBManager<small id="ep-mgr-txt">forward passes since last rebalance: 0 / 1000</small></div>
+      </div>
+    </div>
+  </div>
+
+  <h2><span class="sec-num">7.6</span>RL weight updates: four ways to swap a brain</h2>
+  <p>
+    RLHF loops need to push fresh trainer weights into a serving engine every few steps. SGLang
+    exposes the same family of endpoints at every level (HTTP → <code>TokenizerManager</code> →
+    scheduler → <code>ModelRunner</code>'s <code>WeightUpdater</code> in
+    <code>python/sglang/srt/model_executor/model_runner_components/weight_updater.py</code>):
+  </p>
+
+  <div class="diagram">
+    <div class="dg-title">Trainer → engine weight paths</div>
+    <pre class="mermaid">
+flowchart LR
+  tr["Trainer<br/>(FSDP / Megatron actor)"]
+  ce["checkpoint-engine<br/>ParameterServer<br/><i>checkpoint_engine/update.py</i>"]
+  disk["Checkpoint on disk"]
+  subgraph eng ["SGLang engine (each TP rank)"]
+    gate["TokenizerManager gate:<br/>model_update_lock + weight_version bump"]
+    wu["WeightUpdater →<br/>model.load_weights(...)"]
+    gate --> wu
+  end
+  tr -->|"NCCL broadcast(src=0)<br/>_model_update_group"| d1["update_weights_from_distributed"]
+  tr -->|"CUDA-IPC serialized tensors<br/>(colocated)"| d2["update_weights_from_tensor"]
+  ce -->|"ZMQ handles + CUDA-IPC"| d3["update_weights_from_ipc"]
+  disk -->|"safetensors reload<br/>(rollback on failure)"| d4["update_weights_from_disk"]
+  d1 --> gate
+  d2 --> gate
+  d3 --> gate
+  d4 --> gate
+  style eng fill:#e7f7ec,stroke:#16a34a
+  style ce fill:#f5ecfe,stroke:#9333ea
+    </pre>
+    <div class="dg-caption">
+      <code>update_weights_from_distributed</code> receives tensors via async
+      <code>torch.distributed.broadcast(src=0)</code> on a dedicated trainer+engine group
+      (optionally one flattened <code>FlattenedTensorBucket</code> instead of N tensors —
+      <code>weight_sync/tensor_bucket.py</code>). <code>update_weights_from_tensor</code> is the
+      colocated path: per-TP-rank <code>LocalSerializedTensor</code> handles, CUDA-IPC under the
+      hood. <code>update_weights_from_ipc</code> plugs into the external checkpoint-engine
+      package (<code>checkpoint_engine/checkpoint_engine_worker.py:69</code>) — launch the server
+      with <code>--checkpoint-engine-wait-weights-before-ready --load-format dummy</code>, then
+      <code>torchrun ... update.py --update-method broadcast</code>.
+    </div>
+  </div>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/model_executor/model_runner_components/weight_updater.py:67" data-desc="The RLHF group: trainer rank 0 + engine ranks (body trimmed after docstring)">
+<pre>
+def init_weights_update_group(
+    self,
+    master_address,
+    master_port,
+    rank_offset,
+    world_size,
+    group_name,
+    backend="nccl",
+):
+    """Initialize the Torch process group for model parameter updates.
+
+    `_model_update_group` is used in the RLHF workflow, where rank
+    0 is the actor model in the training engine, and the other ranks are
+    the inference engine, which is used for rollout.
+
+    In the RLHF workflow, the training engine updates the model
+    weights/parameters online, and broadcasts them to the inference
+    engine through the `_model_update_group` process group.
+    """
+</pre>
+  </div>
+
+  <p>Sibling subsystems worth knowing about (each one directory):</p>
+  <div class="filetree">
+<b>python/sglang/srt/</b>
+├── <b>checkpoint_engine/</b>     <i>ZMQ + CUDA-IPC weight publisher (update.py is torchrun-able)</i>
+├── <b>weight_cache/</b>          <i>Weight Cache Daemon: per-GPU process holds TP-sharded weights,</i>
+│                         <i>serves CUDA-IPC handles over a Unix socket → instant engine restarts;</i>
+│                         <i>all update_weights_* endpoints refuse while attached</i>
+├── <b>weight_sync/</b>           <i>FlattenedTensorBucket + DTensor-aware update_weights() for SPMD trainers</i>
+├── <b>ray/</b>                   <i>RayEngine: schedulers as Ray actors (placement groups);</i>
+│                         <i>"Ray for process lifecycle, ZMQ for request/response"</i>
+├── <b>elastic_ep/</b>            <i>TCPStore scale cohorts + DRAM expert backups (§7.5)</i>
+└── <b>multiplex/</b>             <i>PD multiplexing on one GPU via SM partitioning — see chapter 08</i>
+  </div>
+
+  <h2><span class="sec-num">7.7</span>Multi-node launch, verified</h2>
+  <div class="card">
+    <p style="margin-top:0">
+      From <code>docs_new/docs/references/multi_node_deployment/multi_node.mdx</code> — Llama 3.1
+      405B (fp16) as one tp=16 world across two 8-GPU nodes. Same command on both nodes except
+      <code>--node-rank</code>:
+    </p>
+    <div class="snippet" data-lang="bash" data-file="docs_new/docs/references/multi_node_deployment/multi_node.mdx" data-desc="2-node tp16 — node 1 runs the identical command with --node-rank 1">
+<pre>
+# replace 172.16.4.52:20000 with your own node ip address and port of the first node
+python3 -m sglang.launch_server \
+  --model-path meta-llama/Meta-Llama-3.1-405B-Instruct \
+  --tp 16 \
+  --dist-init-addr 172.16.4.52:20000 \
+  --nnodes 2 \
+  --node-rank 0
+</pre>
+    </div>
+    <p>
+      <code>--dist-init-addr host:port</code> becomes torch's <code>tcp://</code> init method
+      (<code>bootstrap._resolve_dist_init_method</code>; override with
+      <code>SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE=env://</code> for external orchestrators).
+      Which ranks a node runs: <code>pp_size_per_node = max(pp_size // nnodes, 1)</code> and
+      <code>tp_size_per_node = tp_size // nnodes_per_tp_group</code>
+      (<code>data_parallel_controller.py</code>); nodes with <code>node_rank ≥ 1</code> run
+      schedulers only (chapter 01). The SLURM recipe in the same doc uses
+      <code>--dist-init-addr "$NCCL_INIT_ADDR" --nnodes 2 --node-rank "$SLURM_NODEID"</code>.
+      The DPA guide (<code>docs_new/docs/advanced_features/dp_dpa_smg_guide.mdx</code>) example:
+      <code>--tp-size 8 --dp-size 8 --enable-dp-attention</code> — both flags required,
+      <code>dp_size</code> must exceed 1 and divide <code>tp_size</code>.
+    </p>
+  </div>
+
+  <h2><span class="sec-num">7.8</span>Notable facts &amp; gotchas</h2>
+  <div class="card">
+    <ul>
+      <li><b>Every NCCL group has a gloo shadow.</b> Each <code>GroupCoordinator</code> carries a
+        <code>cpu_group</code> "to allow direct coordination between processes through the CPU" —
+        PP request forwarding, <code>broadcast_object</code>, and <code>send_object/recv_object</code>
+        all ride gloo, keeping NCCL exclusively for tensors.</li>
+      <li><b>Group aliasing is pervasive.</b> With <code>--tp 8 --ep 8</code> (typical DeepSeek),
+        <code>_MOE_EP is _TP</code>; <code>_ATTN_CP</code> aliases <code>_TP</code> when
+        <code>attn_cp_size == tp_size</code>; and when <code>attn_cp_size &gt; moe_dp_size</code>,
+        <code>_MOE_DP = _ATTN_CP</code> so the existing DP allgather/scatter handles CP token
+        sharing. Only unusual splits (and NPU, which needs a standalone EP group) create new
+        communicators.</li>
+      <li><b>Plain DP ≠ DP-attention.</b> <code>--dp-size 4</code> alone gives 4 separate NCCL
+        worlds behind a ZMQ load balancer; add <code>--enable-dp-attention</code> and the same
+        flag instead carves 4 slices out of one TP world.</li>
+      <li><b>NCCL warm-up and memory sanity at boot:</b> <code>_prewarm_nccl</code> runs one
+        1-element all-reduce to eat communicator-init latency (default on AMD), and
+        <code>_check_tp_memory_balance</code> fails fast if any rank has &lt;90% of the group's
+        free memory — catching "another process is squatting on GPU 3" before a mid-load OOM
+        (<code>distributed/bootstrap.py</code>).</li>
+      <li><b><code>_DpGatheredBufferWrapper</code> uses class attributes, not contextvars</b> — the
+        per-forward buffer sizing must be visible under Dynamo tracing, and contextvars aren't
+        traceable (<code>layers/dp_attention.py:130</code>).</li>
+      <li><b>Speculative decoding runs draft models at dp=1 semantics</b> via the
+        <code>disable_dp_size()</code> context manager during draft-worker init (chapter 09).</li>
+      <li><b>TBO overlap uses one shared comm stream with persistent CUDA events</b> for
+        <code>dp_gather_partial_async</code> / <code>dp_reduce_scatterv_async</code> — allocating
+        events per-call exhausted the HSA signal pool on ROCm
+        (<code>dp_attention.py:858+</code>).</li>
+      <li><b>The PP loop trades bandwidth for determinism:</b> forwarding raw requests to every
+        stage costs gloo traffic but removes any need for a batch-plan broadcast — each stage
+        recomputes identical scheduling decisions.</li>
+      <li><b>Weight updates are globally serialized:</b> the <code>TokenizerManager</code> takes
+        <code>model_update_lock.writer_lock</code>, optionally aborts all in-flight requests, and
+        bumps <code>weight_version</code>; every path is refused while the weight-cache daemon is
+        attached, since CUDA-IPC-shared weights would corrupt all co-attached engines.</li>
+    </ul>
+  </div>
+
+  <div id="pager"></div>
+  </div>
+</main>
+</div>
+
+<script>
+document.addEventListener("DOMContentLoaded", () => {
+
+  new Stepper("#st-dpa", {
+    title: "DP-attention forward: tp=8, dp=2, cp=1 → attn_tp = 8/2/1 = 4",
+    intro: "Two DP ranks, each with its own requests and KV cache, share one MoE.",
+    autoMs: 3400,
+    reset(sc) {
+      clearState(sc, ".sc-box,.tok");
+      rmCls(sc, ".appear", "in");
+      setText(sc, "#dpa-mode-txt", "global_num_tokens = [3, 2]");
+    },
+    steps: [
+      { cap: "<b>Local attention.</b> DP rank 0 attends over its 3 tokens (A1–A3), DP rank 1 over its 2 (B1–B2) — each against its <i>own</i> KV cache, sharded over 4 attn-TP GPUs. With MLA's single latent head, this is what kills the TP-8 KV duplication.",
+        run(sc) { setCls(sc, "#dpa-r0,#dpa-r1", "hl"); setCls(sc, "#tA1,#tA2,#tA3", "hl"); setCls(sc, "#tB1,#tB2", "cache"); } },
+      { cap: "<b>Pick a padding mode.</b> <code>global_num_tokens = [3, 2]</code>: max_len=3, sum_len=5. Cost model: <code>sum_len·2 = 10 ≥ max_len·dp_size = 6</code> → <b>MAX_LEN</b> (dp_attention.py:111). Every rank pads to 3 rows.",
+        run(sc) { setCls(sc, "#dpa-mode", "in", "hl"); setText(sc, "#dpa-mode-txt", "max_len=3, sum_len=5 · 5·2 ≥ 3·2 → MAX_LEN"); } },
+      { cap: "<b>dp_gather_partial</b> → <code>_dp_gather_via_all_gather</code>: one <code>all_gather_into_tensor</code> fills the [2×3=6, hidden] global buffer on <i>every</i> rank. The PAD row gets <code>topk_ids = -1</code> via <code>mask_dp_pad_moe_topk_ids</code> so no expert ever sees it.",
+        run(sc) { rmCls(sc, "#dpa-r0,#dpa-r1", "hl"); setCls(sc, "#dpa-buf", "in", "hl");
+                  setCls(sc, "#gA1,#gA2,#gA3", "hl"); setCls(sc, "#gB1,#gB2", "cache"); setCls(sc, "#gPad", "free"); } },
+      { cap: "<b>Shared MoE.</b> The MoE / dense MLP runs on all 6 rows in <code>FULL</code> layout — TP or EP over the whole 8-GPU world, exactly as if DP didn't exist. This is the layer where big TP still pays off.",
+        run(sc) { rmCls(sc, "#dpa-buf", "hl"); setCls(sc, "#dpa-moe", "in", "ok"); setCls(sc, "#gA1,#gA2,#gA3,#gB1,#gB2", "ok"); setCls(sc, "#gPad", "dim"); } },
+      { cap: "<b>dp_scatter back.</b> No collective needed: each rank <code>memcpy_triton</code>s its slice <code>[local_start_pos, +local_num_tokens)</code> out of the global buffer (dp_attention.py:805). Rank 0 takes rows 0–2, rank 1 takes rows 3–4.",
+        run(sc) { setCls(sc, "#gA1,#gA2,#gA3,#gB1,#gB2,#gPad", "dim"); setCls(sc, "#tA1,#tA2,#tA3,#tB1,#tB2", "ok"); setCls(sc, "#dpa-r0,#dpa-r1", "ok"); } },
+      { cap: "Next layer's attention starts from the scattered states — repeat per layer. In CUDA-graph decode the mode is pinned to MAX_LEN so buffer shapes stay static; prefill prefers SUM_LEN because padding waste dominates there.",
+        run(sc) { setCls(sc, "#dpa-r0,#dpa-r1", "pulse"); } },
+    ],
+  });
+
+  new Stepper("#st-eplb", {
+    title: "EPLB: 8 logical experts, 12 physical slots on 4 EP ranks",
+    intro: "Launched with --ep-num-redundant-experts 4 → 4 spare slots hold redundant copies.",
+    autoMs: 3400,
+    reset(sc) {
+      clearState(sc, ".sc-box");
+      rmCls(sc, ".appear", "in");
+      setText(sc, "#ep-n00", "E0"); setText(sc, "#ep-l00", "load 8%");
+      setText(sc, "#ep-n01", "E1"); setText(sc, "#ep-l01", "load 9%");
+      setText(sc, "#ep-n02", "E2"); setText(sc, "#ep-l02", "load 8%");
+      setText(sc, "#ep-n10", "E3"); setText(sc, "#ep-l10", "load 8%");
+      setText(sc, "#ep-n11", "E4"); setText(sc, "#ep-l11", "load 9%");
+      setText(sc, "#ep-n12", "E5"); setText(sc, "#ep-l12", "load 8%");
+      setText(sc, "#ep-n20", "E6"); setText(sc, "#ep-l20", "load 9%");
+      setText(sc, "#ep-n21", "E7"); setText(sc, "#ep-l21", "load 8%");
+      setText(sc, "#ep-n22", "E0′"); setText(sc, "#ep-l22", "redundant copy");
+      setText(sc, "#ep-n30", "E1′"); setText(sc, "#ep-l30", "redundant copy");
+      setText(sc, "#ep-n31", "E2′"); setText(sc, "#ep-l31", "redundant copy");
+      setText(sc, "#ep-n32", "E3′"); setText(sc, "#ep-l32", "redundant copy");
+      setText(sc, "#ep-mgr-txt", "forward passes since last rebalance: 0 / 1000");
+    },
+    steps: [
+      { cap: "<b>Steady state.</b> <code>physical_to_logical_map</code> spreads 8 logical experts + 4 redundant copies over 12 slots. Every DeepEP dispatch reports token counts to the <code>ExpertDistributionRecorder</code> (<code>on_deepep_dispatch_normal/_low_latency</code>).",
+        run(sc) { setCls(sc, "#ep-s00,#ep-s01,#ep-s02,#ep-s10,#ep-s11,#ep-s12,#ep-s20,#ep-s21,#ep-s22,#ep-s30,#ep-s31,#ep-s32", "ok"); } },
+      { cap: "<b>The workload shifts.</b> A new prompt mix makes E4 hot: it now receives 38% of all routed tokens. EP rank 1 becomes the straggler every layer — everyone else waits at the all-to-all combine.",
+        run(sc) { rmCls(sc, "#ep-s11,#ep-s10,#ep-s12", "ok"); setCls(sc, "#ep-s11", "warn", "pulse"); setCls(sc, "#ep-r1", "warn");
+                  setText(sc, "#ep-l11", "load 38% — HOT"); setText(sc, "#ep-l10", "load 4%"); setText(sc, "#ep-l12", "load 5%"); } },
+      { cap: "<b>The trigger.</b> Each iteration the scheduler calls <code>EPLBManager.on_forward_pass_end()</code>; after <code>eplb_rebalance_num_iterations</code> (default 1000) the generator falls through to <code>rebalance()</code>: <code>dump_record()</code> shows utilization below the threshold → proceed.",
+        run(sc) { setCls(sc, "#ep-mgr", "in", "hl"); setText(sc, "#ep-mgr-txt", "1000 / 1000 → rebalance(): utilization 61% < threshold"); } },
+      { cap: "<b>New placement.</b> <code>ExpertLocationMetadata.init_by_eplb</code> assigns E4 two extra physical replicas, evicting the cold redundant copies E0′ and E1′. <code>ExpertLocationUpdater.update</code> P2P-copies E4's weights from rank 1 to ranks 2 and 3, chunk-by-chunk, serving throughout.",
+        run(sc) { rmCls(sc, "#ep-s22,#ep-s30", "ok");
+                  setText(sc, "#ep-n22", "E4′"); setText(sc, "#ep-l22", "weights arriving (P2P)");
+                  setText(sc, "#ep-n30", "E4″"); setText(sc, "#ep-l30", "weights arriving (P2P)");
+                  setCls(sc, "#ep-s22,#ep-s30", "hl", "pulse"); } },
+      { cap: "<b>Balanced.</b> The router now splits E4's tokens across 3 physical copies (~13% each). Rank 1 is no longer the straggler; the recorder window resets and the loop keeps watching.",
+        run(sc) { rmCls(sc, "#ep-s11,#ep-r1", "warn"); rmCls(sc, "#ep-s11,#ep-s22,#ep-s30", "pulse"); rmCls(sc, "#ep-s22,#ep-s30", "hl");
+                  setCls(sc, "#ep-s10,#ep-s11,#ep-s12,#ep-s22,#ep-s30", "ok"); rmCls(sc, "#ep-mgr", "hl"); setCls(sc, "#ep-mgr", "ok");
+                  setText(sc, "#ep-l11", "load 13%"); setText(sc, "#ep-l22", "load 13%"); setText(sc, "#ep-l30", "load 12%");
+                  setText(sc, "#ep-l10", "load 7%"); setText(sc, "#ep-l12", "load 7%");
+                  setText(sc, "#ep-mgr-txt", "rebalance done — counting to next window: 0 / 1000"); } },
+    ],
+  });
+
+});
+</script>
+</body>
+</html>

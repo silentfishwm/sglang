@@ -1,0 +1,901 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>03 · KV Cache &amp; RadixAttention — SGLang Internals</title>
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/mermaid.min.js"></script>
+<script src="assets/viz.js"></script>
+</head>
+<body>
+<div class="layout">
+<main>
+  <div class="page-hero"><div class="content">
+    <span class="phase-badge">Phase II · The Core Engine</span>
+    <h1>03 · Memory: the KV Cache &amp; RadixAttention</h1>
+    <p class="lede">
+      After weights, every byte of GPU memory an inference server owns goes to one thing:
+      the KV cache. This chapter dissects how SGLang stores it (a two-level indirection into
+      per-layer tensors), how it hands slots out (token vs. paged allocators), and its
+      signature idea — RadixAttention, a radix tree over token IDs that lets requests share
+      each other's KV instead of recomputing it.
+    </p>
+  </div></div>
+
+  <div class="content">
+
+  <h2><span class="sec-num">3.1</span>Why the KV cache is the whole game</h2>
+  <p>
+    During autoregressive decoding, attention at step <i>t</i> needs the key/value vectors of
+    all <i>t−1</i> previous tokens, for every layer. Recomputing them each step would be
+    quadratic, so they are cached — and that cache is enormous. For a Llama-3-8B-shaped model
+    (32 layers, 8 KV heads, head_dim 128, fp16), one token costs
+    <code>2&nbsp;(K+V) × 32 × 8 × 128 × 2&nbsp;bytes = 128&nbsp;KiB</code>; a single 8K-token
+    conversation holds ~1&nbsp;GiB of KV. Whatever GPU memory remains after weights
+    (controlled by <code>--mem-fraction-static</code>) is carved into one giant static KV pool
+    at startup, and the scheduler's entire job (chapter 02) is deciding which requests get to
+    occupy its slots.
+  </p>
+  <p>
+    Two famous ideas attack two <em>different</em> problems in this space, and they are often
+    confused:
+  </p>
+  <ul>
+    <li><strong>PagedAttention</strong> (vLLM's contribution) solves <em>fragmentation</em>:
+      instead of reserving one contiguous max-length region per request, KV is allocated in
+      fixed-size pages, so memory can be handed out incrementally with no external
+      fragmentation.</li>
+    <li><strong>RadixAttention</strong> (SGLang's contribution) solves <em>recomputation</em>:
+      when two requests share a token prefix — the same system prompt, the same few-shot
+      examples, earlier turns of the same chat — their KV for that prefix is byte-identical.
+      A radix tree keyed on token IDs maps prefixes to already-computed KV slots, so the
+      second request skips prefill for the shared part entirely.</li>
+  </ul>
+  <div class="callout note"><span class="co-title">Orthogonal, and SGLang has both</span>
+    Paging is an <em>allocation granularity</em>; prefix reuse is a <em>cache policy</em>.
+    SGLang implements both: <code>--page-size</code> selects the allocation granularity
+    (page_size 1 is fully token-granular), and the radix tree provides prefix reuse on top,
+    with keys truncated to page multiples so a cached prefix is always a whole number of
+    pages. Disabling one (<code>--disable-radix-cache</code>) does not disable the other.
+  </div>
+
+  <h2><span class="sec-num">3.2</span>The two-level indirection</h2>
+  <p>
+    SGLang never stores KV "per request". Instead there are two levels of mapping, both
+    plain tensors, so every attention kernel can gather KV with integer indexing:
+  </p>
+  <ul>
+    <li><strong>Level 1 — <code>ReqToTokenPool</code></strong>
+      (<code>python/sglang/srt/mem_cache/memory_pool.py:256</code>): an int32 matrix
+      <code>req_to_token</code> of shape <code>(size + 1, max_context_len)</code>. Row
+      <code>req_pool_idx</code> belongs to one running request; column <i>p</i> holds the
+      <em>token slot</em> where position <i>p</i>'s KV lives. Row 0 is a padding row for
+      CUDA-graph-padded batches.</li>
+    <li><strong>Level 2 — <code>KVCache</code></strong>
+      (<code>memory_pool.py:1581</code>): the physical per-layer tensors. A token slot is a
+      row index into every layer's K and V buffers at once.</li>
+  </ul>
+  <p>
+    Between the two sits the <strong>allocator</strong> (section 3.3), which owns the free
+    list of token slots. Crucially, nothing says two rows of <code>req_to_token</code> can't
+    point at the <em>same</em> slots — that aliasing is exactly how RadixAttention shares
+    prefixes.
+  </p>
+
+  <div class="diagram">
+    <div class="dg-title">FROM REQUEST TO KV BYTES — THE INDIRECTION CHAIN</div>
+    <pre class="mermaid">
+flowchart LR
+  req["Req<br/>rid · req_pool_idx = 3"]
+  subgraph l1 ["Level 1 · ReqToTokenPool"]
+    r2t["req_to_token — int32<br/>shape (size+1, max_context_len)<br/><i>memory_pool.py:279</i>"]
+  end
+  alloc["Token/Paged allocator<br/>free_pages — slot 0 reserved<br/><i>mem_cache/allocator/</i>"]
+  subgraph l2 ["Level 2 · KVCache, one row per token slot"]
+    mha["MHA/GQA — per layer:<br/>k_buffer: (size+page_size, head_num, head_dim)<br/>v_buffer: (size+page_size, head_num, v_head_dim)"]
+    mla["MLA — per layer, K and V fused:<br/>kv_buffer: (size+page_size, 1, kv_lora_rank+qk_rope_head_dim)"]
+  end
+  tree["RadixCache<br/>TreeNode.value = copies of<br/>slot-index slices"]
+  req -->|"row = req_pool_idx"| r2t
+  r2t -->|"slot = req_to_token[3, pos]"| mha
+  r2t -.-> mla
+  alloc <-.->|"alloc / free slots"| r2t
+  tree -.->|"shares slots, owns refs"| alloc
+  style l1 fill:#eef0ff,stroke:#4f46e5
+  style l2 fill:#e7f7ec,stroke:#16a34a
+  style tree fill:#f5ecfe,stroke:#9333ea
+    </pre>
+    <div class="dg-caption">
+      Verified shapes: MHA keeps a Python <b>list of per-layer tensors</b>
+      (<code>memory_pool.py:1997-2001</code>, <code>2046-2054</code>); MLA stores a single fused
+      latent buffer per layer with <code>kv_cache_dim = kv_lora_rank + qk_rope_head_dim</code>
+      (<code>memory_pool.py:3903-3906</code>, <code>3928-3935</code>). All pools allocate
+      <code>size + page_size</code> rows: the extra first page (slot 0's page) absorbs dummy
+      writes from CUDA-graph padded tokens.
+    </div>
+  </div>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/mem_cache/memory_pool.py:1990" data-desc="MHATokenToKVPool: shapes and buffer creation (hnd / vectorized branches elided)">
+<pre>
+def _kv_buffer_shapes(self):
+    """(k_shape, v_shape)"""
+    ...
+    rows = self.size + self.page_size
+    return (
+        (rows, self.head_num, self.head_dim),
+        (rows, self.head_num, self.v_head_dim),
+    )
+
+# in _create_buffers_normal(), memory_pool.py:2046
+k_shape, v_shape = self._kv_buffer_shapes()
+self.k_buffer = [
+    torch.zeros(k_shape, dtype=self.store_dtype, device=self.device)
+    for _ in range(self.layer_num)
+]
+self.v_buffer = [
+    torch.zeros(v_shape, dtype=self.store_dtype, device=self.device)
+    for _ in range(self.layer_num)
+]
+</pre>
+  </div>
+
+  <div class="callout fact"><span class="co-title">fp8 KV is stored as uint8</span>
+    <code>KVCache.__init__</code> (<code>memory_pool.py:1601-1605</code>) sets
+    <code>store_dtype = torch.uint8</code> for all float8 dtypes because
+    <code>Tensor.index_put</code> is not implemented for <code>float8_e5m2</code>; buffers are
+    <code>.view()</code>-ed back to the real dtype on read. FP4 and MXFP8 variants
+    (<code>MHATokenToKVPoolFP4</code>, <code>MHATokenToKVPoolMXFP8</code>) keep separate scale
+    buffers.
+  </div>
+
+  <h3>Worked example: one prompt, three decode steps</h3>
+  <p>
+    Concrete numbers, <code>page_size = 1</code>: the prompt
+    <code>"The capital of France is"</code> tokenizes to 5 tokens, then the model decodes
+    3 more. Watch both levels of the indirection fill in.
+  </p>
+
+  <div class="stepper" id="st-alloc">
+    <div class="st-scene">
+      <div class="sc-row">
+        <div class="sc-box" id="al-req">Req<small>req_pool_idx = ?</small></div>
+        <div class="sc-box" id="al-alloc">TokenToKVPoolAllocator<small>free_pages = <span id="al-free">[1 2 3 … 12]</span></small></div>
+        <div class="sc-box" id="al-kv">k_buffer / v_buffer<small>one write per layer per slot</small></div>
+      </div>
+      <div class="sc-row" style="margin-top:14px">
+        <div class="sc-box ghost" style="min-width:190px">req_to_token[3, ·]<small>positions 0 … 7</small></div>
+        <div class="tok rt" id="al-rt0">·</div><div class="tok rt" id="al-rt1">·</div>
+        <div class="tok rt" id="al-rt2">·</div><div class="tok rt" id="al-rt3">·</div>
+        <div class="tok rt" id="al-rt4">·</div><div class="tok rt" id="al-rt5">·</div>
+        <div class="tok rt" id="al-rt6">·</div><div class="tok rt" id="al-rt7">·</div>
+      </div>
+      <div class="sc-row" style="margin-top:6px">
+        <div class="sc-box ghost" style="min-width:190px">token slots<small>0 … 12 (0 = padding sink)</small></div>
+        <div class="tok slot dim" id="al-s0" title="padding sink">0</div>
+        <div class="tok slot free" id="al-s1">1</div><div class="tok slot free" id="al-s2">2</div>
+        <div class="tok slot free" id="al-s3">3</div><div class="tok slot free" id="al-s4">4</div>
+        <div class="tok slot free" id="al-s5">5</div><div class="tok slot free" id="al-s6">6</div>
+        <div class="tok slot free" id="al-s7">7</div><div class="tok slot free" id="al-s8">8</div>
+        <div class="tok slot free" id="al-s9">9</div><div class="tok slot free" id="al-s10">10</div>
+        <div class="tok slot free" id="al-s11">11</div><div class="tok slot free" id="al-s12">12</div>
+      </div>
+    </div>
+  </div>
+
+  <h2><span class="sec-num">3.3</span>Allocators: token-granular vs. paged</h2>
+  <p>
+    The free list of token slots lives in a
+    <code>BaseTokenToKVPoolAllocator</code> subclass
+    (<code>python/sglang/srt/mem_cache/allocator/base.py:27</code>). Which one you get is
+    decided purely by <code>--page-size</code>:
+  </p>
+
+  <table class="tbl">
+    <tr><th>Class</th><th>File (under <code>mem_cache/allocator/</code>)</th><th>When / what</th></tr>
+    <tr><td><code>TokenToKVPoolAllocator</code></td><td><code>token.py:28</code></td>
+      <td><code>page_size == 1</code>. <code>free_pages</code> is literally a tensor of free slot
+      indices; alloc = slice off the front, free = <code>torch.cat</code> back on.</td></tr>
+    <tr><td><code>PagedTokenToKVPoolAllocator</code></td><td><code>paged.py:105</code></td>
+      <td><code>page_size &gt; 1</code>. Free list holds <em>page</em> numbers; Triton kernels
+      <code>alloc_extend_kernel</code> / <code>alloc_decode_kernel</code> fill partially-used last
+      pages before claiming new ones, keeping every request's output page-aligned.</td></tr>
+    <tr><td><code>SWATokenToKVPoolAllocator</code>, <code>PureSWATokenToKVPoolAllocator</code></td>
+      <td><code>swa.py:20 / 399</code></td>
+      <td>Hybrid sliding-window models: two free lists (full-attention layers vs. SWA layers)
+      sized by <code>--swa-full-tokens-ratio</code>.</td></tr>
+    <tr><td><code>HiSparseTokenToKVPoolAllocator</code> (+ DeepSeek-V4 variant)</td>
+      <td><code>hisparse.py</code></td><td>Hierarchical sparse attention (<code>--enable-hisparse</code>).</td></tr>
+    <tr><td><code>MambaSlotAllocator</code></td><td><code>mamba.py:30</code></td>
+      <td>Fixed-size Mamba/SSM state slots for hybrid linear-attention models.</td></tr>
+  </table>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/mem_cache/allocator/token.py:55" data-desc="page_size=1 allocator: alloc slices the free list, free concatenates back">
+<pre>
+def alloc(self, need_size: int):
+    if self.need_sort and need_size &gt; len(self.free_pages):
+        self.merge_and_sort_free()
+
+    if need_size &gt; len(self.free_pages):
+        return None
+
+    select_index = self.free_pages[:need_size]
+    self.free_pages = self.free_pages[need_size:]
+    return select_index
+
+def free(self, free_index: torch.Tensor):
+    if free_index.numel() == 0:
+        return
+
+    if self.is_not_in_free_group:
+        if self.need_sort:
+            self.release_pages = torch.cat((self.release_pages, free_index))
+        else:
+            self.free_pages = torch.cat((self.free_pages, free_index))
+    else:
+        self.free_group.append(free_index)
+</pre>
+  </div>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/mem_cache/allocator/paged.py:156" data-desc="paged alloc: page numbers → contiguous token indices (debug asserts trimmed)">
+<pre>
+num_pages = need_size // self.page_size
+if self.need_sort and num_pages &gt; len(self.free_pages):
+    self.merge_and_sort_free()
+if num_pages &gt; len(self.free_pages):
+    return None
+
+out_pages = self.free_pages[:num_pages]
+self.free_pages = self.free_pages[num_pages:]
+
+out_indices = (
+    out_pages[:, None] * self.page_size
+    + torch.arange(self.page_size, device=self.device)
+).reshape(-1)
+
+return out_indices
+</pre>
+  </div>
+
+  <p>
+    A page's tokens are always contiguous slots (<code>page × page_size + arange(page_size)</code>),
+    so token slot <i>i</i> belongs to page <i>i // page_size</i>. During batched frees the
+    scheduler brackets work in <code>free_group_begin() / free_group_end()</code> so hundreds of
+    per-request frees coalesce into a single <code>torch.cat</code>; PD-disaggregation setups
+    additionally set <code>need_sort</code>, routing frees into <code>release_pages</code> and
+    lazily re-sorting so allocation order stays ascending.
+  </p>
+
+  <h2><span class="sec-num">3.4</span>RadixCache: the tree that shares KV</h2>
+  <p>
+    <code>RadixCache</code> (<code>python/sglang/srt/mem_cache/radix_cache.py:279</code>) maps
+    token-ID prefixes to KV slot indices. It is a true radix (Patricia) tree, not a trie:
+    each edge carries a variable-length token segment, and children are found by a dict probe
+    on the first page of the child's key. Three building blocks:
+  </p>
+  <ul>
+    <li><strong><code>RadixKey</code></strong> — a token-ID array plus an optional
+      <code>extra_key</code> namespace string. <code>Req</code> builds <code>extra_key</code> by
+      concatenating <code>cache_salt</code> and <code>lora_id</code>
+      (<code>managers/schedule_batch.py:888-894</code>), and
+      <code>RadixKey.child_key()</code> prefixes it into the dict key
+      (<code>radix_cache.py:197-207</code>) — so different LoRA adapters or salted requests can
+      never share nodes, without any dedicated per-adapter cache. Prefix comparison
+      (<code>RadixKey.match</code>, line 161) gallops in doubling windows of C-level slice
+      compares, then binary-searches the diverging window — no per-token Python loop.</li>
+    <li><strong><code>TreeNode</code></strong> (<code>radix_cache.py:216</code>) — fields:
+      <code>children</code> / <code>parent</code> / <code>key</code>;
+      <code>value</code>, an int64 tensor of KV slot indices the same length as the key;
+      <code>lock_ref</code>, a refcount of running requests pinning this node
+      (&gt;0 ⇒ never evicted; the root is created with <code>lock_ref = 1</code>);
+      <code>last_access_time</code> / <code>creation_time</code> / <code>hit_count</code> /
+      <code>priority</code>, which feed the eviction strategies; and the HiCache trio
+      <code>host_value</code> (host-pool indices), <code>host_ref_counter</code>
+      (<code>protect_host()</code> / <code>release_host()</code>) and <code>hash_value</code>
+      (per-page chained SHA256 used as storage keys). Properties:
+      <code>evicted</code> ⇔ <code>value is None</code> (KV only on host),
+      <code>backuped</code> ⇔ <code>host_value is not None</code>.</li>
+    <li><strong>Typed params</strong> — every call goes through structs from
+      <code>base_prefix_cache.py</code>: <code>MatchPrefixParams → MatchResult</code>,
+      <code>InsertParams → InsertResult</code>, <code>EvictParams → EvictResult</code>.</li>
+  </ul>
+
+  <div class="diagram">
+    <div class="dg-title">A RADIX TREE AFTER TWO CHAT REQUESTS (page_size = 1)</div>
+    <pre class="mermaid">
+flowchart TD
+  root(("root<br/>lock_ref = 1<br/>(never evicted)"))
+  s["'You are a helpful assistant .'<br/>key: 6 tokens · value: slots 10–15<br/>lock_ref = 1 → protected"]
+  qa["'What is the capital of France ? Paris'<br/>8 tokens · slots 16–23<br/>lock_ref = 0 · leaf → evictable"]
+  qb["'Write a haiku about GPUs …'<br/>6 tokens · slots 30–35<br/>lock_ref = 1 → protected"]
+  root -->|"child_key = first token"| s
+  s --> qa
+  s --> qb
+  style s fill:#f5ecfe,stroke:#9333ea
+  style qa fill:#fdf3e3,stroke:#d97706
+  style qb fill:#e7f7ec,stroke:#16a34a
+    </pre>
+    <div class="dg-caption">
+      Node values are <b>copies</b> of <code>req_to_token</code> row slices
+      (<code>kv_indices[:key_len].to(dtype=torch.int64, copy=True)</code>,
+      <code>radix_cache.py:461</code>) — the tree references KV slots without owning any row in
+      the req pool. <code>lock_ref</code> counts running requests whose prefix passes through the
+      node; here request B is still decoding, so the shared system-prompt node stays protected.
+    </div>
+  </div>
+
+  <h3>match_prefix — the walk that splits nodes</h3>
+  <p>
+    <code>match_prefix</code> page-aligns the key, then walks the tree. If the match ends
+    <em>inside</em> a stored segment, the node is split once at the exact boundary — the tree
+    structurally refines itself as new share-points are discovered:
+  </p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/mem_cache/radix_cache.py:648" data-desc="_match_prefix_helper: dict probe per level, one split when the match ends mid-segment">
+<pre>
+def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
+    access_time = time.monotonic()
+    node.last_access_time = access_time
+
+    child_key = key.child_key(self.page_size)
+
+    value = []
+    while len(key) &gt; 0 and child_key in node.children.keys():
+        child = node.children[child_key]
+        child.last_access_time = access_time
+        prefix_len = child.key.match(key, page_size=self.page_size)
+        if prefix_len &lt; len(child.key):
+            new_node = self._split_node(child.key, child, prefix_len)
+            value.append(new_node.value)
+            node = new_node
+            break
+        else:
+            value.append(child.value)
+            node = child
+            key = key[prefix_len:]
+
+            if len(key):
+                child_key = key.child_key(self.page_size)
+
+    return value, node
+</pre>
+  </div>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/mem_cache/radix_cache.py:674" data-desc="_split_node: a new parent takes the shared prefix and inherits the lock">
+<pre>
+def _split_node(self, key: RadixKey, child: TreeNode, split_len: int):
+    # new_node -&gt; child
+    # New node inherits child's priority (represents shared prefix)
+    new_node = TreeNode(priority=child.priority)
+    new_node.hit_count = child.hit_count
+    new_node.children = {key[split_len:].child_key(self.page_size): child}
+    new_node.parent = child.parent
+    new_node.lock_ref = child.lock_ref
+    new_node.key = child.key[:split_len]
+    new_node.value = child.value[:split_len].clone()
+    child.parent = new_node
+    child.key = child.key[split_len:]
+    child.value = child.value[split_len:].clone()
+    new_node.parent.children[key.child_key(self.page_size)] = new_node
+
+    # Split hash_value if it was already computed, otherwise leave as None
+    new_node.hash_value, child.hash_value = split_node_hash_value(
+        child.hash_value, split_len, self.page_size
+    )
+
+    return new_node
+</pre>
+  </div>
+
+  <h3>insert, lock refs, and the two cache_* entry points</h3>
+  <p>
+    <code>insert()</code> (<code>radix_cache.py:412</code>) walks the same way and returns
+    <code>prefix_len</code> — <b>how many leading tokens were already in the tree</b>. The caller
+    uses that to free its now-duplicate KV slots, because the tree's copy is canonical:
+  </p>
+  <ul>
+    <li><strong><code>cache_finished_req(req)</code></strong> (<code>radix_cache.py:434</code>,
+      called from <code>release_kv_cache</code> in <code>mem_cache/common.py</code>): builds the
+      key from <code>origin_input_ids + output_ids</code>, inserts, then in one
+      <code>free_segments</code> call releases (a) the duplicate range
+      <code>[cache_protected_len, prefix_len)</code> and (b) the page-unaligned tail. Finally
+      <code>dec_lock_ref(req.last_node)</code> drops the request's pin.</li>
+    <li><strong><code>cache_unfinished_req(req, chunked=True)</code></strong>
+      (<code>radix_cache.py:488</code>, at every chunked-prefill boundary): inserts the prefix
+      so far, frees duplicates, <em>re-runs</em> <code>match_prefix</code> and rewrites the
+      request's own <code>req_to_token</code> row with the canonical tree indices, then migrates
+      the lock: <code>dec_lock_ref(old last_node); inc_lock_ref(new last_node)</code>.
+      <code>req.cache_protected_len</code> records how much of the row is now tree-owned so the
+      request never double-frees it.</li>
+  </ul>
+  <p>
+    <code>inc_lock_ref</code> / <code>dec_lock_ref</code> (<code>radix_cache.py:592 / 607</code>)
+    walk node→root; the 0→1 and 1→0 transitions move each node's token count between the
+    <code>evictable_size_</code> and <code>protected_size_</code> accumulators the scheduler
+    consults for admission (chapter 02).
+  </p>
+
+  <h3>Eviction</h3>
+  <p>
+    The cache never scans the tree to evict. It incrementally maintains
+    <code>evictable_leaves</code> — nodes with no un-evicted children and
+    <code>lock_ref == 0</code> (<code>_update_leaf_status</code>, <code>radix_cache.py:787</code>) —
+    and heapifies that set on demand:
+  </p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/mem_cache/radix_cache.py:568" data-desc="evict(): heap over evictable leaves, cascading to parents that become leaves">
+<pre>
+leaves = list(self.evictable_leaves)
+eviction_heap = [
+    (self.eviction_strategy.get_priority(node), node) for node in leaves
+]
+heapq.heapify(eviction_heap)
+
+num_evicted = 0
+while num_evicted &lt; num_tokens and len(eviction_heap):
+    _priority, x = heapq.heappop(eviction_heap)
+
+    # Tree values are page-aligned copies of a kv row: page-exact segment.
+    self.token_to_kv_pool_allocator.free_segment(x.value, start_pos=0)
+    num_evicted += len(x.value)
+    self._delete_leaf(x)
+
+    if len(x.parent.children) == 0 and x.parent.lock_ref == 0:
+        new_priority = self.eviction_strategy.get_priority(x.parent)
+        heapq.heappush(eviction_heap, (new_priority, x.parent))
+</pre>
+  </div>
+
+  <p>
+    The heap priority comes from a pluggable <code>EvictionStrategy</code>
+    (<code>mem_cache/evict_policy.py</code>): <code>LRUStrategy</code> is simply
+    <code>node.last_access_time</code>; <code>LFUStrategy</code> is
+    <code>(hit_count, last_access_time)</code>; <code>SLRUStrategy</code> segments nodes by
+    whether <code>hit_count</code> crossed a protection threshold; <code>PriorityStrategy</code>
+    evicts low-priority requests' nodes first. The CLI exposes
+    <code>--radix-eviction-policy {lru,lfu,slru,priority}</code>; FIFO/MRU/FILO strategies also
+    exist in the file for internal use.
+  </p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/mem_cache/radix_cache.py:463" data-desc="cache_finished_req core: insert, then free duplicates + unaligned tail, then unlock">
+<pre>
+# Radix Cache takes one ref in memory pool
+if is_insert:
+    priority = getattr(req, "priority", 0) or 0
+    result = self.insert(
+        InsertParams(key=radix_key, value=values, priority=priority)
+    )
+    freed_end = result.prefix_len
+else:
+    freed_end = key_len
+
+# duplicates / uninserted range, then the unaligned tail
+self.token_to_kv_pool_allocator.free_segments(
+    [
+        (
+            kv_indices[req.cache_protected_len : freed_end],
+            req.cache_protected_len,
+        ),
+        (kv_indices[key_len:], key_len),
+    ]
+)
+
+# Remove req slot release the cache lock
+if req.last_node is not None:
+    self.dec_lock_ref(req.last_node)
+</pre>
+  </div>
+
+  <h3>The crown piece: two chats sharing a system prompt</h3>
+  <p>
+    Everything above, animated. Requests A and B share the 6-token system prompt
+    <code>"You are a helpful assistant ."</code>; A asks about France, B wants a haiku.
+    <code>page_size = 1</code>. The two upper segments start life as <em>one</em> node —
+    watch the split happen when B arrives.
+  </p>
+
+  <div class="stepper" id="st-radix">
+    <div class="st-scene">
+      <div class="sc-row">
+        <div class="sc-box" id="rx-root">root<small>lock_ref = 1 (permanent)</small></div>
+        <div class="sc-box ghost" id="rx-stats" style="margin-left:auto">tree accounting<small>evictable: <span id="rx-ev">0</span> · protected: <span id="rx-pr">0</span> tok</small></div>
+      </div>
+      <div class="sc-row" style="margin-left:34px; margin-top:10px">
+        <div class="sc-box appear" id="rx-s">
+          <span class="tok rxs">You</span><span class="tok rxs">are</span><span class="tok rxs">a</span>
+          <span class="tok rxs">helpful</span><span class="tok rxs">assistant</span><span class="tok rxs">.</span>
+          <small>slots 10–15 · lock_ref <span id="rx-s-lock">0</span> · <span id="rx-s-note">part of A's node</span></small>
+        </div>
+        <div class="sc-box appear" id="rx-badge" style="border-style:dashed">⟵ ONE node ⟶<small id="rx-badge-sub">insert() made a single leaf</small></div>
+        <div class="sc-box appear" id="rx-qa">
+          <span class="tok rxa">What</span><span class="tok rxa">is</span><span class="tok rxa">the</span>
+          <span class="tok rxa">capital</span><span class="tok rxa">of</span><span class="tok rxa">France</span>
+          <span class="tok rxa">?</span><span class="tok rxa">␣Paris</span>
+          <small>slots 16–23 · lock_ref 0</small>
+        </div>
+      </div>
+      <div class="sc-row" style="margin-left:68px; margin-top:10px">
+        <div class="sc-box appear" id="rx-qb">
+          <span class="tok rxb">Write</span><span class="tok rxb">a</span><span class="tok rxb">haiku</span>
+          <span class="tok rxb">about</span><span class="tok rxb">GPUs</span><span class="tok rxb">␣Silicon…</span>
+          <small>slots 30–35 · new child of the split node</small>
+        </div>
+        <div class="sc-box appear" id="rx-b" style="border-style:dashed">Request B<small>prefix_indices = slots 10–15<br/>prefill computes only 5 of 11 tokens</small></div>
+      </div>
+    </div>
+  </div>
+
+  <h2><span class="sec-num">3.5</span>The cache class family</h2>
+  <p>
+    <code>RadixCache</code> is one of a dozen implementations of
+    <code>BasePrefixCache</code>. Selection is centralized in
+    <code>mem_cache/registry.py</code> — a pluggable registry
+    (<code>register_radix_cache_backend</code> + <code>--radix-cache-backend</code>) with this
+    built-in decision chain when no backend is named:
+  </p>
+
+  <div class="diagram">
+    <div class="dg-title">TREE-CACHE SELECTION CHAIN — registry.py:default_radix_cache_factory</div>
+    <pre class="mermaid">
+flowchart TD
+  a{"--disable-radix-cache?"} -->|yes| cc["ChunkCache /<br/>SWAChunkCache / PureSWAChunkCache"]
+  a -->|no| b{"env SGLANG_EXPERIMENTAL_<br/>CPP_RADIX_TREE?"}
+  b -->|yes| cpp["RadixCacheCpp"]
+  b -->|no| c{"unified env · MLX ·<br/>hybrid SWA · hybrid SSM?"}
+  c -->|yes| uni["UnifiedRadixCache<br/>components: FULL + SWA / MAMBA"]
+  c -->|no| d{"--enable-hierarchical-cache?"}
+  d -->|"yes (plain attn)"| hi["HiRadixCache"]
+  d -->|"yes (hybrid / DSA)"| uni
+  d -->|no| e{"--enable-lmcache /<br/>--enable-flexkv?"}
+  e -->|yes| lmc["LMCRadixCache /<br/>FlexKV factory"]
+  e -->|no| rc["RadixCache"]
+  style rc fill:#eef0ff,stroke:#4f46e5
+  style uni fill:#f5ecfe,stroke:#9333ea
+  style hi fill:#fdf3e3,stroke:#d97706
+    </pre>
+    <div class="dg-caption">
+      Verified against <code>default_radix_cache_factory</code>
+      (<code>python/sglang/srt/mem_cache/registry.py:79-160</code>). ChunkCache is the
+      "no prefix reuse" implementation — chunked prefill still needs per-request KV
+      bookkeeping even with the radix tree off. Pure-SWA models get
+      <code>PureSWARadixCache</code> inside the hybrid-SWA branch.
+    </div>
+  </div>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/mem_cache/registry.py:79" data-desc="the selection chain (imports and constructor details trimmed)">
+<pre>
+def default_radix_cache_factory(ctx: TreeCacheBuildContext) -&gt; BasePrefixCache:
+    """Built-in Radix Cache selection chain."""
+    if ctx.effective_chunked_prefill_size is not None and ctx.disable_radix_cache:
+        ...
+        return ChunkCache(params)  # or SWAChunkCache / PureSWAChunkCache
+
+    if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
+        return RadixCacheCpp(params=params, server_args=server_args)
+
+    if envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get() or use_mlx():
+        return _create_unified_radix_cache(ctx, server_args, params)
+
+    if ctx.is_hybrid_swa:
+        ...  # PureSWARadixCache when full_tokens_per_layer == 0
+        return _create_unified_radix_cache(ctx, server_args, params)
+
+    if ctx.is_hybrid_ssm:
+        return _create_unified_radix_cache(ctx, server_args, params)
+
+    if ctx.enable_hierarchical_cache:
+        ...
+        cache = HiRadixCache(params=params, server_args=server_args)
+        ctx.tp_worker.register_hicache_layer_transfer_counter(
+            cache.cache_controller.layer_done_counter
+        )
+        return cache
+
+    if server_args.enable_lmcache:
+        return LMCRadixCache(...)
+    if server_args.enable_flexkv:
+        return _flexkv_factory(ctx)
+
+    return RadixCache(params)
+</pre>
+  </div>
+
+  <table class="tbl">
+    <tr><th>Implementation</th><th>File (under <code>mem_cache/</code>)</th><th>Purpose</th></tr>
+    <tr><td><code>ChunkCache</code> family</td><td><code>chunk_cache.py</code></td>
+      <td>No prefix reuse (<code>--disable-radix-cache</code>); per-request bookkeeping only.</td></tr>
+    <tr><td><code>RadixCache</code></td><td><code>radix_cache.py</code></td>
+      <td>The canonical device-only radix tree (this section).</td></tr>
+    <tr><td><code>HiRadixCache</code></td><td><code>hiradix_cache.py</code></td>
+      <td>RadixCache + host (L2) and storage (L3) tiers — section 3.7.</td></tr>
+    <tr><td><code>UnifiedRadixCache</code></td><td><code>unified_radix_cache.py</code></td>
+      <td>Component-based tree (<code>ComponentType.FULL / SWA / MAMBA</code>); default for
+      hybrid SWA/SSM models and DSA HiCache.</td></tr>
+    <tr><td><code>SWARadixCache</code> / <code>PureSWARadixCache</code></td>
+      <td><code>swa_radix_cache.py</code>, <code>pure_swa_radix_cache.py</code></td>
+      <td>Sliding-window hybrids: dual pools, tombstone nodes for out-of-window KV.</td></tr>
+    <tr><td><code>MambaRadixCache</code> / <code>HiMambaRadixCache</code></td>
+      <td><code>mamba_radix_cache.py</code>, <code>hi_mamba_radix_cache.py</code></td>
+      <td>Hybrid linear-attention: radix tree for full-attn KV + Mamba state slots.</td></tr>
+    <tr><td><code>RadixCacheCpp</code></td><td><code>radix_cache_cpp.py</code></td>
+      <td>Experimental C++ tree (<code>SGLANG_EXPERIMENTAL_CPP_RADIX_TREE</code>).</td></tr>
+    <tr><td><code>LMCRadixCache</code>, FlexKV factory</td><td><code>storage/lmcache/</code>, <code>storage/flexkv/</code></td>
+      <td>Whole-tree replacements integrating external KV-cache systems.</td></tr>
+  </table>
+
+  <div class="callout warn"><span class="co-title">There is no "LoRA radix cache"</span>
+    Looking for a per-adapter cache class is a dead end — LoRA isolation is done entirely by
+    key namespacing: <code>Req.extra_key</code> concatenates <code>cache_salt</code> and
+    <code>lora_id</code>, and <code>RadixKey.child_key()</code> folds it into every dict probe.
+    Same-token prefixes under different adapters simply live in disjoint subtrees.
+  </div>
+
+  <h2><span class="sec-num">3.6</span>When memory runs out: evict, then retract</h2>
+  <p>
+    Before any allocation, callers run <code>evict_from_tree_cache(tree_cache, num_tokens)</code>
+    (<code>mem_cache/common.py:105</code>): it compares the allocator's
+    <code>available_size()</code> against the need and asks the tree to evict only the
+    shortfall. If decode <em>still</em> cannot fit — every evictable leaf is gone and what
+    remains is locked by running requests — the scheduler escalates to
+    <code>ScheduleBatch.retract_decode</code> (<code>managers/schedule_batch.py:2734</code>):
+    whole requests are popped from the running batch and re-queued, releasing their KV
+    <em>without</em> inserting it into the tree ("we need the space instantly"), and the last
+    survivor is aborted rather than crashing. Chapter 02 covers the retraction policy;
+    the memory-side takeaway is the ownership invariant: <b>every token slot is owned by
+    exactly one of</b> a running request's uncached suffix, the radix tree (evictable or
+    protected), or the allocator free list.
+  </p>
+
+  <h2><span class="sec-num">3.7</span>HiCache in one screen: device → host → storage</h2>
+  <p>
+    <code>--enable-hierarchical-cache</code> upgrades the tree so evicting from GPU no longer
+    means recomputing: a <code>TreeNode</code> can hold device slots (<code>value</code>), a host
+    copy (<code>host_value</code>), or exist only as a chain of page hashes
+    (<code>hash_value</code>) in external storage. The data mover is
+    <code>HiCacheController</code> (<code>managers/cache_controller.py:225</code>) — dedicated
+    CUDA streams for device⇄host copies and daemon threads for storage traffic, all polled by
+    the scheduler via <code>tree_cache.check_hicache_events()</code>.
+  </p>
+
+  <div class="diagram">
+    <div class="dg-title">THREE TIERS, FOUR DATA PATHS — HiCacheController</div>
+    <pre class="mermaid">
+flowchart LR
+  subgraph l1t ["L1 · GPU device pool"]
+    dev["TreeNode.value<br/>device KV slots"]
+  end
+  subgraph ctl ["HiCacheController<br/><i>cache_controller.py</i>"]
+    ws["write_stream<br/>CacheOperation queue"]
+    ls["load_stream<br/>per-layer + LayerDoneCounter"]
+    pft["prefetch_thread<br/>hash-chain query → hit / revoke"]
+    bkt["backup_thread<br/>StorageOperation batches"]
+  end
+  subgraph l2t ["L2 · pinned host RAM"]
+    host["HostKVCache<br/>TreeNode.host_value<br/>size = device × --hicache-ratio"]
+  end
+  subgraph l3t ["L3 · storage backends"]
+    st["file · nixl · mooncake · hf3fs · aibrix<br/>eic · simm · mori · shm · dynamic"]
+  end
+  dev -->|"write-through backup"| ws --> host
+  host -->|"load-back"| ls --> dev
+  host -->|"backup"| bkt --> st
+  st -->|"prefetch"| pft --> host
+  style l1t fill:#e7f7ec,stroke:#16a34a
+  style l2t fill:#eef0ff,stroke:#4f46e5
+  style l3t fill:#f5ecfe,stroke:#9333ea
+    </pre>
+    <div class="dg-caption">
+      The ten L3 backends are registered in
+      <code>mem_cache/storage/backend_factory.py:197-247</code>. Storage keys are per-page
+      SHA256 hashes where each page's hash chains the previous one
+      (<code>get_hash_str</code>, <code>mem_cache/utils.py</code>) — so a key identifies not just
+      a page's tokens but its entire prefix.
+    </div>
+  </div>
+
+  <p>Design highlights worth knowing even if you never enable it:</p>
+  <ul>
+    <li><strong>Write policies</strong> (<code>--hicache-write-policy</code>): plain
+      <code>write_through</code> backs a node up on first hit; <code>write_through_selective</code>
+      waits until <code>hit_count ≥ 2</code>; <code>write_back</code> stages the copy only at
+      eviction time. Backups must keep a contiguous backed-up prefix from the root.</li>
+    <li><strong>Layer-overlapped load-back</strong>: host→device copies run layer by layer,
+      ticking a <code>LayerDoneCounter</code>; the forward pass blocks per layer in
+      <code>KVCache.get_key_buffer → layer_transfer_counter.wait_until(layer_id)</code>
+      (<code>memory_pool.py:2233-2239</code>), so prefill starts before the whole prefix has
+      landed.</li>
+    <li><strong>Prefetch discipline</strong>: storage prefetch only fires for uncovered
+      suffixes ≥ 256 tokens, is budgeted at half the host pool, and is revoked if the hash
+      lookup hits too little (TP-MIN all-reduced across ranks).</li>
+  </ul>
+  <div class="callout note"><span class="co-title">Full treatment in chapter 08</span>
+    HiCache's controller internals, storage-backend wire formats, and how PD disaggregation
+    reuses the same machinery get their own chapter — see chapter 08.
+  </div>
+
+  <h2><span class="sec-num">3.8</span>Flags that shape memory</h2>
+  <table class="tbl">
+    <tr><th>Flag</th><th>Default</th><th>Effect</th></tr>
+    <tr><td><code>--page-size</code></td><td>auto (<code>_handle_page_size</code>)</td>
+      <td>Tokens per page; picks <code>TokenToKVPoolAllocator</code> (1) vs.
+      <code>PagedTokenToKVPoolAllocator</code> (&gt;1). Radix keys are truncated to page
+      multiples.</td></tr>
+    <tr><td><code>--mem-fraction-static</code></td><td>derived</td>
+      <td>Fraction of GPU memory for weights + KV pool; when unset it is computed from
+      chunked-prefill size and CUDA-graph decode batch size
+      (<code>server_args.py:4607-4624</code>). First knob to lower on OOM at startup.</td></tr>
+    <tr><td><code>--max-total-tokens</code></td><td>auto</td>
+      <td>Explicit cap on KV pool token count, overriding the derived size.</td></tr>
+    <tr><td><code>--kv-cache-dtype</code></td><td><code>auto</code></td>
+      <td>KV storage dtype — fp8 variants halve KV memory (stored as uint8), fp4/mxfp8 need
+      scale buffers and specific hardware.</td></tr>
+    <tr><td><code>--disable-radix-cache</code></td><td>off</td>
+      <td>"Disable RadixAttention for prefix caching" → ChunkCache; no prefix reuse.</td></tr>
+    <tr><td><code>--radix-eviction-policy</code></td><td><code>lru</code></td>
+      <td><code>lru | lfu | slru | priority</code> — the heap key in
+      <code>evict()</code>.</td></tr>
+    <tr><td><code>--radix-cache-backend</code></td><td>unset</td>
+      <td>Select a factory registered via <code>register_radix_cache_backend</code>, bypassing
+      the built-in chain.</td></tr>
+    <tr><td><code>--swa-full-tokens-ratio</code></td><td>0.8</td>
+      <td>SWA-layer vs. full-layer token budget split for hybrid SWA pools.</td></tr>
+    <tr><td><code>--enable-hierarchical-cache</code></td><td>off</td>
+      <td>Turn on HiCache tiers (section 3.7).</td></tr>
+    <tr><td><code>--hicache-ratio</code> / <code>--hicache-size</code></td><td>2.0 / unset</td>
+      <td>Host pool = device pool × ratio, or an absolute GB size (overrides ratio).</td></tr>
+    <tr><td><code>--hicache-write-policy</code></td><td><code>write_through</code></td>
+      <td><code>write_back | write_through | write_through_selective</code>.</td></tr>
+    <tr><td><code>--hicache-mem-layout</code> / <code>--hicache-io-backend</code></td>
+      <td><code>page_first</code> / <code>kernel</code></td>
+      <td>Host tensor layout and CPU⇄GPU transfer path
+      (<code>_handle_hicache</code> normalizes combos).</td></tr>
+    <tr><td><code>--hicache-storage-backend</code></td><td>unset</td>
+      <td>L3 backend: <code>file | mooncake | hf3fs | nixl | aibrix | eic | simm | mori | shm |
+      dynamic</code> (+ <code>--hicache-storage-prefetch-policy</code>, default
+      <code>timeout</code>).</td></tr>
+  </table>
+
+  <h2><span class="sec-num">3.9</span>Notable facts &amp; gotchas</h2>
+  <div class="card">
+    <ul>
+      <li><b>Slot 0 is a garbage can, on purpose.</b> Every pool allocates
+        <code>size + page_size</code> rows and never hands out page 0; CUDA-graph padded batches
+        default <code>req_pool_indices</code> and out-cache locations to 0, so their dummy writes
+        land harmlessly. <code>ReqToTokenPool</code> has the same trick with row 0.</li>
+      <li><b>Eviction never scans the tree.</b> <code>evictable_leaves</code> is maintained
+        incrementally on every lock/insert/delete (<code>_update_leaf_status</code>); LRU is just
+        <code>last_access_time</code> as the heap key, and swapping policies swaps only the key
+        function.</li>
+      <li><b>Page alignment is pervasive.</b> Keys are truncated to page multiples before
+        match/insert, <code>RadixKey.match</code> rounds down to a page, storage hashes are
+        per-page and chained, and <code>free_segment(..., start_pos=…)</code> exploits page
+        contiguity to free with stride arithmetic instead of <code>torch.unique</code> —
+        avoiding a device sync.</li>
+      <li><b>The tree stores copies, not views.</b> Node values are cloned int64 slices of
+        <code>req_to_token</code> rows; <code>cache_unfinished_req</code> then rewrites the
+        <em>request's</em> row to the canonical indices so duplicate slots can be freed
+        mid-flight.</li>
+      <li><b><code>insert()</code> returning <code>prefix_len</code> is a free-list protocol.</b>
+        The return value tells the caller exactly which of its slots became duplicates of
+        existing tree content — freeing them is the caller's job
+        (<code>cache_finished_req</code> / <code>cache_unfinished_req</code>).</li>
+      <li><b>EAGLE flips keys to bigrams in O(1).</b>
+        <code>RadixKey.maybe_to_bigram_view</code> just sets a flag; draft-model caches key on
+        token pairs without materializing tuple lists (chapter 09).</li>
+      <li><b>Prefix compare is gallop + binary search.</b> <code>RadixKey.match</code> does
+        C-level array slice compares in doubling windows — matching a 10K-token shared prefix
+        costs ~log² slice comparisons, not 10K Python iterations.</li>
+      <li><b>fp8 KV is uint8 at rest</b> because <code>index_put</code> lacks float8 support;
+        buffers are re-<code>view()</code>-ed on read.</li>
+      <li><b>Deterministic mode skips finished-request inserts</b>
+        (<code>disable_finished_insert</code> in <code>RadixCache</code>) — cache hits change
+        batch composition, which can change results under non-deterministic kernels.</li>
+    </ul>
+  </div>
+
+  <div id="pager"></div>
+  </div>
+</main>
+</div>
+
+<script>
+document.addEventListener("DOMContentLoaded", () => {
+
+  new Stepper("#st-alloc", {
+    title: "Allocating KV: a 5-token prompt + 3 decode steps (page_size = 1)",
+    intro: "Both levels of the indirection, filled in live.",
+    autoMs: 3400,
+    reset(sc) {
+      clearState(sc, ".sc-box,.tok");
+      setCls(sc, ".slot", "free");
+      rmCls(sc, "#al-s0", "free"); setCls(sc, "#al-s0", "dim");
+      ["#al-rt0","#al-rt1","#al-rt2","#al-rt3","#al-rt4","#al-rt5","#al-rt6","#al-rt7"]
+        .forEach(id => setText(sc, id, "·"));
+      setText(sc, "#al-free", "[1 2 3 … 12]");
+    },
+    steps: [
+      { cap: "The tokenized prompt <code>[The, ␣capital, ␣of, ␣France, ␣is]</code> reaches the scheduler. <code>ReqToTokenPool.alloc</code> hands the request a free row: <code>req_pool_idx = 3</code>. Slot 0 (dimmed) is the permanent padding sink — <code>free_pages</code> starts at 1.",
+        run(sc) { setCls(sc, "#al-req", "hl", "pulse"); } },
+      { cap: "Prefill needs 5 KV slots. <code>TokenToKVPoolAllocator.alloc(5)</code> slices the first 5 entries off <code>free_pages</code> → slots <b>1–5</b> (with <code>page_size&gt;1</code> this would be the Triton <code>alloc_extend_kernel</code> instead).",
+        run(sc) { rmCls(sc, "#al-req", "pulse"); setCls(sc, "#al-alloc", "hl");
+                  rmCls(sc, "#al-s1,#al-s2,#al-s3,#al-s4,#al-s5", "free");
+                  setCls(sc, "#al-s1,#al-s2,#al-s3,#al-s4,#al-s5", "ok");
+                  setText(sc, "#al-free", "[6 7 8 … 12]"); } },
+      { cap: "The mapping is recorded: <code>req_to_token[3, 0:5] = [1,2,3,4,5]</code>. Position → slot, one int32 each. The row and the slots are now linked.",
+        run(sc) { rmCls(sc, "#al-alloc", "hl");
+                  setText(sc, "#al-rt0", "1"); setText(sc, "#al-rt1", "2");
+                  setText(sc, "#al-rt2", "3"); setText(sc, "#al-rt3", "4"); setText(sc, "#al-rt4", "5");
+                  setCls(sc, "#al-rt0,#al-rt1,#al-rt2,#al-rt3,#al-rt4", "hl"); } },
+      { cap: "The prefill forward pass runs. Every attention layer calls <code>set_kv_buffer</code> with these 5 slot indices — writing rows 1–5 of <code>k_buffer[layer]</code> and <code>v_buffer[layer]</code> for all layers.",
+        run(sc) { setCls(sc, "#al-kv", "hl", "pulse"); } },
+      { cap: "Decode step 1 samples <code>␣Paris</code>. One new slot: <code>alloc(1)</code> → slot <b>6</b>, written to <code>req_to_token[3, 5]</code>.",
+        run(sc) { rmCls(sc, "#al-kv", "pulse"); rmCls(sc, "#al-s6", "free"); setCls(sc, "#al-s6", "ok");
+                  setText(sc, "#al-rt5", "6"); setCls(sc, "#al-rt5", "hl");
+                  setText(sc, "#al-free", "[7 8 9 … 12]"); } },
+      { cap: "Decode steps 2 and 3 (<code>,</code> and <code>␣the</code>): slots <b>7</b> and <b>8</b> fill positions 6 and 7. Each step, the attention kernel gathers KV via <code>req_to_token[3, :seq_len]</code> — the double indirection is on the hot path of every forward.",
+        run(sc) { rmCls(sc, "#al-s7,#al-s8", "free"); setCls(sc, "#al-s7,#al-s8", "ok");
+                  setText(sc, "#al-rt6", "7"); setText(sc, "#al-rt7", "8");
+                  setCls(sc, "#al-rt6,#al-rt7", "hl"); setText(sc, "#al-free", "[9 10 11 12]"); } },
+      { cap: "The request finishes. Its KV is not freed — <code>cache_finished_req</code> hands slots 1–8 to the radix tree (purple = tree-owned, reusable by the next request that shares this prefix). Section 3.4 takes it from here.",
+        run(sc) { rmCls(sc, "#al-s1,#al-s2,#al-s3,#al-s4,#al-s5,#al-s6,#al-s7,#al-s8", "ok");
+                  setCls(sc, "#al-s1,#al-s2,#al-s3,#al-s4,#al-s5,#al-s6,#al-s7,#al-s8", "cache");
+                  rmCls(sc, "#al-rt0,#al-rt1,#al-rt2,#al-rt3,#al-rt4,#al-rt5,#al-rt6,#al-rt7", "hl");
+                  setCls(sc, "#al-req", "ok"); } },
+    ],
+  });
+
+  new Stepper("#st-radix", {
+    title: "RadixAttention live: two chats share a system prompt",
+    intro: "Insert, node split, lock refs, KV reuse, and LRU eviction — with real slot numbers.",
+    autoMs: 4200,
+    reset(sc) {
+      clearState(sc, ".sc-box,.tok");
+      rmCls(sc, ".appear", "in");
+      setText(sc, "#rx-s-lock", "0");
+      setText(sc, "#rx-s-note", "part of A's node");
+      setText(sc, "#rx-ev", "0");
+      setText(sc, "#rx-pr", "0");
+      setText(sc, "#rx-badge-sub", "insert() made a single leaf");
+      const badge = sc.querySelector("#rx-badge");
+      if (badge) badge.firstChild.textContent = "⟵ ONE node ⟶";
+    },
+    steps: [
+      { cap: "<b>Request A arrives</b> (system prompt + <code>What is the capital of France?</code>). <code>Req.init_next_round_input</code> calls <code>tree_cache.match_prefix(RadixKey(tokens, extra_key))</code>. The tree is empty: the dict probe on <code>root.children</code> misses → <code>device_indices = []</code>, <code>last_node = root</code>. A must compute everything.",
+        run(sc) { setCls(sc, "#rx-root", "hl", "pulse"); } },
+      { cap: "A prefills its 13 tokens into freshly allocated slots <b>10–22</b> and decodes <code>␣Paris</code> into slot <b>23</b>. So far the radix tree knows nothing — the slots are owned by A's running request.",
+        run(sc) { rmCls(sc, "#rx-root", "pulse");
+                  setCls(sc, "#rx-s,#rx-qa,#rx-badge", "in");
+                  setCls(sc, ".rxs,.rxa", "hl"); } },
+      { cap: "<b>A finishes.</b> <code>cache_finished_req</code> builds <code>RadixKey(origin_input_ids + output_ids)</code> and calls <code>insert()</code> → one new leaf under root holding all <b>14 tokens, value = slots 10–23</b>. <code>insert</code> returned <code>prefix_len = 0</code> (nothing was duplicate), and <code>dec_lock_ref</code> leaves the node at <code>lock_ref = 0</code>: all 14 tokens are evictable.",
+        run(sc) { rmCls(sc, ".rxs,.rxa", "hl"); setCls(sc, ".rxs,.rxa", "ok");
+                  setCls(sc, "#rx-badge", "hl"); setText(sc, "#rx-ev", "14"); } },
+      { cap: "<b>Request B arrives</b> (same system prompt + <code>Write a haiku about GPUs</code>). <code>match_prefix</code> probes <code>root.children</code> with B's first token — hit! <code>child.key.match(B.key)</code> gallops and finds only <b>6</b> tokens shared, and <code>6 &lt; 14</code> … the match ends <i>inside</i> the node.",
+        run(sc) { setCls(sc, "#rx-s", "hl"); setCls(sc, "#rx-badge", "warn"); } },
+      { cap: "<b>_split_node!</b> A new parent takes <code>key[:6]</code> (the system prompt, slots 10–15) and inherits the old node's <code>lock_ref</code> and hit_count; the old node keeps <code>key[6:]</code> (slots 16–23) and becomes its child. One node became two — the tree discovered the share-point.",
+        run(sc) { rmCls(sc, "#rx-badge", "warn", "hl"); setCls(sc, "#rx-badge", "bad");
+                  const b = sc.querySelector("#rx-badge"); if (b) b.firstChild.textContent = "SPLIT → two nodes";
+                  setText(sc, "#rx-badge-sub", "_split_node(child.key, child, 6)");
+                  setText(sc, "#rx-s-note", "own node now");
+                  setCls(sc, "#rx-s", "hl"); } },
+      { cap: "B's <code>MatchResult</code>: <code>device_indices = slots 10–15</code>, <code>last_node = </code> the new prompt node. Those 6 tokens (purple) are <b>never recomputed</b> — B's <code>req_to_token</code> row positions 0–5 are filled with A's slots, and B's prefill computes only its 5 question tokens.",
+        run(sc) { rmCls(sc, ".rxs", "ok", "hl"); setCls(sc, ".rxs", "cache");
+                  setCls(sc, "#rx-b", "in", "hl"); } },
+      { cap: "The <code>PrefillAdder</code> admits B and calls <code>inc_lock_ref(req.last_node)</code>, walking node→root: the prompt node's <code>lock_ref</code> goes 0→1 and its 6 tokens move from <code>evictable_size_</code> to <code>protected_size_</code>. While B runs, eviction can take A's suffix but never the shared prompt.",
+        run(sc) { setText(sc, "#rx-s-lock", "1"); setCls(sc, "#rx-s", "hl", "pulse");
+                  setText(sc, "#rx-ev", "8"); setText(sc, "#rx-pr", "6"); } },
+      { cap: "<b>B finishes</b> (haiku delivered, slots 30–35 for its 5 + 1 tokens). <code>cache_finished_req → insert()</code> walks through the prompt node (<code>prefix_len = 6</code>) and creates a second child. Note: the duplicate-free range <code>[cache_protected_len=6, prefix_len=6)</code> is <i>empty</i> — B never had its own copy of the shared slots. <code>dec_lock_ref</code> → lock_ref back to 0.",
+        run(sc) { rmCls(sc, "#rx-s", "pulse"); setText(sc, "#rx-s-lock", "0");
+                  setCls(sc, "#rx-qb", "in"); setCls(sc, ".rxb", "ok");
+                  setText(sc, "#rx-ev", "20"); setText(sc, "#rx-pr", "0"); } },
+      { cap: "<b>Memory pressure.</b> A new batch needs 8 slots but the allocator is short. <code>evict_from_tree_cache</code> → <code>evict(EvictParams(num_tokens=8))</code>: heapify <code>evictable_leaves</code> by <code>last_access_time</code> (LRU). A's suffix is the oldest leaf → popped, <code>free_segment(slots 16–23)</code>, <code>_delete_leaf</code>. The prompt node survives — it is not a leaf, and B's leaf is newer.",
+        run(sc) { setCls(sc, ".rxa", "bad"); setCls(sc, "#rx-qa", "dim", "bad");
+                  setText(sc, "#rx-ev", "12"); } },
+      { cap: "End state: the system prompt (slots 10–15) and B's conversation remain cached. A third request with the same system prompt would hit 6 tokens instantly — the shared prefix outlives every request that built it. That is RadixAttention.",
+        run(sc) { setCls(sc, "#rx-s", "hl", "pulse"); setCls(sc, ".rxs", "cache"); } },
+    ],
+  });
+
+});
+</script>
+</body>
+</html>

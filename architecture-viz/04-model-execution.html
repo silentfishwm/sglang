@@ -1,0 +1,742 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 · ModelRunner, Attention &amp; CUDA Graphs — SGLang Internals</title>
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/mermaid.min.js"></script>
+<script src="assets/viz.js"></script>
+</head>
+<body>
+<div class="layout">
+<main>
+  <div class="page-hero"><div class="content">
+    <span class="phase-badge">Phase II · The Core Engine</span>
+    <h1>04 · Model Execution: ModelRunner, Attention Backends &amp; CUDA Graphs</h1>
+    <p class="lede">
+      The scheduler (chapter 02) decides <em>what</em> to run; this chapter is about <em>how</em> it
+      runs. <code>ModelRunner</code> owns the model weights, the KV-cache pools, the attention
+      backends, and the CUDA graph runners — and turns a <code>ForwardBatch</code> into logits and
+      sampled tokens, thousands of times per second.
+    </p>
+  </div></div>
+
+  <div class="content">
+
+  <h2><span class="sec-num">4.1</span>ModelRunner's place in the stack</h2>
+  <p>
+    Recall from chapter 01: each scheduler subprocess embeds a <code>TpModelWorker</code>, which
+    embeds a <code>ModelRunner</code> (<code>python/sglang/srt/model_executor/model_runner.py</code>,
+    ~1900 lines). The call chain per iteration is
+    <code>Scheduler.run_batch → TpModelWorker.forward_batch_generation → ModelRunner.forward →
+    model.forward(...)</code> — the last hop lands in an ordinary <code>nn.Module</code> like
+    <code>LlamaForCausalLM</code>.
+  </p>
+  <p>
+    Construction is deliberately staged. <code>ModelRunner.__init__</code> gets you a loaded model
+    and a distributed world — but <b>no memory pools and no CUDA graphs</b>. The owner
+    (<code>TpModelWorker</code>, <code>python/sglang/srt/managers/tp_worker.py:365-404</code>) calls
+    three more methods in a fixed order, because each stage needs the previous one: backends need
+    pools to index into, graphs need backends to capture.
+  </p>
+
+  <div class="diagram">
+    <div class="dg-title">MODELRUNNER INIT PIPELINE — WHO CREATES WHAT, IN ORDER</div>
+    <pre class="mermaid">
+flowchart TB
+  tw["TpModelWorker.__init__<br/><i>managers/tp_worker.py</i>"] --> ctor
+  subgraph ctor ["ModelRunner.__init__ (model_runner.py:260)"]
+    a1["parse args / derive flags<br/>use_mla_backend, page_size, spec_algorithm"]
+    a2["init_torch_distributed()<br/>tp_group / pp_group / attention_tp_group"]
+    a3["initialize()<br/>create_sampler() → <b>load_model()</b><br/>→ LoRA manager → configure_kv_cache_dtype()"]
+    a1 --> a2 --> a3
+  end
+  ctor --> b1["alloc_memory_pool()<br/>req_to_token_pool + token_to_kv_pool<br/><i>model_runner.py:749</i>"]
+  b1 --> b2["init_attention_backends()<br/>build_attention_backends(model_runner=self)<br/><i>model_runner.py:861</i>"]
+  b2 --> b3["init_cuda_graphs()<br/>capture_cuda_graphs → eager_runner,<br/>prefill/decode cuda graph runners<br/><i>model_runner.py:923</i>"]
+  style ctor fill:#eef0ff,stroke:#4f46e5
+  style b1 fill:#e7f7ec,stroke:#16a34a
+  style b2 fill:#e7f7ec,stroke:#16a34a
+  style b3 fill:#fdf3e3,stroke:#d97706
+    </pre>
+    <div class="dg-caption">
+      The three post-<code>__init__</code> stages are invoked by <code>TpModelWorker</code>
+      (<code>tp_worker.py:378, 394, 400</code>). Draft workers for speculative decoding (chapter 09)
+      reuse the target's pools, which is why pool allocation is separable from construction.
+      Graph capture is last because it replays real forwards through the chosen attention backend.
+    </div>
+  </div>
+
+  <div class="callout note"><span class="co-title">A "frozen core" file</span>
+    <code>model_runner.py</code> is one of SGLang's three frozen core files
+    (<code>.claude/rules/modify-component-must-read.md</code> →
+    <code>.claude/skills/large-class-style/SKILL.md</code>): its <code>__init__</code> and
+    <code>initialize()</code> are written as <em>pseudocode-style orchestrators</em> — flat sequences
+    of <code>init_*()</code> / <code>maybe_init_*()</code> one-liners — with all heavy logic extracted
+    into <code>model_executor/model_runner_components/</code> (e.g.
+    <code>attention_backend_setup.py</code>, <code>cuda_graph_setup.py</code>,
+    <code>load_model_utils.py</code>). Read <code>initialize()</code> at
+    <code>model_runner.py:575</code> and you can see the whole boot sequence in one screen:
+    <code>init_memory_saver_adapter → … → self.sampler = create_sampler() → self.load_model() →
+    prepare_moe_topk → resolve_layer_indices → maybe_init_lora_manager →
+    configure_kv_cache_dtype()</code>.
+  </div>
+
+  <h2><span class="sec-num">4.2</span>ForwardBatch: the GPU-side view of a batch</h2>
+  <p>
+    The scheduler's <code>ScheduleBatch</code> is high-level, mostly-CPU bookkeeping. Right before
+    the forward pass it is lowered into a <code>ForwardBatch</code>
+    (<code>python/sglang/srt/model_executor/forward_batch_info.py:412</code>) — "low-level tensor
+    data, mostly GPU tensors", built by <code>ForwardBatch.init_new</code>. Every attention backend,
+    CUDA graph runner, and model forward reads from this one dataclass.
+  </p>
+
+  <table class="tbl">
+    <tr><th>Field</th><th>Type / shape</th><th>Meaning (docstrings at <code>forward_batch_info.py:415-430</code>)</th></tr>
+    <tr><td><code>forward_mode</code></td><td><code>ForwardMode</code></td><td>EXTEND / DECODE / … — drives every dispatch decision below.</td></tr>
+    <tr><td><code>batch_size</code></td><td><code>int</code></td><td>Number of requests in the batch.</td></tr>
+    <tr><td><code>input_ids</code></td><td><code>[num_tokens]</code></td><td>Flattened token ids of all requests — only the <em>new</em> (uncached) tokens.</td></tr>
+    <tr><td><code>req_pool_indices</code></td><td><code>[bs]</code></td><td>"The indices of requests in the req_to_token_pool" — each request's row in the token→KV-slot map (chapter 03).</td></tr>
+    <tr><td><code>seq_lens</code></td><td><code>[bs]</code></td><td>Total sequence length per request (cached prefix + new tokens).</td></tr>
+    <tr><td><code>out_cache_loc</code></td><td><code>[num_tokens]</code></td><td>"The indices of output tokens in the token_to_kv_pool" — the KV slots this forward <em>writes</em> new K/V into.</td></tr>
+    <tr><td><code>seq_lens_sum</code></td><td><code>int</code></td><td>Host-side sum of <code>seq_lens</code> (avoids a GPU sync).</td></tr>
+    <tr><td><code>positions</code></td><td><code>[num_tokens]</code></td><td>Absolute position of each token, fed to RoPE. Decode: <code>clamp_position(seq_lens)</code>; extend: computed by a Triton kernel (<code>compute_position_triton</code>).</td></tr>
+    <tr><td><code>extend_prefix_lens</code></td><td><code>[bs]</code>, extend only</td><td>Cached-prefix length per request (0 for a fresh prompt).</td></tr>
+    <tr><td><code>extend_seq_lens</code></td><td><code>[bs]</code>, extend only</td><td>Number of <em>new</em> tokens per request.</td></tr>
+    <tr><td><code>extend_start_loc</code></td><td><code>[bs]</code>, extend only</td><td>Each request's start offset in the flattened token axis (cumsum of <code>extend_seq_lens</code>).</td></tr>
+    <tr><td><code>extend_num_tokens</code></td><td><code>int</code>, extend only</td><td>Total new tokens = <code>sum(extend_seq_lens)</code> = <code>len(input_ids)</code>.</td></tr>
+  </table>
+
+  <p>
+    The complete <code>ForwardMode</code> enum in this repo
+    (<code>forward_batch_info.py:98-122</code>) — more modes than the classic prefill/decode pair:
+  </p>
+
+  <table class="tbl">
+    <tr><th>Mode</th><th>What it means</th></tr>
+    <tr><td><code>EXTEND</code></td><td>Extend a sequence whose prefix KV may already be cached — "also called prefill".</td></tr>
+    <tr><td><code>DECODE</code></td><td>Decode one token per request.</td></tr>
+    <tr><td><code>MIXED</code></td><td>Both EXTEND and DECODE in one batch (chunked prefill mixing, chapter 02).</td></tr>
+    <tr><td><code>IDLE</code></td><td>No work — a DP-attention rank with no requests still must join collectives (chapter 07).</td></tr>
+    <tr><td><code>TARGET_VERIFY</code></td><td>Speculative decoding: verify draft tokens in the target model (chapter 09).</td></tr>
+    <tr><td><code>DRAFT_EXTEND_V2</code></td><td>Speculative decoding: extend a batch in the draft model.</td></tr>
+    <tr><td><code>PREBUILT</code></td><td>Disaggregated decode worker: KV cache already transferred, ready to decode (chapter 08).</td></tr>
+    <tr><td><code>SPLIT_PREFILL</code></td><td>Layer-split prefill for PD multiplexing.</td></tr>
+    <tr><td><code>DLLM_EXTEND</code></td><td>Diffusion-LLM block extend.</td></tr>
+  </table>
+
+  <div class="callout fact"><span class="co-title">Mode predicates matter more than modes</span>
+    Dispatch code never compares enum values directly — it uses predicates:
+    <code>is_extend()</code> covers <code>EXTEND | MIXED | TARGET_VERIFY | SPLIT_PREFILL |
+    DLLM_EXTEND</code> (plus <code>DRAFT_EXTEND_V2</code> when opted in), and
+    <code>is_cuda_graph()</code> covers <code>DECODE | TARGET_VERIFY | IDLE | DLLM_EXTEND</code> —
+    that's the set eligible for decode-graph replay (<code>forward_batch_info.py:175-181</code>).
+  </div>
+
+  <h3>Worked example: building a ForwardBatch, number by number</h3>
+  <p>
+    A mixed extend batch with two requests on a <code>tp=1</code> server. <b>Request A</b> is a
+    follow-up turn: 8 total tokens, of which a 5-token prefix
+    ("<code>The capital of France is</code>") was matched in the radix cache (chapter 03).
+    <b>Request B</b> is a fresh 4-token prompt with no cached prefix. Token ids are illustrative.
+  </p>
+
+  <div class="stepper" id="st-fb">
+    <div class="st-scene">
+      <div class="sc-row"><div class="sc-box" id="fb-reqa">Request A<small>seq_len 8 · prefix 5 cached</small></div>
+        <span class="tok sc-cachetok" id="fa-0">791</span><span class="tok sc-cachetok" id="fa-1">6864</span><span class="tok sc-cachetok" id="fa-2">315</span><span class="tok sc-cachetok" id="fa-3">9822</span><span class="tok sc-cachetok" id="fa-4">374</span>
+        <span class="tok" id="fa-5">279</span><span class="tok" id="fa-6">3363</span><span class="tok" id="fa-7">315</span>
+      </div>
+      <div class="sc-row"><div class="sc-box" id="fb-reqb">Request B<small>seq_len 4 · no cached prefix</small></div>
+        <span class="tok" id="fbk-0">9906</span><span class="tok" id="fbk-1">1917</span><span class="tok" id="fbk-2">758</span><span class="tok" id="fbk-3">30</span>
+      </div>
+      <div class="sc-row appear" id="fb-ids-row" style="margin-top:14px">
+        <div class="sc-box" style="min-width:170px">input_ids<small>[7] — new tokens only</small></div>
+        <span class="tok" id="fi-0">279</span><span class="tok" id="fi-1">3363</span><span class="tok" id="fi-2">315</span>
+        <span class="tok" id="fi-3">9906</span><span class="tok" id="fi-4">1917</span><span class="tok" id="fi-5">758</span><span class="tok" id="fi-6">30</span>
+      </div>
+      <div class="sc-row appear" id="fb-pos-row">
+        <div class="sc-box" style="min-width:170px">positions<small>[7] — absolute, for RoPE</small></div>
+        <span class="tok" id="fp-0">5</span><span class="tok" id="fp-1">6</span><span class="tok" id="fp-2">7</span>
+        <span class="tok" id="fp-3">0</span><span class="tok" id="fp-4">1</span><span class="tok" id="fp-5">2</span><span class="tok" id="fp-6">3</span>
+      </div>
+      <div class="sc-row appear" id="fb-loc-row">
+        <div class="sc-box" style="min-width:170px">out_cache_loc<small>[7] — KV slots to write</small></div>
+        <span class="tok" id="fl-0">1310</span><span class="tok" id="fl-1">1311</span><span class="tok" id="fl-2">1312</span>
+        <span class="tok" id="fl-3">5021</span><span class="tok" id="fl-4">5022</span><span class="tok" id="fl-5">5023</span><span class="tok" id="fl-6">5024</span>
+      </div>
+      <div class="sc-row appear" id="fb-meta-row" style="margin-top:10px">
+        <div class="sc-box" id="fb-meta1">extend_prefix_lens = [5, 0]<small>cached per request</small></div>
+        <div class="sc-box" id="fb-meta2">extend_seq_lens = [3, 4]<small>new per request</small></div>
+        <div class="sc-box" id="fb-meta3">extend_start_loc = [0, 3]<small>cumsum offsets</small></div>
+      </div>
+      <div class="sc-row appear" id="fb-meta-row2">
+        <div class="sc-box" id="fb-meta4">seq_lens = [8, 4] · seq_lens_sum = 12</div>
+        <div class="sc-box" id="fb-meta5">req_pool_indices = [3, 7]<small>rows in req_to_token_pool</small></div>
+        <div class="sc-box" id="fb-meta6">extend_num_tokens = 7</div>
+      </div>
+    </div>
+  </div>
+
+  <h2><span class="sec-num">4.3</span>Forward dispatch: one entry point, four execution paths</h2>
+  <p>
+    <code>ModelRunner.forward(forward_batch) → ModelRunnerOutput</code>
+    (<code>model_runner.py:1323</code>) wraps <code>_forward_raw</code> with profiling and
+    observability hooks; <code>_forward_raw</code> (<code>model_runner.py:1467</code>) is the actual
+    router. Its first and cheapest check is the decode CUDA graph fast path — everything else is
+    the slow lane.
+  </p>
+
+  <div class="callout warn"><span class="co-title">Rename alert vs. older SGLang docs</span>
+    The classic <code>ModelRunner.forward_extend</code> / <code>forward_decode</code> /
+    <code>forward_idle</code> methods <b>no longer exist in this repo</b>. Dispatch moved into
+    dedicated runner objects: <code>DecodeCudaGraphRunner</code>, <code>PrefillCudaGraphRunner</code>,
+    and <code>EagerRunner._execute_decode / _execute_extend / _execute_idle</code>
+    (<code>model_executor/runner/eager_runner.py</code>). The names
+    <code>forward_extend</code>/<code>forward_decode</code> survive only at the
+    <em>attention-backend</em> level (§4.4).
+  </div>
+
+  <div class="diagram">
+    <div class="dg-title">_FORWARD_RAW DECISION TREE</div>
+    <pre class="mermaid">
+flowchart TB
+  f["ModelRunner.forward(forward_batch)"] --> raw["_forward_raw<br/><i>model_runner.py:1467</i>"]
+  raw --> d1{"forward_mode.is_cuda_graph() and<br/>decode_cuda_graph_runner.can_run_graph()?"}
+  d1 -- "yes (hot path)" --> replay["DecodeCudaGraphRunner.execute<br/>pad → graph.replay() → slice"]
+  d1 -- no --> prep["_prepare_eager_forward_batch()<br/>DP / MLP-sync padding, deferred mamba ops"]
+  prep --> d2{"is_split_prefill()?"}
+  d2 -- yes --> sp["forward_split_prefill<br/>layer-range chunks (PD multiplexing)"]
+  d2 -- no --> d3{"is_extend() and<br/>prefill_cuda_graph_runner.can_run_graph()?"}
+  d3 -- yes --> pcg["PrefillCudaGraphRunner.execute<br/>breakable / full / tc_piecewise"]
+  d3 -- no --> eager["EagerRunner.execute"]
+  eager --> e1["_execute_decode / _execute_extend / _execute_idle"]
+  e1 --> mf["model.forward(input_ids, positions, forward_batch)"]
+  replay --> out["LogitsProcessorOutput"]
+  sp --> out
+  pcg --> out
+  mf --> out
+  style replay fill:#e7f7ec,stroke:#16a34a
+  style eager fill:#eef0ff,stroke:#4f46e5
+  style out fill:#fdf3e3,stroke:#d97706
+    </pre>
+    <div class="dg-caption">
+      The decode-graph path returns early, before DP padding — the graph runner pre-pads its own
+      static buffers. All other paths run the live batch through
+      <code>_prepare_eager_forward_batch</code> first. Sampling is <em>not</em> in this tree: the
+      worker calls <code>ModelRunner.sample(logits_output, forward_batch)</code> as a separate step
+      (§4.6).
+    </div>
+  </div>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/model_executor/model_runner.py:1498" data-desc="_forward_raw routing (abridged — DP-padding and timer plumbing elided)">
+<pre>
+# Replay cuda graph if applicable
+if can_run_graph:
+    ret = self.decode_cuda_graph_runner.execute(
+        forward_batch,
+        pp_proxy_tensors=pp_proxy_tensors,
+    )
+    return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+...
+if forward_batch.forward_mode.is_split_prefill():
+    # Layer-split mode; stays on ModelRunner, not the eager runner.
+    ret = self.forward_split_prefill(...)
+elif (
+    forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
+    and not isinstance(self.prefill_cuda_graph_runner, EagerRunner)
+    and self.prefill_cuda_graph_runner is not None
+    and self.prefill_cuda_graph_runner.can_run_graph(forward_batch)
+    ...
+):
+    # Prefill cuda graph (piecewise).
+    ...
+    ret = self.prefill_cuda_graph_runner.execute(forward_batch, **kwargs)
+else:
+    # Eager: decode / extend / idle dispatched inside the runner.
+    ret = self.eager_runner.execute(
+        forward_batch, pp_proxy_tensors=pp_proxy_tensors
+    )
+</pre>
+  </div>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/model_executor/runner/eager_runner.py:197" data-desc="The eager fallback — where forward_extend/forward_decode dispatch went">
+<pre>
+def execute(
+    self, forward_batch: ForwardBatch, pp_proxy_tensors=None, **kwargs
+) -> Any:
+    mode = forward_batch.forward_mode
+    if mode.is_decode():
+        return self._execute_decode(forward_batch, pp_proxy_tensors)
+    if mode.is_idle():
+        return self._execute_idle(forward_batch, pp_proxy_tensors)
+    if mode.is_extend(include_draft_extend_v2=True):
+        return self._execute_extend(forward_batch, pp_proxy_tensors)
+    raise ValueError(f"Invalid forward mode for eager runner: {mode}")
+</pre>
+  </div>
+
+  <p>
+    Each eager path does three things: <code>load_batch</code> (copy the live batch into
+    fixed-capacity static buffers), <code>attn_backend.init_forward_metadata(forward_batch)</code>
+    if the batch still <code>needs_forward_metadata_init()</code> (multi-step speculative workers
+    pre-plan and mark metadata ready — <code>mark_forward_metadata_ready()</code>,
+    <code>forward_batch_info.py:621</code>), then
+    <code>model_runner.model.forward(input_ids, positions, forward_batch)</code>.
+  </p>
+
+  <h2><span class="sec-num">4.4</span>RadixAttention and the attention backend zoo</h2>
+  <p>
+    Inside every model, the attention layer is a <code>RadixAttention</code> module
+    (<code>python/sglang/srt/layers/radix_attention.py:91</code>). Despite being an
+    <code>nn.Module</code>, it holds <b>no weights and no kernel</b> — only metadata:
+    <code>tp_q_head_num</code>, <code>tp_k_head_num</code>, <code>head_dim</code>,
+    <code>scaling</code>, <code>layer_id</code>, <code>logit_cap</code>,
+    <code>sliding_window_size</code>, KV scales. Its <code>forward(q, k, v, forward_batch)</code> is
+    pure indirection: it fetches the process-ambient backend from the <code>ForwardContext</code>
+    and delegates.
+  </p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/layers/radix_attention.py:278" data-desc="RadixAttention.forward, normal (non-piecewise-compile) path">
+<pre>
+        else:
+            return get_attn_backend().forward(
+                q,
+                k,
+                v,
+                self,
+                forward_batch,
+                save_kv_cache,
+                **kwargs,
+            )
+</pre>
+  </div>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/layers/attention/base_attn_backend.py:187" data-desc="AttentionBackend.forward — where forward_decode / forward_extend live now (abridged arg lists)">
+<pre>
+@debug_kernel_api
+def forward(self, q, k, v, layer: RadixAttention,
+            forward_batch: ForwardBatch, save_kv_cache: bool = True, **kwargs):
+    """Run forward on an attention layer."""
+    if forward_batch.forward_mode.is_idle():
+        return q.new_empty(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+    elif forward_batch.forward_mode.is_decode():
+        return self.forward_decode(q, k, v, layer, forward_batch,
+                                   save_kv_cache=save_kv_cache, **kwargs)
+    elif forward_batch.forward_mode.is_mixed() and is_npu():
+        return self.forward_mixed(...)
+    else:
+        return self.forward_extend(q, k, v, layer, forward_batch,
+                                   save_kv_cache=save_kv_cache, **kwargs)
+</pre>
+  </div>
+
+  <p>
+    Every concrete backend implements <code>forward_decode</code> / <code>forward_extend</code>
+    (writing new K/V into the pool via <code>out_cache_loc</code>, then launching its kernel) plus a
+    strict three-method <em>metadata contract</em> (<code>base_attn_backend.py:19-97</code>):
+  </p>
+  <ul>
+    <li><code>init_forward_metadata(fb)</code> — eager path; by default calls the two below.</li>
+    <li><code>init_forward_metadata_out_graph(fb, in_capture=False)</code> — host-side per-iteration
+      prep (page tables, indptrs) that runs <em>outside</em> any CUDA graph.</li>
+    <li><code>init_forward_metadata_in_graph(fb)</code> — static-shape GPU ops recorded <em>inside</em>
+      the graph and auto-replayed; must never call <code>.item()</code>/<code>.cpu()</code>.</li>
+  </ul>
+
+  <p>
+    Backends are chosen by name through a registry
+    (<code>layers/attention/attention_registry.py:31-39</code>): a module-level dict
+    <code>ATTENTION_BACKENDS = {}</code> filled by <code>@register_attention_backend("name")</code>
+    factory functions. A factory can dispatch further — <code>"flashinfer"</code> returns
+    <code>FlashInferAttnBackend</code> or <code>FlashInferMLAAttnBackend</code> depending on
+    <code>runner.use_mla_backend</code>. Unknown names raise
+    <code>ValueError("Invalid attention backend: ...")</code> in
+    <code>model_runner_components/attention_backend_setup.py</code>.
+  </p>
+
+  <p>The full set of <b>23 built-in <code>--attention-backend</code> choices</b>
+    (<code>server_args.py:175-203</code>), grouped:</p>
+
+  <table class="tbl">
+    <tr><th>Group</th><th>Choices</th><th>Notes</th></tr>
+    <tr><td>Common / portable</td><td><code>triton</code> · <code>torch_native</code> · <code>flex_attention</code></td>
+      <td>Triton kernels; pure PyTorch SDPA; torch FlexAttention.</td></tr>
+    <tr><td>Sparse attention</td><td><code>dsa</code> (<code>nsa</code> = deprecated alias) · <code>dsv4</code> (<code>compressed</code> = deprecated alias)</td>
+      <td>DeepSeek Sparse Attention (indexer + top-k) and DeepSeek-V4 compressed KV.</td></tr>
+    <tr><td>NVIDIA · MHA</td><td><code>flashinfer</code> · <code>fa3</code> · <code>fa4</code> · <code>trtllm_mha</code> · <code>dual_chunk_flash_attn</code> · <code>hpc_ops</code></td>
+      <td><code>fa3</code> asserts SM80–90; <code>hpc_ops</code> is Tencent HPC-Ops, Hopper only, requires <code>--page-size 64</code>.</td></tr>
+    <tr><td>NVIDIA · MLA-specific</td><td><code>cutlass_mla</code> · <code>flashmla</code> · <code>trtllm_mla</code> · <code>cutedsl_mla</code> · <code>tokenspeed_mla</code></td>
+      <td>For MLA models (DeepSeek family); <code>flashinfer</code>/<code>fa3</code>/<code>triton</code> also auto-switch to MLA variants when <code>use_mla_backend</code>.</td></tr>
+    <tr><td>AMD</td><td><code>aiter</code> · <code>wave</code></td><td>ROCm AITER kernels; Wave-lang kernels.</td></tr>
+    <tr><td>Other platforms</td><td><code>intel_amx</code> · <code>intel_xpu</code> · <code>ascend</code></td><td>Intel CPU AMX, Intel GPU, Huawei Ascend NPU.</td></tr>
+  </table>
+
+  <div class="callout note"><span class="co-title">Hybrid linear attention is a wrapper, not a choice</span>
+    Mamba2 / GDN / KDA / MiniMax-Lightning / short-conv / MiniMax-sparse backends never appear in
+    <code>--attention-backend</code>. After the full-attention backend is built,
+    <code>attn_backend_wrapper</code> (<code>attention_registry.py:297</code>) composes it into a
+    <code>HybridLinearAttnBackend</code> keyed by the model config's
+    <code>full_attention_layer_ids</code> — full-attention layers route to your chosen backend,
+    linear-attention layers to the model-specific one. Similarly, differing
+    <code>--prefill-attention-backend</code> / <code>--decode-attention-backend</code> produce a
+    two-in-one <code>HybridAttnBackend</code>.
+  </div>
+
+  <h2><span class="sec-num">4.5</span>CUDA graphs: making decode launch-bound no more</h2>
+  <p>
+    A decode step runs hundreds of tiny kernels — for small batches, CPU launch overhead dwarfs GPU
+    compute. CUDA graphs fix this by recording the whole forward once per batch-size bucket at
+    startup, then replaying it as a <b>single launch</b>. The design has two orthogonal axes:
+    a <b>phase runner</b> (<code>DecodeCudaGraphRunner</code>, <code>PrefillCudaGraphRunner</code>,
+    <code>EagerRunner</code> — bucket choice, static buffers, output slicing) and a pluggable
+    <b>capture backend</b> (<code>model_executor/runner_backend/</code>):
+    <code>full</code> (one <code>torch.cuda.CUDAGraph</code> per shape), <code>breakable</code>
+    (segmented capture), <code>tc_piecewise</code> (torch.compile FX-split at every attention op),
+    or <code>disabled</code> — configured per phase via <code>--cuda-graph-config</code>, e.g.
+    <code>{"decode": {"backend": "full"}, "prefill": {"backend": "breakable"}}</code>
+    (<code>model_executor/cuda_graph_config.py</code>).
+  </p>
+
+  <div class="callout fact"><span class="co-title">Prefill is no longer eager-only</span>
+    Defaults (<code>cuda_graph_config.py:109-131</code>): decode = <code>full</code>; prefill =
+    <code>breakable</code> on CUDA, <code>tc_piecewise</code> elsewhere. Breakable prefill captures
+    the transformer body once with a single request slot and replays it with live attention
+    metadata; <code>full</code> prefill (opt-in) captures one graph per <em>token-count</em> bucket.
+    Under <code>tc_piecewise</code>, <code>RadixAttention</code> routes through the
+    <code>unified_attention_with_output</code> custom op registered as a split op, so torch.compile
+    cuts the FX graph at every attention call and CUDA-graphs the pieces between them.
+  </div>
+
+  <p>Which decode batch sizes get a graph? The default bucket list:</p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/server_args.py:4931" data-desc="Default decode capture buckets (non-speculative); spec decoding uses a denser small-bs grid">
+<pre>
+elif self.speculative_algorithm is None:
+    # Normal case:
+    capture_bs = (
+        [1, 2, 4, 8, 12]
+        + list(range(16, 257, 8))
+        + list(range(272, 512, 16))
+        + list(range(512, max_bs + 1, 32))
+    )
+</pre>
+  </div>
+
+  <p>
+    So: <code>1, 2, 4, 8, 12</code>, then every 8 up to 256, every 16 up to 496, every 32 beyond 512.
+    Capture (<code>runner/decode_cuda_graph_runner.py:799</code>) iterates <b>largest batch size
+    first</b> so smaller shapes can reuse the shared graph memory pool, inside
+    <code>freeze_gc</code> (a GC pass mid-capture would poison the graph). Each shape's
+    <code>run_once()</code> is executed twice as warmup, then recorded. At replay time, a real batch
+    is padded up to the nearest bucket:
+  </p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/model_executor/runner/base_cuda_graph_runner.py:134" data-desc="Bucket selection — shared by decode and prefill runners (docstring trimmed)">
+<pre>
+@staticmethod
+def _pad_to_bucket(raw_size: int, buckets: Sequence[int]) -> int:
+    """Return the smallest buckets[i] >= raw_size. ..."""
+    assert raw_size &lt;= buckets[-1], (
+        f"size {raw_size} exceeds max captured bucket {buckets[-1]}; "
+        f"can_run_graph should have rejected this batch"
+    )
+    index = bisect.bisect_left(buckets, raw_size)
+    return buckets[index]
+</pre>
+  </div>
+
+  <h3>Worked example: one decode step through the graph, bs = 5</h3>
+  <p>
+    Five requests are decoding. No graph was captured for bs=5 — step through what
+    <code>DecodeCudaGraphRunner.execute</code> (<code>decode_cuda_graph_runner.py:1158</code>)
+    actually does.
+  </p>
+
+  <div class="stepper" id="st-cg">
+    <div class="st-scene">
+      <div class="sc-row">
+        <div class="sc-box" style="min-width:150px">capture_bs<small>captured buckets</small></div>
+        <span class="tok" id="cg-b1">1</span><span class="tok" id="cg-b2">2</span><span class="tok" id="cg-b4">4</span><span class="tok" id="cg-b8">8</span><span class="tok" id="cg-b12">12</span><span class="tok" id="cg-b16">16</span><span class="tok" id="cg-b24">24</span><span class="tok" id="cg-bmore">…</span>
+      </div>
+      <div class="sc-row" style="margin-top:12px">
+        <div class="sc-box" style="min-width:150px">static buffers<small>input_ids · seq_lens ·<br/>out_cache_loc lanes</small></div>
+        <div class="sc-box" id="cg-l0">req 0<small>id 8341 · len 91</small></div>
+        <div class="sc-box" id="cg-l1">req 1<small>id 311 · len 17</small></div>
+        <div class="sc-box" id="cg-l2">req 2<small>id 1131 · len 203</small></div>
+        <div class="sc-box" id="cg-l3">req 3<small>id 6 · len 44</small></div>
+        <div class="sc-box" id="cg-l4">req 4<small>id 279 · len 58</small></div>
+        <div class="sc-box" id="cg-l5">pad<small>seq_len = fill_value</small></div>
+        <div class="sc-box" id="cg-l6">pad<small>seq_len = fill_value</small></div>
+        <div class="sc-box" id="cg-l7">pad<small>seq_len = fill_value</small></div>
+      </div>
+      <div class="sc-row appear" id="cg-meta-row" style="margin-top:10px">
+        <div class="sc-box" id="cg-plan">init_forward_metadata_out_graph(fb_view)<small>host-side plan, outside the graph</small></div>
+        <div class="sc-box" id="cg-replay">graphs[ShapeKey(bs=8)].replay()<small>one launch, whole forward</small></div>
+      </div>
+      <div class="sc-row appear" id="cg-out-row" style="margin-top:10px">
+        <div class="sc-box" style="min-width:150px">next_token_logits<small>[8, vocab] → slice</small></div>
+        <span class="tok" id="cg-o0">row 0</span><span class="tok" id="cg-o1">row 1</span><span class="tok" id="cg-o2">row 2</span><span class="tok" id="cg-o3">row 3</span><span class="tok" id="cg-o4">row 4</span>
+        <span class="tok" id="cg-o5">row 5</span><span class="tok" id="cg-o6">row 6</span><span class="tok" id="cg-o7">row 7</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/model_executor/runner_backend/full_cuda_graph_backend.py:123" data-desc="Replay is two lines — all the work happened at capture time">
+<pre>
+def replay(
+    self,
+    shape_key: ShapeKey,
+    static_forward_batch: ForwardBatch,
+    **kwargs,
+) -> Any:
+    self._graphs[shape_key].replay()
+    return self._outputs[shape_key]
+</pre>
+  </div>
+
+  <h2><span class="sec-num">4.6</span>From hidden states to a token</h2>
+  <p>
+    The model trunk produces one hidden state per input token — but for generation we only need
+    logits for the <em>last</em> token of each request. <code>LogitsProcessor</code>
+    (<code>python/sglang/srt/layers/logits_processor.py:340</code>, instantiated inside each model
+    class) prunes before the expensive LM-head matmul: for extend batches,
+    <code>last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1;
+    pruned_states = hidden_states[last_index]</code> (<code>logits_processor.py:525-526</code>).
+    In our §4.2 example that keeps rows <code>[2, 6]</code> of the 7-row hidden-state tensor — the
+    vocab projection runs on 2 rows instead of 7.
+  </p>
+
+  <div class="diagram">
+    <div class="dg-title">LOGITS → TOKEN PIPELINE (PER SCHEDULER ITERATION)</div>
+    <pre class="mermaid">
+flowchart LR
+  hs["hidden_states<br/>[7, hidden]"] --> lp["LogitsProcessor<br/>prune: cumsum(extend_seq_lens)-1<br/>→ rows [2, 6]"]
+  lp --> lm["lm_head matmul<br/>[2, vocab] (+ TP all-gather)"]
+  lm --> lo["LogitsProcessorOutput<br/>next_token_logits"]
+  lo --> pre["ModelRunner.sample →<br/>_preprocess_logits:<br/>penalties · grammar mask · logit_bias"]
+  pre --> smp["Sampler<br/>div_(temperatures) → in-place softmax<br/>→ top-k/top-p (flashinfer | pytorch)"]
+  smp --> ids["next_token_ids [2]"]
+  style lp fill:#eef0ff,stroke:#4f46e5
+  style pre fill:#fdf3e3,stroke:#d97706
+  style ids fill:#e7f7ec,stroke:#16a34a
+    </pre>
+    <div class="dg-caption">
+      <code>model.forward</code> ends at <code>LogitsProcessorOutput</code>; the worker then calls
+      <code>ModelRunner.sample(logits_output, forward_batch)</code>
+      (<code>model_runner.py:1584</code>) as a separate step.
+      <code>_preprocess_logits</code> applies, in order: accumulated additive penalties
+      (frequency/presence), scaling penalties (repetition), the penalizer orchestrator, the
+      grammar vocab mask, and per-request <code>logit_bias</code>
+      (<code>sampling/sampling_batch_info.py:284</code>, <code>apply_logits_bias</code>).
+    </div>
+  </div>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/layers/sampler.py:188" data-desc="Sampler standard path (abridged — deterministic-logprob branch elided)">
+<pre>
+# Standard path: do softmax and sample from probs.
+logits.div_(sampling_info.temperatures)
+...
+# In-place op to save memory
+logits[:] = torch.softmax(logits, dim=-1)
+probs = logits
+
+batch_next_token_ids = self._sample_from_probs(
+    probs, sampling_info, positions, simple_sampling_case
+)
+</pre>
+  </div>
+
+  <p>
+    Note the memory trick: temperature division and softmax are <b>in-place</b>, so "probs" is the
+    logits buffer itself — there is never a second <code>[bs, vocab]</code> tensor. All-greedy
+    batches (<code>top_k &lt;= 1</code> everywhere) skip softmax entirely and use
+    <code>torch.argmax</code>. Otherwise <code>_sample_from_probs</code> picks a kernel by
+    <code>--sampling-backend</code>: <code>flashinfer</code>
+    (<code>top_k_top_p_sampling_from_probs</code> fused kernel) or <code>pytorch</code>
+    (sort-based fallback). Penalties, grammar-constrained decoding, logprobs, and deterministic
+    sampling are covered in depth in chapter 10.
+  </p>
+
+  <h2><span class="sec-num">4.7</span>Model loading and the model zoo</h2>
+  <p>
+    How does <code>"architectures": ["LlamaForCausalLM"]</code> in an HF <code>config.json</code>
+    become a running SGLang model? By <b>class-name matching</b>: at import,
+    <code>models/registry.py</code> walks every module in <code>sglang.srt.models</code>
+    (212 files, 193 exporting an <code>EntryClass</code>) and maps each entry class's <em>name</em>
+    to the class. Architectures with no match get <code>TransformersForCausalLM</code> appended as
+    a fallback (<code>registry.py:75-77</code>) — a generic wrapper that runs any HF
+    <code>transformers</code> model with SGLang attention.
+  </p>
+
+  <div class="diagram">
+    <div class="dg-title">FROM HF CONFIG TO LOADED WEIGHTS</div>
+    <pre class="mermaid">
+flowchart LR
+  cfg["config.json<br/>architectures:<br/>[LlamaForCausalLM]"] --> reg["ModelRegistry<br/><i>models/registry.py</i><br/>class-name → class"]
+  reg -- match --> cls["models/llama.py<br/>EntryClass = [LlamaForCausalLM,<br/>Phi3..., InternLM3..., IQuestCoder...]"]
+  reg -- "no match" --> fb2["TransformersForCausalLM<br/>(fallback wrapper)"]
+  cls --> im["_initialize_model<br/>on target device<br/><i>model_loader/loader.py</i>"]
+  im --> pw["_prepare_weights<br/>*.safetensors picked via<br/>model.safetensors.index.json"]
+  pw --> lw2["model.load_weights(...)<br/>stacked_params_mapping fuses<br/>q/k/v → qkv_proj"]
+  lw2 --> done["weights on GPU<br/>+ dist barrier"]
+  style reg fill:#eef0ff,stroke:#4f46e5
+  style fb2 fill:#fdf3e3,stroke:#d97706
+  style done fill:#e7f7ec,stroke:#16a34a
+    </pre>
+    <div class="dg-caption">
+      <code>DefaultModelLoader.load_model</code> (<code>model_loader/loader.py:793</code>):
+      constructs the model under <code>set_default_torch_dtype</code>, streams tensors via
+      <code>safetensors_weights_iterator</code>, and hands each <code>(name, tensor)</code> pair to
+      the model's own <code>load_weights</code>. Alternative loaders: layered (meta-device),
+      sharded-state, remote-instance (NCCL transfer from a running server), dummy.
+    </div>
+  </div>
+
+  <p>
+    <code>models/llama.py</code> is the canonical model file to read. <code>LlamaAttention</code>
+    wraps <code>QKVParallelLinear → rotary_emb → RadixAttention → RowParallelLinear</code>
+    (the <code>RadixAttention</code> construction at <code>llama.py:209</code> passes
+    <code>num_heads, head_dim, scaling, num_kv_heads, layer_id</code> — everything a backend needs,
+    no weights). The interesting part is weight loading: HF checkpoints store
+    <code>q_proj</code>/<code>k_proj</code>/<code>v_proj</code> separately, but SGLang fuses them
+    into one <code>qkv_proj</code> matmul (and <code>gate_proj</code>/<code>up_proj</code> into
+    <code>gate_up_proj</code>). A declarative mapping drives the fusion:
+  </p>
+
+  <div class="snippet" data-lang="python" data-file="python/sglang/srt/models/llama.py:537" data-desc="stacked_params_mapping — load_weights routes each HF tensor into a shard of a fused parameter">
+<pre>
+self.stacked_params_mapping = [
+    # (param_name, shard_name, shard_id)
+    (".qkv_proj", ".q_proj", "q"),
+    (".qkv_proj", ".k_proj", "k"),
+    (".qkv_proj", ".v_proj", "v"),
+    (".gate_up_proj", ".gate_proj", 0),
+    (".gate_up_proj", ".up_proj", 1),
+]
+</pre>
+  </div>
+
+  <p>
+    <code>load_weights</code> (<code>llama.py:657</code>) iterates the checkpoint tensors; when a
+    name contains <code>.q_proj</code>, it substitutes <code>.qkv_proj</code>, looks up the fused
+    parameter, and calls that parameter's <code>weight_loader(param, loaded_weight, "q")</code> —
+    which also applies the tensor-parallel slice for this rank (chapter 05).
+    <code>EntryClass</code> at the bottom of the file (<code>llama.py:924</code>) registers four
+    architectures at once: <code>LlamaForCausalLM</code>, <code>Phi3ForCausalLM</code>,
+    <code>InternLM3ForCausalLM</code>, <code>IQuestCoderForCausalLM</code> — thin subclasses sharing
+    the whole implementation.
+  </p>
+
+  <h2><span class="sec-num">4.8</span>Notable facts &amp; gotchas</h2>
+  <div class="card">
+    <ul>
+      <li><b><code>ModelRunner.forward_extend</code>/<code>forward_decode</code> are gone.</b>
+        Dispatch is <code>_forward_raw</code> → runner objects
+        (<code>EagerRunner._execute_*</code>, <code>DecodeCudaGraphRunner</code>,
+        <code>PrefillCudaGraphRunner</code>). The old names survive only on attention backends.</li>
+      <li><b>CUDA graphs = phase runner × capture backend.</b> Per-phase
+        <code>full | breakable | tc_piecewise | disabled</code> via <code>--cuda-graph-config</code>;
+        decode defaults to <code>full</code>, prefill to <code>breakable</code> on CUDA — prefill is
+        no longer eager-only.</li>
+      <li><b>Padding invariants:</b> decode replay pads bs to the nearest captured bucket; padded
+        <code>seq_lens</code> lanes hold the backend's <code>seq_len_fill_value</code> ("typically 0
+        or 1"); outputs are sliced with <code>[: self.raw_num_token]</code>; piecewise prefill
+        explicitly zeroes the padded attention-output tail so NaNs can't leak into residuals or MoE
+        routing.</li>
+      <li><b><code>RadixAttention</code> owns zero weights</b> — it's a metadata handle that routes
+        q/k/v to the ambient backend via <code>get_attn_backend()</code> from
+        <code>ForwardContext</code>. Under tc_piecewise it becomes the
+        <code>unified_attention_with_output</code> custom split-op.</li>
+      <li><b>The metadata contract is three methods</b>
+        (<code>init_forward_metadata</code> / <code>..._out_graph</code> / <code>..._in_graph</code>);
+        the legacy <code>init_forward_metadata_capture_cuda_graph</code> /
+        <code>..._replay_cuda_graph</code> pair is removed.</li>
+      <li><b>Speculative decoding rides the decode graph:</b> capture mode becomes
+        <code>TARGET_VERIFY</code> with <code>captured_req_width = speculative_num_draft_tokens</code>
+        and a dummy verify-input wired to a static <code>custom_mask</code> buffer (chapter 09).</li>
+      <li><b>Capture goes largest-shape-first</b> inside <code>freeze_gc</code>, with two warmup
+        runs per shape, and all shapes share one global graph memory pool — that's why graph memory
+        overhead stays modest despite ~60 captured buckets.</li>
+      <li><b>The Sampler reuses the logits tensor in place</b> (<code>div_</code> +
+        <code>logits[:] = softmax</code>); grammar masks are applied <em>before</em> sampling in
+        <code>ModelRunner._preprocess_logits</code> and freed immediately to avoid a VRAM leak under
+        overlap scheduling.</li>
+      <li><b>Model discovery is literal class-name matching</b> against HF
+        <code>architectures[]</code>; unknown architectures fall back to
+        <code>TransformersForCausalLM</code>.</li>
+    </ul>
+  </div>
+
+  <div id="pager"></div>
+  </div>
+</main>
+</div>
+
+<script>
+document.addEventListener("DOMContentLoaded", () => {
+
+  new Stepper("#st-fb", {
+    title: "ForwardBatch.init_new for a 2-request extend batch (one cached prefix)",
+    intro: "Watch ScheduleBatch data get lowered into flat GPU tensors.",
+    autoMs: 3600,
+    reset(sc) {
+      clearState(sc, ".sc-box,.tok");
+      rmCls(sc, ".appear", "in");
+      setCls(sc, ".sc-cachetok", "cache");
+    },
+    steps: [
+      { cap: "The scheduler hands over a <code>ScheduleBatch</code> with two extend requests. For request A, the radix tree (chapter 03) matched a 5-token cached prefix — purple tokens already have K/V in the pool. <code>ForwardBatch.init_new</code> sets <code>forward_mode=EXTEND</code>, <code>batch_size=2</code>.",
+        run(sc) { setCls(sc, "#fb-reqa,#fb-reqb", "hl"); } },
+      { cap: "<code>input_ids</code> is the concatenation of <b>new tokens only</b> — [279, 3363, 315] from A, then [9906, 1917, 758, 30] from B. 7 tokens total; the 5 cached tokens are never re-run through the model.",
+        run(sc) { rmCls(sc, "#fb-reqa,#fb-reqb", "hl"); setCls(sc, "#fb-ids-row", "in");
+                  setCls(sc, "#fa-5,#fa-6,#fa-7,#fbk-0,#fbk-1,#fbk-2,#fbk-3", "ok");
+                  setCls(sc, "#fi-0,#fi-1,#fi-2,#fi-3,#fi-4,#fi-5,#fi-6", "ok"); } },
+      { cap: "Extend metadata: <code>extend_prefix_lens=[5,0]</code> (cached), <code>extend_seq_lens=[3,4]</code> (new), <code>extend_start_loc=[0,3]</code> — request B's tokens start at flat offset 3. <code>extend_num_tokens=7</code>.",
+        run(sc) { setCls(sc, "#fb-meta-row,#fb-meta-row2", "in"); setCls(sc, "#fb-meta1,#fb-meta2,#fb-meta3", "hl"); setCls(sc, "#fb-meta6", "hl"); } },
+      { cap: "<code>positions</code> are computed by the Triton kernel <code>compute_position_triton</code> from prefix + extend lens (<code>forward_batch_info.py:898</code>): request A continues at absolute positions <b>5, 6, 7</b> (after its 5-token prefix); request B starts fresh at <b>0..3</b>. RoPE reads these.",
+        run(sc) { rmCls(sc, "#fb-meta1,#fb-meta2,#fb-meta3,#fb-meta6", "hl"); setCls(sc, "#fb-pos-row", "in");
+                  setCls(sc, "#fp-0,#fp-1,#fp-2,#fp-3,#fp-4,#fp-5,#fp-6", "hl"); } },
+      { cap: "The allocator hands out 7 free KV slots → <code>out_cache_loc = [1310, 1311, 1312, 5021, 5022, 5023, 5024]</code>. During the forward, every attention layer writes each new token's K/V to its slot. Slots need not be contiguous across requests.",
+        run(sc) { rmCls(sc, "#fp-0,#fp-1,#fp-2,#fp-3,#fp-4,#fp-5,#fp-6", "hl"); setCls(sc, "#fb-loc-row", "in");
+                  setCls(sc, "#fl-0,#fl-1,#fl-2,#fl-3,#fl-4,#fl-5,#fl-6", "cache"); } },
+      { cap: "Bookkeeping the kernels index with: <code>seq_lens=[8,4]</code>, <code>seq_lens_sum=12</code>, <code>req_pool_indices=[3,7]</code> — rows 3 and 7 of <code>req_to_token_pool</code> map each request's positions (including A's cached prefix) to KV slots. Attention for A's 3 new tokens covers all 8 positions.",
+        run(sc) { setCls(sc, "#fb-meta4,#fb-meta5", "ok"); setCls(sc, "#fa-0,#fa-1,#fa-2,#fa-3,#fa-4", "hl"); } },
+      { cap: "The batch is ready: <code>model.forward(input_ids, positions, forward_batch)</code> produces 7 hidden states; §4.6 shows how only rows 2 and 6 (the last token of each request) reach the LM head.",
+        run(sc) { rmCls(sc, "#fa-0,#fa-1,#fa-2,#fa-3,#fa-4", "hl"); setCls(sc, "#fi-2,#fi-6", "hl", "pulse"); } },
+    ],
+  });
+
+  new Stepper("#st-cg", {
+    title: "Decode step, bs = 5, through the captured CUDA graph",
+    intro: "No graph exists for bs=5 — padding to a bucket makes replay possible.",
+    autoMs: 3600,
+    reset(sc) {
+      clearState(sc, ".sc-box,.tok");
+      rmCls(sc, ".appear", "in");
+    },
+    steps: [
+      { cap: "<code>_forward_raw</code> checks <code>forward_mode.is_cuda_graph()</code> (DECODE qualifies) and <code>decode_cuda_graph_runner.can_run_graph(fb)</code>: bs 5 ≤ max captured bs, spec width matches, DP constraints ok → take the graph fast path.",
+        run(sc) { setCls(sc, "#cg-l0,#cg-l1,#cg-l2,#cg-l3,#cg-l4", "hl"); } },
+      { cap: "<code>_pad_to_bucket(5, capture_bs)</code>: <code>bisect_left([1,2,4,8,12,…], 5)</code> lands on <b>8</b> — the smallest captured bucket ≥ 5. The graph for <code>ShapeKey(bs=8)</code> will be replayed.",
+        run(sc) { setCls(sc, "#cg-b8", "ok", "pulse"); setCls(sc, "#cg-b1,#cg-b2,#cg-b4", "dim"); } },
+      { cap: "<code>buffer_registry.fill_from(...)</code> copies the 5 live requests into the first 5 lanes of the <b>static buffers</b> the graph was recorded against. Lanes 5–7 are padding: their <code>seq_lens</code> keep the backend's <code>seq_len_fill_value</code>, and their garbage outputs are simply never read — no zeroing needed.",
+        run(sc) { rmCls(sc, "#cg-b8", "pulse"); rmCls(sc, "#cg-l0,#cg-l1,#cg-l2,#cg-l3,#cg-l4", "hl");
+                  setCls(sc, "#cg-l0,#cg-l1,#cg-l2,#cg-l3,#cg-l4", "ok"); setCls(sc, "#cg-l5,#cg-l6,#cg-l7", "dim"); } },
+      { cap: "Host-side attention planning runs <b>outside</b> the graph: <code>attn_backend.init_forward_metadata_out_graph(fb_view)</code> refreshes page tables / indptrs for the padded batch. The in-graph half was recorded at capture time and replays automatically.",
+        run(sc) { setCls(sc, "#cg-meta-row", "in"); setCls(sc, "#cg-plan", "hl"); } },
+      { cap: "<code>FullCudaGraphBackend.replay</code> is two lines: <code>self._graphs[shape_key].replay(); return self._outputs[shape_key]</code>. One kernel launch replays the entire multi-hundred-kernel forward for all 8 lanes.",
+        run(sc) { rmCls(sc, "#cg-plan", "hl"); setCls(sc, "#cg-replay", "hl", "pulse"); } },
+      { cap: "The captured output buffer is <code>[8, vocab]</code>. <code>execute</code> slices it back to reality: <code>next_token_logits[: self.raw_num_token]</code> → rows 0–4 survive, the 3 padded rows are dropped.",
+        run(sc) { rmCls(sc, "#cg-replay", "pulse"); setCls(sc, "#cg-out-row", "in");
+                  setCls(sc, "#cg-o0,#cg-o1,#cg-o2,#cg-o3,#cg-o4", "ok"); setCls(sc, "#cg-o5,#cg-o6,#cg-o7", "bad"); } },
+      { cap: "Return <code>ModelRunnerOutput(logits_output=..., can_run_graph=True)</code> — early exit from <code>_forward_raw</code>, no DP padding pass, no eager runner. The worker then calls <code>ModelRunner.sample</code> on the 5 real rows.",
+        run(sc) { setCls(sc, "#cg-o0,#cg-o1,#cg-o2,#cg-o3,#cg-o4", "pulse"); } },
+    ],
+  });
+
+});
+</script>
+</body>
+</html>
