@@ -909,7 +909,7 @@ document.addEventListener("DOMContentLoaded", () => {
       { cap: "<code>organize_draft_results</code> takes <code>torch.topk(score_list, num_draft_token − 1 = 7)</code> over all 36, sorts indices, gathers the winners + <code>parent_list</code>. Picked: \",\" \".\" \"is\" \"the\" \"which\" \"It\" \"capital\". Losers (\"and\" .05, \"a\" .055, \"largest\", \"city\", \"'s\", …) are dropped.",
         run(sc) { rmCls(sc, "#eg-d3a,#eg-d3b,#eg-d3c,#eg-d3d", "hl"); setCls(sc, "#eg-org", "hl");
                   setCls(sc, "#eg-d1a,#eg-d1b,#eg-d1c,#eg-d2a,#eg-d2b,#eg-d2c,#eg-d3a", "hl");
-                  setCls(sc, "#eg-d1d,#eg-d2d,#eg-d3b,#eg-d3c,#eg-d3d", "dim"); } },
+                  setCls(sc, "#eg-d1d,#eg-d2d,#eg-d3b,#eg-d3c,#eg-d3d", "free"); } },
       { cap: "<code>build_tree_kernel_efficient</code> prepends the bonus as root — <code>draft_tokens = cat((bonus_tokens.unsqueeze(1), draft_tokens), dim=1)</code> — so exactly 8 tokens verify per request, and emits <code>tree_mask</code>, <code>positions</code>, and the first-child/next-sibling arrays <code>retrieve_index / retrieve_next_token / retrieve_next_sibling</code>.",
         run(sc) { rmCls(sc, "#eg-org", "hl"); setCls(sc, "#eg-tree", "hl"); setCls(sc, "#eg-root", "cache", "pulse"); } },
       { cap: "<code>run_eagle_verify</code>: <code>eagle_prepare_for_verify</code> assigns 8 KV slots past <code>seq_lens</code> and flips <code>forward_mode = TARGET_VERIFY</code>; the target runs ONE extend-like forward over all 8 positions, the attention backend applying <code>custom_mask</code> so each node attends only to its root path. Fixed width ⇒ replays through the decode CUDA graph.",
