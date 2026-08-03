@@ -370,7 +370,7 @@ flowchart LR
   cli["sglang serve<br/><i>cli/serve.py</i>"] --> rs["run_server()<br/><i>launch_server.py</i>"]
   legacy["python -m sglang.launch_server"] --> rs
   rs --> http["launch_server()<br/>HTTP + FastAPI<br/><i>entrypoints/http_server.py</i>"]
-  rs --> grpc["gRPC server<br/>(chapter 11)"]
+  rs --> grpc["gRPC server<br/>(chapter 10)"]
   py["import sglang as sgl<br/>sgl.Engine(...)"] --> eng["Engine<br/><i>entrypoints/engine.py</i>"]
   http --> sub["Engine._launch_subprocesses()"]
   eng --> sub

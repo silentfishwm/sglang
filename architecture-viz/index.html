@@ -182,10 +182,10 @@ flowchart TB
   <div class="card">
     <p style="margin:4px 0"><b>Scale of the codebase this guide covers</b> (counted at the pinned commit):</p>
     <ul style="margin:6px 0">
-      <li><b>212</b> model implementation files (193 registered architectures) in <code>srt/models/</code></li>
-      <li><b>23</b> selectable <code>--attention-backend</code> choices (incl. 2 deprecated aliases) across ~30 backend files</li>
+      <li><b>212</b> model implementation files (192 exporting an <code>EntryClass</code>) in <code>srt/models/</code></li>
+      <li><b>23</b> selectable <code>--attention-backend</code> choices (incl. 2 deprecated aliases) across 35 backend files</li>
       <li><b>~29</b> quantization method families in <code>srt/layers/quantization/</code></li>
-      <li><b>43</b> subsystem directories under <code>srt/</code> — all of them mapped in chapter 12</li>
+      <li><b>41</b> subsystem directories under <code>srt/</code> (46 entries incl. top-level modules) — all mapped in chapter 12</li>
       <li><b>~9,400</b> lines of <code>ServerArgs</code> alone; ~120 Prometheus metrics; ~60 HTTP endpoints</li>
     </ul>
   </div>
@@ -232,7 +232,7 @@ flowchart TB
       <p>The original SGLang language, fork/join/select, CLI, bench_serving metrics, tests and CI.</p></a>
     <a class="chapter-card" href="12-observability.html"><span class="cc-num">12 · Phase VI</span>
       <h3>Observability, Config &amp; Everything Else</h3>
-      <p>Metrics, tracing, watchdogs, the configuration architecture — and the complete map of all 43 subsystems.</p></a>
+      <p>Metrics, tracing, watchdogs, the configuration architecture — and the complete map of all 46 subsystem entries.</p></a>
   </div>
 
   <h2><span class="sec-num">0.6</span>How to read these pages</h2>

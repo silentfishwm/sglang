@@ -352,9 +352,9 @@ flowchart TB
       Device↔host copies run on dedicated CUDA <code>write_stream</code>/<code>load_stream</code>
       with start/finish events pushed into ack queues; the scheduler polls them each round via
       <code>tree_cache.check_hicache_events()</code> (TP-MIN-synced counts). Host↔storage moves run
-      on two daemon threads. The 10 registered L3 backends are in
-      <code>mem_cache/storage/backend_factory.py:197–247</code> (<code>dynamic</code> loads any
-      module_path/class_name from extra config).
+      on two daemon threads. Nine L3 backends are registered in
+      <code>mem_cache/storage/backend_factory.py:197–247</code> (a tenth CLI choice, <code>dynamic</code>, loads any
+      module_path/class_name from extra config instead of a factory registration).
     </div>
   </div>
 

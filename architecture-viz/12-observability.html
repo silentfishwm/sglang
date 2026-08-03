@@ -342,7 +342,7 @@ flowchart TB
 
   <h2><span class="sec-num">12.4</span>The HTTP management surface</h2>
   <p>
-    Beyond the inference routes (chapter 11), <code>entrypoints/http_server.py</code> (2,768
+    Beyond the inference routes (chapter 10), <code>entrypoints/http_server.py</code> (2,768
     lines) exposes roughly 60 management endpoints. The 25 most important, grouped:
   </p>
 
@@ -585,7 +585,7 @@ class HookType(Enum):
     <tr><td><code>environ.py</code></td><td>Typed env-var registry (<code>envs.SGLANG_*</code>).</td><td>12 (§12.3)</td></tr>
     <tr><td><code>eplb/</code></td><td>Expert-parallel load balancing: distribution recorder, rebalancing algorithms.</td><td>07</td></tr>
     <tr><td><code>function_call/</code></td><td>Tool-call parsers, one detector per model family.</td><td>10</td></tr>
-    <tr><td><code>grpc/</code></td><td>Placeholder package; the real gRPC server is <code>entrypoints/grpc_server.py</code> + <code>/proto</code>.</td><td>11</td></tr>
+    <tr><td><code>grpc/</code></td><td>Placeholder package; the real gRPC server is <code>entrypoints/grpc_server.py</code> + <code>/proto</code>.</td><td>10</td></tr>
     <tr><td><code>hardware_backend/</code></td><td>Per-vendor glue: cpu/gpu/mlx/musa/npu/xpu.</td><td>06</td></tr>
     <tr><td><code>kv_canary/</code></td><td>Runtime KV-corruption detector with self-test perturbation.</td><td>12 (§12.5)</td></tr>
     <tr><td><code>layers/</code></td><td>All NN layers: attention backends, MoE, quantization, sampler, logits processor.</td><td>05</td></tr>
@@ -594,14 +594,14 @@ class HookType(Enum):
     <tr><td><code>mem_cache/</code></td><td>KV pools, allocators, radix cache, HiCache, KV events.</td><td>03, 08</td></tr>
     <tr><td><code>model_executor/</code></td><td><code>ModelRunner</code> (frozen core file), forward batch info, CUDA-graph runners.</td><td>04</td></tr>
     <tr><td><code>model_loader/</code></td><td>Weight loading, remote-instance loader, weight validation.</td><td>04</td></tr>
-    <tr><td><code>models/</code></td><td>~200 model implementations.</td><td>05</td></tr>
+    <tr><td><code>models/</code></td><td>212 model implementations.</td><td>05</td></tr>
     <tr><td><code>multimodal/</code></td><td>Multimodal <em>understanding</em> processors (per-model), video sampling, vision utils.</td><td>05</td></tr>
     <tr><td><code>multiplex/</code></td><td>PD multiplexing on one GPU: SM partitioning into prefill/decode stream groups.</td><td>08</td></tr>
     <tr><td><code>observability/</code></td><td>Metrics collectors, OTel tracing, forward-pass ZMQ telemetry, request logging.</td><td>12 (§12.1)</td></tr>
     <tr><td><code>parser/</code></td><td>Chat templates/conversation, harmony &amp; reasoning parsers, code completion.</td><td>10, 11</td></tr>
     <tr><td><code>platforms/</code></td><td>Platform abstraction + out-of-tree platform plugin interface.</td><td>06</td></tr>
     <tr><td><code>plugins/</code></td><td>AOP hook registry (BEFORE/AFTER/AROUND/REPLACE).</td><td>12 (§12.6)</td></tr>
-    <tr><td><code>ray/</code></td><td>Ray deployment: <code>RayEngine</code>, scheduler actor, Ray DP controller.</td><td>11</td></tr>
+    <tr><td><code>ray/</code></td><td>Ray deployment: <code>RayEngine</code>, scheduler actor, Ray DP controller.</td><td>07</td></tr>
     <tr><td><code>runtime_context.py</code></td><td>Process-global config bags, flags, resources, per-forward state.</td><td>12 (§12.3)</td></tr>
     <tr><td><code>sampling/</code></td><td>Sampling params + batched sampling metadata (penalties, custom logit processors).</td><td>10</td></tr>
     <tr><td><code>server_args.py</code></td><td>The 9,392-line <code>ServerArgs</code> dataclass — every CLI flag.</td><td>12 (§12.3)</td></tr>
@@ -624,9 +624,9 @@ class HookType(Enum):
   </table>
 
   <div class="callout note"><span class="co-title">Outside <code>python/</code></span>
-    The repo also contains <code>sgl-kernel/</code> (AOT CUDA/C++ kernels, chapter 06),
+    The repo's AOT CUDA/C++ kernels live at <code>python/sglang/kernels/aot/</code> (chapter 06); it also contains
     <code>rust/</code> and <code>sgl-model-gateway/</code> (the Rust router/gateway, chapter 08),
-    <code>proto/</code> (the gRPC <code>SglangService</code> definition, chapter 11),
+    <code>proto/</code> (the gRPC <code>SglangService</code> definition, chapter 10),
     <code>3rdparty/</code>, <code>test/</code>, and <code>docs_new/</code>.
   </div>
 

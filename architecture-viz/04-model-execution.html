@@ -561,7 +561,7 @@ batch_next_token_ids = self._sample_from_probs(
     How does <code>"architectures": ["LlamaForCausalLM"]</code> in an HF <code>config.json</code>
     become a running SGLang model? By <b>class-name matching</b>: at import,
     <code>models/registry.py</code> walks every module in <code>sglang.srt.models</code>
-    (212 files, 193 exporting an <code>EntryClass</code>) and maps each entry class's <em>name</em>
+    (212 files, 192 exporting an <code>EntryClass</code>) and maps each entry class's <em>name</em>
     to the class. Architectures with no match get <code>TransformersForCausalLM</code> appended as
     a fallback (<code>registry.py:75-77</code>) — a generic wrapper that runs any HF
     <code>transformers</code> model with SGLang attention.

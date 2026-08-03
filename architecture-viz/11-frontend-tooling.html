@@ -495,7 +495,7 @@ else:
     <code>python -m sglang.test.few_shot_gsm8k</code> is a deprecated shim over
     <code>run_eval eval_name="gsm8k"</code>), plus <code>sglang/eval/</code>
     (<code>llama3_eval.py</code>, <code>loogle_eval.py</code>). The repo-root <code>benchmark/</code>
-    directory holds 45 self-contained task benches — many written in the frontend DSL itself
+    directory holds 44 self-contained task benches — many written in the frontend DSL itself
     (<code>gsm8k</code>, <code>tree_of_thought_deep</code>, <code>multi_turn_chat</code>,
     <code>json_decode_regex</code>, <code>tip_suggestion</code>…) alongside infra benches
     (<code>hicache</code>, <code>kernels</code>, <code>deepseek_v3</code>, <code>prefill_only</code>).
@@ -503,7 +503,7 @@ else:
 
   <h2><span class="sec-num">11.6</span>Test infrastructure: self-registering CI</h2>
   <p>
-    Tests under <code>test/registered/</code> (66 category dirs: <code>core</code>, <code>unit</code>,
+    Tests under <code>test/registered/</code> (65 category dirs: <code>core</code>, <code>unit</code>,
     <code>models</code>, <code>8-gpu-models</code>, <code>spec</code>, <code>lora</code>, <code>moe</code>,
     <code>hicache</code>, <code>disaggregation</code>, per-vendor <code>amd</code>/<code>npu</code>/<code>xpu</code>…)
     are auto-discovered by <code>test/run_suite.py</code>. There is no central manifest: each test file
