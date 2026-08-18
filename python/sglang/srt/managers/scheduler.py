@@ -2948,6 +2948,15 @@ class Scheduler(
             self.handle_embedding_request(tokenized_req)
 
     def stash_chunked_request(self, req: Req):
+        # Mamba extra-buffer radix caching snapshots GPU state here. Under
+        # overlap, the preceding forward may still be writing that state when
+        # the scheduler reaches this CPU-side stash. Order the scheduler stream
+        # after every pending result's copy completion; this is a stream wait,
+        # not a device-wide host synchronization.
+        if self.server_args.enable_mamba_extra_buffer() and self.enable_overlap:
+            for _, result in self.result_queue:
+                if result.copy_done is not None:
+                    self.schedule_stream.wait_event(result.copy_done)
         maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
     def process_pending_chunked_abort(self) -> None:
