@@ -4050,15 +4050,30 @@ class MLATokenToKVPool(KVCache):
         cache_v: torch.Tensor,
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
-        maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MLA)")
+        parallel = get_parallel()
+        dcp_size = parallel.attn_dcp_size if parallel.dcp_enabled else 1
+        # Under DCP this entry point receives locs in the ALLOCATOR's virtual
+        # space, dcp_size times wider than this rank's rows -- which is what the
+        # owner-rule mask below is filtering on. State the bound in that space,
+        # as set_mla_kv_buffer already does; the un-widened bound reported every
+        # legitimately high virtual loc as out of range.
+        maybe_detect_oob(
+            loc, 0, (self.size + self.page_size) * dcp_size, "set_kv_buffer (MLA)"
+        )
         layer_id = layer.layer_id
         assert not self.dsa_kv_cache_store_fp8
-        parallel = get_parallel()
         if parallel.dcp_enabled:
-            valid_mask = loc % parallel.attn_dcp_size == parallel.attn_dcp_rank
+            valid_mask = loc % dcp_size == parallel.attn_dcp_rank
             if not valid_mask.all():
                 loc = loc[valid_mask]
                 cache_k = cache_k[valid_mask]
+            # Translate virtual -> this rank's physical row, mirroring
+            # set_mla_kv_buffer_kernel (`safe_loc // DCP_WORLD_SIZE`): a loc owned
+            # by rank r has the form k * dcp_size + r and addresses row k. This
+            # must run whether or not the mask filtered anything -- when every loc
+            # is owned by this rank the filter is skipped, but the locs are still
+            # virtual.
+            loc = loc // dcp_size
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
 
