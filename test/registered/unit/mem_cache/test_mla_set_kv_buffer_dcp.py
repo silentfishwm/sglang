@@ -68,9 +68,7 @@ class TestMLASetKvBufferDcp(unittest.TestCase):
         with get_parallel().override(
             dcp_enabled=True, attn_dcp_size=DCP, attn_dcp_rank=RANK
         ):
-            MLATokenToKVPool.set_kv_buffer(
-                pool, self.layer, torch.arange(8), val, None
-            )
+            MLATokenToKVPool.set_kv_buffer(pool, self.layer, torch.arange(8), val, None)
         # Of locs 0..7 rank 1 owns 1 and 5, which address rows 0 and 1.
         self.assertEqual(_written_rows(pool), [0, 1])
         torch.testing.assert_close(pool.kv_buffer[0][0], val[1])
